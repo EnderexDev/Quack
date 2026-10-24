@@ -1,0 +1,1000 @@
+import fs from "node:fs";
+import path from "node:path";
+import { promises as fsp } from "node:fs";
+import { IPCServer } from "./ipc/server.js";
+import { config } from "./config.js";
+import { log } from "./util/log.js";
+import { SnapshotBuilder } from "./snapshot.js";
+import { RojoSnapshotBuilder } from "./snapshot/rojo/index.js";
+import { generateGUID } from "./util/id.js";
+import {
+  classifyScriptFileName,
+  isScriptFileName,
+  replaceSelfRequires,
+} from "./util/scriptFile.js";
+import {
+  applySourcemapProperties,
+  buildInstancesFromSourcemap,
+  findNodeForFilepath,
+  loadSourcemapPropertyIndex,
+} from "./sourcemap/propertyLoader.js";
+import type {
+  InstanceData,
+  PushConfig,
+  PushConfigMessage,
+  PushSnapshotMapping,
+  RequestPushConfigMessage,
+  StudioMessage,
+} from "./ipc/messages.js";
+
+interface PushOptions {
+  source?: string;
+  destination?: string;
+  destructive?: boolean;
+  usePlaceConfig?: boolean;
+  rojoMode?: boolean;
+  rojoProjectFile?: string;
+  applySourcemapProperties?: boolean;
+  useSourcemapAsSource?: boolean;
+  sourcemapPath?: string;
+}
+
+export class PushCommand {
+  private ipc: IPCServer;
+  private options: PushOptions;
+  private sourcemapPath: string;
+  private sourcemapIndex: ReturnType<typeof loadSourcemapPropertyIndex>;
+  private sourcemapIndexByPath: Map<
+    string,
+    ReturnType<typeof loadSourcemapPropertyIndex>
+  >;
+
+  constructor(options: PushOptions = {}) {
+    this.options = options;
+    this.sourcemapPath = path.resolve(
+      options.sourcemapPath ?? config.sourcemapPath,
+    );
+    this.sourcemapIndex = loadSourcemapPropertyIndex(this.sourcemapPath);
+    this.sourcemapIndexByPath = new Map([
+      [this.sourcemapPath, this.sourcemapIndex],
+    ]);
+    this.ipc = new IPCServer(config.port, undefined, {
+      requestSnapshotOnConnect: false,
+    });
+  }
+
+  public async run(): Promise<void> {
+    if (/^game[./\\]/i.test(this.options.destination ?? "")) {
+      log.warn(
+        "Do not use 'game.' in the destination; it is implied. Stripping it.",
+      );
+      this.options.destination = this.options.destination!.slice(5);
+    }
+
+    if (this.options.rojoMode) {
+      log.info(
+        "Rojo compatibility mode: ignoring place config; destination becomes a prefix.",
+      );
+      const destSegments = this.options.destination
+        ? this.parseDestination(this.options.destination)
+        : [];
+      const instances = await this.buildRojoInstances(
+        destSegments,
+        this.options.source,
+      );
+      if (!instances) return;
+
+      const snapshotMappings: PushSnapshotMapping[] = [
+        {
+          destination: destSegments,
+          destructive: Boolean(this.options.destructive),
+          instances,
+        },
+      ];
+
+      await new Promise<void>((resolve) => {
+        const sendSnapshot = () => {
+          log.info("Handshake complete. Sending Rojo compatibility push...");
+          this.ipc.send({ type: "pushSnapshot", mappings: snapshotMappings });
+          setTimeout(async () => {
+            await this.ipc.close();
+            resolve();
+          }, 200);
+        };
+
+        this.ipc.onConnection(() => {
+          log.info("Studio connected. Waiting for handshake...");
+        });
+
+        this.ipc.onHandshake(sendSnapshot);
+      });
+      return;
+    }
+
+    const mappings = await this.collectMappings();
+    if (!mappings || mappings.length === 0) {
+      log.error(
+        "No push mappings available. Provide '--source' / '--destination' or place config.",
+      );
+      return;
+    }
+
+    log.info(`Building ${mappings.length} mapping(s) for push...`);
+
+    const snapshotMappings: PushSnapshotMapping[] = [];
+
+    for (const mapping of mappings) {
+      const destSegments = mapping.destination;
+      log.debug(
+        `Processing push mapping: ${mapping.source} -> ${destSegments.join("/")}${
+          mapping.destructive ? " (destructive)" : ""
+        }${mapping.rojoMode ? " (Rojo mode)" : ""}${
+          mapping.fromSourcemap
+            ? ` (from sourcemap: ${mapping.fromSourcemap})`
+            : ""
+        }`,
+      );
+
+      if (mapping.rojoMode) {
+        log.info(
+          `Mapping source ${mapping.source} in Rojo compatibility mode.`,
+        );
+        const instances = await this.buildRojoInstances(
+          destSegments,
+          mapping.source,
+        );
+        if (!instances) continue;
+
+        snapshotMappings.push({
+          destination: destSegments,
+          destructive: Boolean(mapping.destructive),
+          instances,
+        });
+        continue;
+      }
+
+      const sourceCandidates = this.expandSourceCandidates(mapping.source);
+      const sourcePath = sourceCandidates.find((candidate) =>
+        fs.existsSync(candidate),
+      );
+
+      if (!sourcePath) {
+        log.error(
+          `Source path not found for push mapping. Tried: ${sourceCandidates.join(
+            ", ",
+          )}`,
+        );
+        continue;
+      }
+
+      let sourceStats: fs.Stats;
+      try {
+        sourceStats = await fsp.stat(sourcePath);
+      } catch {
+        log.error(`Could not read source path for push mapping: ${sourcePath}`);
+        continue;
+      }
+
+      const isSourceDirectory = sourceStats.isDirectory();
+      const isSourceFile = sourceStats.isFile();
+
+      if (!isSourceDirectory && !isSourceFile) {
+        log.error(
+          `Source path must be a file or directory for push mapping: ${sourcePath}`,
+        );
+        continue;
+      }
+
+      const mappingSourcemapPath = this.resolveMappingSourcemapPath(mapping);
+      const useFromSourcemap = Boolean(mappingSourcemapPath);
+
+      // Quack keeps a script's descendants in a same-named sibling folder, so
+      // pushing either half has to carry the other.
+      const { scriptFile, childDir, instanceName } = this.resolveScriptPair(
+        sourcePath,
+        isSourceDirectory,
+      );
+
+      // Where the source's own instance lands in Studio, plus the filesystem
+      // path whose basename matches that instance's name (used to locate it in
+      // a sourcemap, since a script file's name carries a .server/.client suffix).
+      const containerPath = isSourceDirectory
+        ? destSegments
+        : [...destSegments, instanceName];
+      const probePath = isSourceDirectory
+        ? sourcePath
+        : path.join(path.dirname(sourcePath), instanceName);
+
+      let instances: InstanceData[] | null = null;
+
+      if (useFromSourcemap) {
+        instances = this.buildPushInstancesFromSourcemap(
+          probePath,
+          containerPath,
+          mappingSourcemapPath!,
+          scriptFile,
+        );
+
+        if (!instances) {
+          log.warn(
+            `Could not derive sourcemap subtree for ${sourcePath}; falling back to filesystem snapshot.`,
+          );
+        }
+      }
+
+      if (!instances) {
+        instances = await this.buildPushInstancesFromFilesystem(
+          scriptFile,
+          childDir,
+          containerPath,
+        );
+
+        if (!instances) {
+          log.error(
+            `Could not build push snapshot for source path: ${sourcePath}`,
+          );
+          continue;
+        }
+
+        if (this.options.applySourcemapProperties !== false) {
+          applySourcemapProperties(
+            instances,
+            this.getSourcemapIndexForPath(this.sourcemapPath),
+          );
+        }
+      }
+
+      if (scriptFile && childDir) {
+        log.debug(
+          `Paired ${path.basename(scriptFile)} with sibling folder ${path.basename(childDir)}/ for ${containerPath.join("/")}`,
+        );
+      }
+
+      log.success(
+        `Prepared ${instances.length} instances from ${sourcePath} -> ${containerPath.join("/")}`,
+      );
+
+      snapshotMappings.push({
+        destination: destSegments,
+        destructive: Boolean(mapping.destructive),
+        instances,
+      });
+    }
+
+    if (snapshotMappings.length === 0) {
+      log.error("No push mappings could be prepared (missing source paths).");
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      const sendSnapshot = () => {
+        log.info("Handshake complete. Sending push snapshot...");
+        this.ipc.send({ type: "pushSnapshot", mappings: snapshotMappings });
+        setTimeout(async () => {
+          await this.ipc.close();
+          resolve();
+        }, 200);
+      };
+
+      this.ipc.onConnection(() => {
+        log.info("Studio connected. Waiting for handshake...");
+      });
+
+      this.ipc.onHandshake(sendSnapshot);
+    });
+  }
+
+  /**
+   * Quack stores a script's descendants in a same-named sibling folder
+   * (`UI.client.luau` + `UI/`). Given either half, resolves both so a push of
+   * one carries the other.
+   */
+  private resolveScriptPair(
+    sourcePath: string,
+    isDirectory: boolean,
+  ): {
+    scriptFile: string | null;
+    childDir: string | null;
+    instanceName: string;
+  } {
+    if (isDirectory) {
+      const folderName = path.basename(sourcePath);
+      const parentDir = path.dirname(sourcePath);
+
+      let entries: fs.Dirent[] = [];
+      try {
+        entries = fs.readdirSync(parentDir, { withFileTypes: true });
+      } catch {
+        // Unreadable parent: treat the directory as a plain Folder push.
+      }
+
+      const match = entries.find(
+        (entry) =>
+          entry.isFile() &&
+          isScriptFileName(entry.name) &&
+          classifyScriptFileName(entry.name, {
+            stripDisambiguationSuffix: true,
+          }).scriptName === folderName,
+      );
+
+      return {
+        scriptFile: match ? path.join(parentDir, match.name) : null,
+        childDir: sourcePath,
+        instanceName: folderName,
+      };
+    }
+
+    const { scriptName } = classifyScriptFileName(path.basename(sourcePath), {
+      stripDisambiguationSuffix: true,
+    });
+    const childDir = path.join(path.dirname(sourcePath), scriptName);
+
+    return {
+      scriptFile: sourcePath,
+      childDir:
+        fs.existsSync(childDir) && fs.statSync(childDir).isDirectory()
+          ? childDir
+          : null,
+      instanceName: scriptName,
+    };
+  }
+
+  /**
+   * Builds a push subtree from disk: the container script (if the source has
+   * one) plus everything in its children folder, rooted at `containerPath`.
+   */
+  private async buildPushInstancesFromFilesystem(
+    scriptFile: string | null,
+    childDir: string | null,
+    containerPath: string[],
+  ): Promise<InstanceData[] | null> {
+    const instances: InstanceData[] = [];
+
+    if (scriptFile) {
+      const container = await this.buildPushInstancesFromFile(
+        scriptFile,
+        containerPath,
+      );
+      if (!container) return null;
+      instances.push(...container);
+    }
+
+    if (childDir) {
+      const builder = new SnapshotBuilder({
+        sourceDir: childDir,
+        destPrefix: containerPath,
+        skipSymlinks: true,
+      });
+      instances.push(...(await builder.build()));
+    }
+
+    instances.sort((a, b) => a.path.length - b.path.length);
+    return instances;
+  }
+
+  /**
+   * Builds the instance for a single script file, placed at an explicit Studio
+   * path (the last segment names the instance).
+   */
+  private async buildPushInstancesFromFile(
+    sourceFile: string,
+    instancePath: string[],
+  ): Promise<InstanceData[] | null> {
+    const fileName = path.basename(sourceFile);
+
+    if (!isScriptFileName(fileName)) {
+      log.error(
+        `Source file is not a .lua/.luau script and cannot be pushed directly: ${sourceFile}`,
+      );
+      return null;
+    }
+
+    const { className, scriptName } = classifyScriptFileName(fileName, {
+      stripDisambiguationSuffix: true,
+    });
+
+    // The instance name is the last segment of the destination path, or the script's name if the path is empty.
+    const instanceName = instancePath[instancePath.length - 1] ?? scriptName;
+    const source = replaceSelfRequires(
+      instanceName,
+      await fsp.readFile(sourceFile, "utf-8"),
+    );
+
+    // Get the sourcemap node for this file, if it exists, so we can pull properties/attributes/tags from it
+    const sourcemapIndex = this.getSourcemapIndexForPath(this.sourcemapPath);
+    const node = findNodeForFilepath(sourceFile, sourcemapIndex);
+
+    return [
+      {
+        guid: node?.guid ?? generateGUID(),
+        className,
+        name: instanceName,
+        path: instancePath,
+        source,
+        properties: node?.properties,
+        attributes: node?.attributes,
+        tags: node?.tags,
+      },
+    ];
+  }
+
+  private async buildRojoInstances(
+    destSegments: string[],
+    sourceOverride?: string,
+  ): Promise<InstanceData[] | null> {
+    const sourceRootOpt = sourceOverride ?? this.options.source;
+
+    const projectFiles = await this.resolveRojoProjectFiles(sourceRootOpt);
+    if (projectFiles.length === 0) {
+      if (!sourceRootOpt) {
+        log.error(
+          "Rojo compatibility mode could not find default.project.json. Provide --rojo-project or point --source to a folder that contains one.",
+        );
+        return null;
+      }
+
+      const sourceRoot = path.resolve(process.cwd(), sourceRootOpt);
+      if (!fs.existsSync(sourceRoot)) {
+        log.error(
+          `Source path not found for Rojo compatibility mode: ${sourceRoot}`,
+        );
+        return null;
+      }
+
+      log.warn(
+        "No default.project.json found; falling back to loose script import with Rojo-style init module handling.",
+      );
+
+      const loose = await new RojoSnapshotBuilder({
+        cwd: process.cwd(),
+      }).buildLoose(sourceRoot, destSegments);
+
+      log.info(
+        `Rojo compatibility imported ${loose.length} loose instance(s) without a project JSON from ${sourceRoot}`,
+      );
+
+      if (loose.length === 0) {
+        log.warn(
+          `Rojo compatibility fallback found no scripts under ${sourceRoot}.`,
+        );
+      }
+
+      return this.dedupeRojoInstances(loose);
+    }
+
+    const allInstances: InstanceData[] = [];
+    const projectDirs = new Set<string>();
+
+    for (const projectFile of projectFiles) {
+      // If a source root was provided, include the relative path from that root to the project file's folder
+      let relativeSegments: string[] = [];
+      if (sourceRootOpt) {
+        const sourceRoot = path.resolve(process.cwd(), sourceRootOpt);
+        const projectDir = path.dirname(projectFile);
+        projectDirs.add(projectDir);
+        const rel = path.relative(sourceRoot, projectDir).replace(/\\/g, "/");
+        if (rel && !rel.startsWith("..")) {
+          relativeSegments = rel.split("/").filter(Boolean);
+        }
+      }
+
+      const effectivePrefix = [...destSegments, ...relativeSegments];
+
+      const builder = new RojoSnapshotBuilder({
+        projectFile,
+        cwd: process.cwd(),
+        destPrefix: effectivePrefix,
+      });
+
+      log.info(`Preparing Rojo compatibility push from ${projectFile}`);
+
+      try {
+        const built = await builder.build();
+        allInstances.push(...built);
+      } catch (error) {
+        log.error(`${error}`);
+        return null;
+      }
+    }
+
+    // Emit loose scripts not covered by a Rojo project (e.g., cmdr.lua, janitor.lua, Promise.lua)
+    if (sourceRootOpt) {
+      const sourceRoot = path.resolve(process.cwd(), sourceRootOpt);
+
+      const loose = await new RojoSnapshotBuilder({
+        cwd: process.cwd(),
+      }).buildLoose(sourceRoot, destSegments, {
+        skipDirs: projectDirs,
+        existing: allInstances,
+      });
+      allInstances.push(...loose);
+
+      if (loose.length > 0) {
+        log.info(
+          `Rojo compatibility imported ${loose.length} loose instance(s) not covered by default.project.json files.`,
+        );
+      }
+    }
+
+    if (allInstances.length === 0) {
+      log.warn(
+        "Rojo compatibility build produced 0 instances. Check project paths and ignores.",
+      );
+    }
+
+    return this.dedupeRojoInstances(allInstances);
+  }
+
+  private dedupeRojoInstances(instances: InstanceData[]): InstanceData[] {
+    const byKey = new Map<string, InstanceData>();
+
+    for (const instance of instances) {
+      // Keyed by path alone: one Studio path holds one instance, so a Folder
+      // and a script landing on the same path are a collision, not two entries.
+      const key = instance.path.join("/");
+      const existing = byKey.get(key);
+
+      if (!existing) {
+        byKey.set(key, instance);
+        continue;
+      }
+
+      const existingIsFolder = existing.className === "Folder";
+      const incomingIsFolder = instance.className === "Folder";
+
+      if (existingIsFolder && !incomingIsFolder) {
+        byKey.set(key, instance);
+        continue;
+      }
+
+      if (!existingIsFolder && incomingIsFolder) {
+        continue;
+      }
+
+      const existingIsScript = this.isScriptClassName(existing.className);
+      const incomingIsScript = this.isScriptClassName(instance.className);
+
+      if (existingIsScript && incomingIsScript) {
+        if (existing.className !== instance.className) {
+          log.warn(
+            `Rojo push dedupe: conflicting class at ${key} (${existing.className} vs ${instance.className}); keeping first occurrence.`,
+          );
+        } else if (
+          typeof existing.source === "string" &&
+          typeof instance.source === "string" &&
+          existing.source !== instance.source
+        ) {
+          log.warn(
+            `Rojo push dedupe: conflicting script content at ${key} (${instance.className}); keeping first occurrence.`,
+          );
+        }
+      }
+    }
+
+    const deduped = [...byKey.values()];
+    deduped.sort((a, b) => {
+      if (a.path.length !== b.path.length) {
+        return a.path.length - b.path.length;
+      }
+      return a.path.join("/").localeCompare(b.path.join("/"));
+    });
+
+    if (deduped.length !== instances.length) {
+      log.debug(
+        `Rojo push dedupe removed ${instances.length - deduped.length} duplicate instance(s).`,
+      );
+    }
+
+    return deduped;
+  }
+
+  private isScriptClassName(className: string): boolean {
+    return (
+      className === "Script" ||
+      className === "LocalScript" ||
+      className === "ModuleScript"
+    );
+  }
+
+  /**
+   * Determines push mappings to use based on CLI options and/or place config from Studio.
+   * Priority:
+   * 1. CLI-provided source/destination
+   * 2. Place config provided by Studio (if --use-place-config is not false)
+   * @returns
+   */
+  private async collectMappings(): Promise<PushConfig["mappings"] | null> {
+    // CLI-provided mapping takes priority
+    if (this.options.source && this.options.destination) {
+      const destSegments = this.parseDestination(this.options.destination);
+      if (destSegments.length === 0) {
+        log.error(
+          "Destination must be a dot-separated path (e.g., ReplicatedStorage.Packages)",
+        );
+        return null;
+      }
+      return [
+        {
+          source: this.options.source,
+          destination: destSegments,
+          destructive: Boolean(this.options.destructive),
+        },
+      ];
+    }
+
+    if (this.options.usePlaceConfig === false) {
+      return null;
+    }
+
+    log.info(
+      "No source/destination provided. Requesting push config from Studio... (ServerStorage.Quack.Config)",
+    );
+    const config = await this.waitForPushConfig();
+    if (!config) {
+      return null;
+    }
+
+    log.debug("Received push config from Studio.", config);
+
+    const sanitizedMappings = config.mappings?.filter((m) =>
+      Boolean(m && m.source && m.destination && m.destination.length > 0),
+    );
+
+    if (!sanitizedMappings || sanitizedMappings.length === 0) {
+      log.error("Received push config, but no valid mappings were found.");
+      return null;
+    }
+
+    return sanitizedMappings.map((m) => ({
+      source: m.source,
+      destination: m.destination,
+      destructive: Boolean(m.destructive),
+      rojoMode: Boolean(m.rojoMode),
+      fromSourcemap:
+        typeof m.fromSourcemap === "string" && m.fromSourcemap.trim().length > 0
+          ? m.fromSourcemap
+          : undefined,
+    }));
+  }
+
+  /**
+   * Parses a destination string into path segments, trimming whitespace and ignoring empty segments.
+   * Accepts dot, forward slash, or backslash as separators for user convenience.
+   * @param input
+   * @returns
+   */
+  private parseDestination(input: string): string[] {
+    return input
+      .split(/[./\\]+/)
+      .map((segment) => segment.trim())
+      .filter(Boolean);
+  }
+
+  /**
+   * Builds instances for a push mapping using a specified sourcemap as the source of truth.
+   * @param sourceDir
+   * @param destSegments
+   * @param sourcemapPath
+   * @returns
+   */
+  /**
+   * Builds a push subtree from a sourcemap. `probePath` is the filesystem path
+   * whose basename matches the subtree root's instance name; `scriptFile`, when
+   * present, pins that root exactly via the sourcemap's filePaths and makes the
+   * root itself part of the push (it carries the class and source a plain
+   * destination folder would lose).
+   */
+  private buildPushInstancesFromSourcemap(
+    probePath: string,
+    containerPath: string[],
+    sourcemapPath: string,
+    scriptFile: string | null,
+  ): InstanceData[] | null {
+    const all = buildInstancesFromSourcemap(sourcemapPath);
+    if (!all || all.length === 0) {
+      return null;
+    }
+
+    const sourcePrefix =
+      this.inferSourcePrefixFromScript(scriptFile, sourcemapPath, all) ??
+      this.inferSourcePrefixFromPath(probePath, all);
+
+    if (!sourcePrefix || sourcePrefix.length === 0) {
+      return null;
+    }
+
+    const includeRoot = Boolean(scriptFile);
+    const rebased = all
+      .filter(
+        (instance) =>
+          this.pathStartsWith(instance.path, sourcePrefix) &&
+          (includeRoot || instance.path.length > sourcePrefix.length),
+      )
+      .map((instance) => {
+        const rebasedPath = [
+          ...containerPath,
+          ...instance.path.slice(sourcePrefix.length),
+        ];
+        const name = rebasedPath[rebasedPath.length - 1];
+        return {
+          ...instance,
+          name,
+          path: rebasedPath,
+          source: instance.source
+            ? replaceSelfRequires(name, instance.source) // Rewrite @self requires against the new instance name
+            : instance.source,
+        };
+      });
+
+    if (rebased.length === 0) {
+      return null;
+    }
+
+    log.debug(
+      `Mapped ${rebased.length} instance(s) from sourcemap subtree "${sourcePrefix.join("/")}" to destination "${containerPath.join("/")}".`,
+    );
+
+    rebased.sort((a, b) => a.path.length - b.path.length);
+    return rebased;
+  }
+
+  /**
+   * Locates a script's node in the sourcemap by its file path, which is exact,
+   * unlike matching a folder path against instance names.
+   */
+  private inferSourcePrefixFromScript(
+    scriptFile: string | null,
+    sourcemapPath: string,
+    instances: InstanceData[],
+  ): string[] | null {
+    if (!scriptFile) return null;
+
+    const node = findNodeForFilepath(
+      scriptFile,
+      this.getSourcemapIndexForPath(sourcemapPath),
+    );
+    if (!node?.guid) return null;
+
+    return (
+      instances.find((instance) => instance.guid === node.guid)?.path ?? null
+    );
+  }
+
+  private resolveMappingSourcemapPath(mapping: {
+    fromSourcemap?: string;
+  }): string | null {
+    if (this.options.useSourcemapAsSource) {
+      return this.sourcemapPath;
+    }
+
+    if (
+      typeof mapping.fromSourcemap === "string" &&
+      mapping.fromSourcemap.trim().length > 0
+    ) {
+      return path.resolve(process.cwd(), mapping.fromSourcemap);
+    }
+
+    return null;
+  }
+
+  /**
+   * Retrieves the property index for a given sourcemap path, loading it if necessary.
+   * @param sourcemapPath The file path to the sourcemap to load the index for.
+   * @returns The property index for the specified sourcemap.
+   */
+  private getSourcemapIndexForPath(
+    sourcemapPath: string,
+  ): ReturnType<typeof loadSourcemapPropertyIndex> {
+    const existing = this.sourcemapIndexByPath.get(sourcemapPath);
+    if (existing) {
+      return existing;
+    }
+
+    const loaded = loadSourcemapPropertyIndex(sourcemapPath);
+    this.sourcemapIndexByPath.set(sourcemapPath, loaded);
+    return loaded;
+  }
+
+  private inferSourcePrefixFromPath(
+    sourceDir: string,
+    instances: InstanceData[],
+  ): string[] | null {
+    const normalized = path
+      .resolve(sourceDir)
+      .replace(/\\/g, "/")
+      .split("/")
+      .filter(Boolean);
+
+    let best: string[] | null = null;
+    for (let start = 0; start < normalized.length; start++) {
+      const candidate = normalized.slice(start);
+      if (candidate.length === 0) continue;
+
+      const matches = instances.some((instance) =>
+        this.pathStartsWith(instance.path, candidate),
+      );
+
+      if (!matches) continue;
+
+      if (!best || candidate.length > best.length) {
+        best = candidate;
+      }
+    }
+
+    return best;
+  }
+
+  private pathStartsWith(pathSegments: string[], prefix: string[]): boolean {
+    if (prefix.length > pathSegments.length) return false;
+
+    for (let index = 0; index < prefix.length; index++) {
+      if (pathSegments[index] !== prefix[index]) return false;
+    }
+
+    return true;
+  }
+
+  private async resolveRojoProjectFiles(
+    sourceOverride?: string,
+  ): Promise<string[]> {
+    const cwd = process.cwd();
+    const results = new Set<string>();
+
+    const add = (p: string) => {
+      const abs = path.resolve(cwd, p);
+      if (fs.existsSync(abs)) {
+        results.add(abs);
+      }
+    };
+
+    if (this.options.rojoProjectFile) {
+      add(this.options.rojoProjectFile);
+      return [...results];
+    }
+
+    const sourceRootOpt = sourceOverride ?? this.options.source;
+
+    // If a source root is provided, only search within it (and its nested projects).
+    if (sourceRootOpt) {
+      const srcRoot = path.resolve(cwd, sourceRootOpt);
+      if (!fs.existsSync(srcRoot)) {
+        log.warn(`--source path does not exist: ${srcRoot}`);
+        return [];
+      }
+
+      const direct = path.join(srcRoot, "default.project.json");
+      if (fs.existsSync(direct)) {
+        results.add(direct);
+      }
+
+      const foundInSource = await this.findProjectJsons(srcRoot, 6);
+      for (const f of foundInSource) {
+        results.add(f);
+      }
+
+      return [...results];
+    }
+
+    // No source root: search at workspace root (previous behavior).
+    const rootDirect = path.join(cwd, "default.project.json");
+    if (fs.existsSync(rootDirect)) {
+      results.add(rootDirect);
+    }
+
+    const found = await this.findProjectJsons(cwd, 3);
+    for (const f of found) {
+      results.add(f);
+    }
+
+    return [...results];
+  }
+
+  /**
+   * Breadth-first search for all default.project.json under a root.
+   * Skips common vendor/ignored folders.
+   */
+  private async findProjectJsons(
+    root: string,
+    maxDepth: number,
+  ): Promise<string[]> {
+    const queue: { dir: string; depth: number }[] = [{ dir: root, depth: 0 }];
+    const found: string[] = [];
+    const FOLDERS_TO_SKIP = new Set(["node_modules", ".git", "dist", "sync"]);
+
+    while (queue.length > 0) {
+      const { dir, depth } = queue.shift()!;
+      if (depth > maxDepth) continue;
+
+      let entries: fs.Dirent[];
+      try {
+        entries = await fsp.readdir(dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+
+      // Deterministic order
+      entries.sort((a, b) => a.name.localeCompare(b.name));
+
+      for (const entry of entries) {
+        if (entry.isFile() && entry.name === "default.project.json") {
+          found.push(path.join(dir, entry.name));
+        }
+      }
+
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        if (FOLDERS_TO_SKIP.has(entry.name)) continue;
+        queue.push({ dir: path.join(dir, entry.name), depth: depth + 1 });
+      }
+    }
+
+    return found;
+  }
+
+  /**
+   * Normalize source path strings from config, preferring the raw value but
+   * attempting obvious fixes (e.g., accidental leading '.' before a folder).
+   */
+  private expandSourceCandidates(source: string): string[] {
+    const candidates: string[] = [];
+    const cwd = process.cwd();
+
+    const add = (p: string) => {
+      const abs = path.resolve(cwd, p);
+      if (!candidates.includes(abs)) {
+        candidates.push(abs);
+      }
+    };
+
+    add(source);
+
+    // If someone wrote ".Packages" by mistake, try "Packages"
+    if (source.startsWith(".")) {
+      const trimmedDot = source.replace(/^\.*/, "");
+      if (trimmedDot) add(trimmedDot);
+    }
+
+    // If someone prefixed with ./ or .\, resolve both forms
+    if (source.startsWith("./") || source.startsWith(".\\")) {
+      add(source.slice(2));
+    }
+
+    return candidates;
+  }
+
+  private async waitForPushConfig(): Promise<PushConfig | null> {
+    return new Promise<PushConfig | null>((resolve) => {
+      let resolved = false;
+
+      const timeout = setTimeout(() => {
+        if (!resolved) {
+          log.warn("Timed out waiting for push config from Studio.");
+          resolved = true;
+          resolve(null);
+        }
+      }, 8000);
+
+      this.ipc.onMessage((message: StudioMessage) => {
+        if (message.type === "pushConfig") {
+          const pushConfig = (message as PushConfigMessage).config;
+
+          clearTimeout(timeout);
+          if (!resolved) {
+            resolved = true;
+            resolve(pushConfig);
+          }
+        }
+      });
+
+      // Ask the plugin to send config after connection
+      this.ipc.onConnection(() => {
+        log.info("Studio connected. Waiting for handshake...");
+      });
+
+      this.ipc.onHandshake(() => {
+        const request: RequestPushConfigMessage = { type: "requestPushConfig" };
+        this.ipc.send(request);
+      });
+    });
+  }
+}

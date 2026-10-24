@@ -1,0 +1,1085 @@
+{
+  "name": "Game",
+  "className": "DataModel",
+  "children": [
+    {
+      "name": "ReplicatedFirst",
+      "className": "ReplicatedFirst",
+      "guid": "9214",
+      "children": [
+        {
+          "name": "QuackPlugin",
+          "className": "Script",
+          "guid": "1003615",
+          "filePaths": ["sync/ReplicatedFirst/QuackPlugin.server.luau"],
+          "properties": {
+            "RunContext": {
+              "Enum": 3
+            }
+          },
+          "children": [
+            {
+              "name": "App",
+              "className": "Folder",
+              "guid": "4807509",
+              "children": [
+                {
+                  "name": "Assets",
+                  "className": "ModuleScript",
+                  "guid": "4807549",
+                  "filePaths": [
+                    "sync/ReplicatedFirst/QuackPlugin/App/Assets.luau"
+                  ]
+                },
+                {
+                  "name": "Components",
+                  "className": "Folder",
+                  "guid": "4807548",
+                  "children": [
+                    {
+                      "name": "Border",
+                      "className": "ModuleScript",
+                      "guid": "4807617",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/App/Components/Border.luau"
+                      ]
+                    },
+                    {
+                      "name": "Box",
+                      "className": "ModuleScript",
+                      "guid": "4807615",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/App/Components/Box.luau"
+                      ]
+                    },
+                    {
+                      "name": "Checkbox",
+                      "className": "ModuleScript",
+                      "guid": "4807621",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/App/Components/Checkbox.luau"
+                      ]
+                    },
+                    {
+                      "name": "Collapsible",
+                      "className": "ModuleScript",
+                      "guid": "4807611",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/App/Components/Collapsible.luau"
+                      ]
+                    },
+                    {
+                      "name": "Container",
+                      "className": "ModuleScript",
+                      "guid": "4807613",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/App/Components/Container.luau"
+                      ]
+                    },
+                    {
+                      "name": "Corner",
+                      "className": "ModuleScript",
+                      "guid": "4807619",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/App/Components/Corner.luau"
+                      ]
+                    },
+                    {
+                      "name": "IconButton",
+                      "className": "ModuleScript",
+                      "guid": "4807623",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/App/Components/IconButton.luau"
+                      ]
+                    },
+                    {
+                      "name": "Image",
+                      "className": "ModuleScript",
+                      "guid": "4807639",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/App/Components/Image.luau"
+                      ]
+                    },
+                    {
+                      "name": "Input",
+                      "className": "ModuleScript",
+                      "guid": "4807637",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/App/Components/Input.luau"
+                      ]
+                    },
+                    {
+                      "name": "List",
+                      "className": "ModuleScript",
+                      "guid": "4807627",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/App/Components/List.luau"
+                      ]
+                    },
+                    {
+                      "name": "Notifications",
+                      "className": "ModuleScript",
+                      "guid": "4807609",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/App/Components/Notifications.luau"
+                      ]
+                    },
+                    {
+                      "name": "OptionSelector",
+                      "className": "ModuleScript",
+                      "guid": "4807607",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/App/Components/OptionSelector.luau"
+                      ]
+                    },
+                    {
+                      "name": "Padding",
+                      "className": "ModuleScript",
+                      "guid": "4807582",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/App/Components/Padding.luau"
+                      ]
+                    },
+                    {
+                      "name": "Plugin",
+                      "className": "Folder",
+                      "guid": "4807575",
+                      "children": [
+                        {
+                          "name": "Toolbar",
+                          "className": "ModuleScript",
+                          "guid": "4807682",
+                          "filePaths": [
+                            "sync/ReplicatedFirst/QuackPlugin/App/Components/Plugin/Toolbar.luau"
+                          ]
+                        },
+                        {
+                          "name": "ToolbarButton",
+                          "className": "ModuleScript",
+                          "guid": "4807686",
+                          "filePaths": [
+                            "sync/ReplicatedFirst/QuackPlugin/App/Components/Plugin/ToolbarButton.luau"
+                          ]
+                        },
+                        {
+                          "name": "Widget",
+                          "className": "ModuleScript",
+                          "guid": "4807688",
+                          "filePaths": [
+                            "sync/ReplicatedFirst/QuackPlugin/App/Components/Plugin/Widget.luau"
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "name": "ScrollingContainer",
+                      "className": "ModuleScript",
+                      "guid": "4807557",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/App/Components/ScrollingContainer.luau"
+                      ]
+                    },
+                    {
+                      "name": "Slider",
+                      "className": "ModuleScript",
+                      "guid": "4817114",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/App/Components/Slider.luau"
+                      ]
+                    },
+                    {
+                      "name": "Text",
+                      "className": "ModuleScript",
+                      "guid": "4807553",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/App/Components/Text.luau"
+                      ]
+                    },
+                    {
+                      "name": "TextButton",
+                      "className": "ModuleScript",
+                      "guid": "4807551",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/App/Components/TextButton.luau"
+                      ]
+                    },
+                    {
+                      "name": "Util",
+                      "className": "Folder",
+                      "guid": "4807559",
+                      "children": [
+                        {
+                          "name": "animate",
+                          "className": "ModuleScript",
+                          "guid": "4807655",
+                          "filePaths": [
+                            "sync/ReplicatedFirst/QuackPlugin/App/Components/Util/animate.luau"
+                          ]
+                        },
+                        {
+                          "name": "default",
+                          "className": "ModuleScript",
+                          "guid": "4807680",
+                          "filePaths": [
+                            "sync/ReplicatedFirst/QuackPlugin/App/Components/Util/default.luau"
+                          ]
+                        },
+                        {
+                          "name": "filterHost",
+                          "className": "ModuleScript",
+                          "guid": "4807684",
+                          "filePaths": [
+                            "sync/ReplicatedFirst/QuackPlugin/App/Components/Util/filterHost.luau"
+                          ]
+                        },
+                        {
+                          "name": "filterNumber",
+                          "className": "ModuleScript",
+                          "guid": "4807653",
+                          "filePaths": [
+                            "sync/ReplicatedFirst/QuackPlugin/App/Components/Util/filterNumber.luau"
+                          ]
+                        },
+                        {
+                          "name": "filterPort",
+                          "className": "ModuleScript",
+                          "guid": "4807649",
+                          "filePaths": [
+                            "sync/ReplicatedFirst/QuackPlugin/App/Components/Util/filterPort.luau"
+                          ]
+                        },
+                        {
+                          "name": "getState",
+                          "className": "ModuleScript",
+                          "guid": "4807643",
+                          "filePaths": [
+                            "sync/ReplicatedFirst/QuackPlugin/App/Components/Util/getState.luau"
+                          ]
+                        },
+                        {
+                          "name": "getTextSize",
+                          "className": "ModuleScript",
+                          "guid": "4807641",
+                          "filePaths": [
+                            "sync/ReplicatedFirst/QuackPlugin/App/Components/Util/getTextSize.luau"
+                          ]
+                        },
+                        {
+                          "name": "isState",
+                          "className": "ModuleScript",
+                          "guid": "4807645",
+                          "filePaths": [
+                            "sync/ReplicatedFirst/QuackPlugin/App/Components/Util/isState.luau"
+                          ]
+                        },
+                        {
+                          "name": "stripProps",
+                          "className": "ModuleScript",
+                          "guid": "4807651",
+                          "filePaths": [
+                            "sync/ReplicatedFirst/QuackPlugin/App/Components/Util/stripProps.luau"
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "Theme",
+                  "className": "ModuleScript",
+                  "guid": "4807546",
+                  "filePaths": [
+                    "sync/ReplicatedFirst/QuackPlugin/App/Theme.luau"
+                  ]
+                },
+                {
+                  "name": "UI",
+                  "className": "ModuleScript",
+                  "guid": "4807544",
+                  "filePaths": [
+                    "sync/ReplicatedFirst/QuackPlugin/App/UI.luau"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "QuackService",
+              "className": "ModuleScript",
+              "guid": "4807512",
+              "filePaths": [
+                "sync/ReplicatedFirst/QuackPlugin/QuackService.luau"
+              ]
+            },
+            {
+              "name": "Config",
+              "className": "ModuleScript",
+              "guid": "4807537",
+              "filePaths": [
+                "sync/ReplicatedFirst/QuackPlugin/Config.luau"
+              ]
+            },
+            {
+              "name": "Enums",
+              "className": "ModuleScript",
+              "guid": "4807507",
+              "filePaths": [
+                "sync/ReplicatedFirst/QuackPlugin/Enums.luau"
+              ]
+            },
+            {
+              "name": "Logger",
+              "className": "ModuleScript",
+              "guid": "4807500",
+              "filePaths": [
+                "sync/ReplicatedFirst/QuackPlugin/Logger.luau"
+              ]
+            },
+            {
+              "name": "Packages",
+              "className": "Folder",
+              "guid": "4807506",
+              "children": [
+                {
+                  "name": ".lpm",
+                  "className": "Folder",
+                  "guid": "4807543",
+                  "children": [
+                    {
+                      "name": "elttob_fusion",
+                      "className": "Folder",
+                      "guid": "4807560",
+                      "children": [
+                        {
+                          "name": "src",
+                          "className": "ModuleScript",
+                          "guid": "4807647",
+                          "filePaths": [
+                            "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src.luau"
+                          ],
+                          "children": [
+                            {
+                              "name": "Animation",
+                              "className": "Folder",
+                              "guid": "4807700",
+                              "children": [
+                                {
+                                  "name": "ExternalTime",
+                                  "className": "ModuleScript",
+                                  "guid": "4808065",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Animation/ExternalTime.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "getTweenDuration",
+                                  "className": "ModuleScript",
+                                  "guid": "4808012",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Animation/getTweenDuration.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "getTweenRatio",
+                                  "className": "ModuleScript",
+                                  "guid": "4807996",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Animation/getTweenRatio.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "lerpType",
+                                  "className": "ModuleScript",
+                                  "guid": "4808008",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Animation/lerpType.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "packType",
+                                  "className": "ModuleScript",
+                                  "guid": "4808010",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Animation/packType.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "Spring",
+                                  "className": "ModuleScript",
+                                  "guid": "4807994",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Animation/Spring.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "springCoefficients",
+                                  "className": "ModuleScript",
+                                  "guid": "4808002",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Animation/springCoefficients.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "Stopwatch",
+                                  "className": "ModuleScript",
+                                  "guid": "4807992",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Animation/Stopwatch.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "Tween",
+                                  "className": "ModuleScript",
+                                  "guid": "4807982",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Animation/Tween.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "unpackType",
+                                  "className": "ModuleScript",
+                                  "guid": "4807980",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Animation/unpackType.luau"
+                                  ]
+                                }
+                              ]
+                            },
+                            {
+                              "name": "Colour",
+                              "className": "Folder",
+                              "guid": "4807709",
+                              "children": [
+                                {
+                                  "name": "Oklab",
+                                  "className": "ModuleScript",
+                                  "guid": "4807984",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Colour/Oklab.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "sRGB",
+                                  "className": "ModuleScript",
+                                  "guid": "4807988",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Colour/sRGB.luau"
+                                  ]
+                                }
+                              ]
+                            },
+                            {
+                              "name": "External",
+                              "className": "ModuleScript",
+                              "guid": "4807701",
+                              "filePaths": [
+                                "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/External.luau"
+                              ]
+                            },
+                            {
+                              "name": "ExternalDebug",
+                              "className": "ModuleScript",
+                              "guid": "4807710",
+                              "filePaths": [
+                                "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/ExternalDebug.luau"
+                              ]
+                            },
+                            {
+                              "name": "Graph",
+                              "className": "Folder",
+                              "guid": "4807699",
+                              "children": [
+                                {
+                                  "name": "castToGraph",
+                                  "className": "ModuleScript",
+                                  "guid": "4807986",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Graph/castToGraph.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "change",
+                                  "className": "ModuleScript",
+                                  "guid": "4807978",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Graph/change.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "depend",
+                                  "className": "ModuleScript",
+                                  "guid": "4808014",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Graph/depend.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "evaluate",
+                                  "className": "ModuleScript",
+                                  "guid": "4808051",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Graph/evaluate.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "Observer",
+                                  "className": "ModuleScript",
+                                  "guid": "4808016",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Graph/Observer.luau"
+                                  ]
+                                }
+                              ]
+                            },
+                            {
+                              "name": "Instances",
+                              "className": "Folder",
+                              "guid": "4807697",
+                              "children": [
+                                {
+                                  "name": "applyInstanceProps",
+                                  "className": "ModuleScript",
+                                  "guid": "4808057",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Instances/applyInstanceProps.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "Attribute",
+                                  "className": "ModuleScript",
+                                  "guid": "4808061",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Instances/Attribute.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "AttributeChange",
+                                  "className": "ModuleScript",
+                                  "guid": "4808063",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Instances/AttributeChange.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "AttributeOut",
+                                  "className": "ModuleScript",
+                                  "guid": "4808055",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Instances/AttributeOut.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "Child",
+                                  "className": "ModuleScript",
+                                  "guid": "4808059",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Instances/Child.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "Children",
+                                  "className": "ModuleScript",
+                                  "guid": "4808053",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Instances/Children.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "defaultProps",
+                                  "className": "ModuleScript",
+                                  "guid": "4808020",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Instances/defaultProps.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "Hydrate",
+                                  "className": "ModuleScript",
+                                  "guid": "4808018",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Instances/Hydrate.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "New",
+                                  "className": "ModuleScript",
+                                  "guid": "4808022",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Instances/New.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "OnChange",
+                                  "className": "ModuleScript",
+                                  "guid": "4808026",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Instances/OnChange.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "OnEvent",
+                                  "className": "ModuleScript",
+                                  "guid": "4808024",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Instances/OnEvent.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "Out",
+                                  "className": "ModuleScript",
+                                  "guid": "4807953",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Instances/Out.luau"
+                                  ]
+                                }
+                              ]
+                            },
+                            {
+                              "name": "Logging",
+                              "className": "Folder",
+                              "guid": "4807698",
+                              "children": [
+                                {
+                                  "name": "formatError",
+                                  "className": "ModuleScript",
+                                  "guid": "4807990",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Logging/formatError.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "messages",
+                                  "className": "ModuleScript",
+                                  "guid": "4807951",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Logging/messages.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "parseError",
+                                  "className": "ModuleScript",
+                                  "guid": "4807821",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Logging/parseError.luau"
+                                  ]
+                                }
+                              ]
+                            },
+                            {
+                              "name": "Memory",
+                              "className": "Folder",
+                              "guid": "4807694",
+                              "children": [
+                                {
+                                  "name": "checkLifetime",
+                                  "className": "ModuleScript",
+                                  "guid": "4807782",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Memory/checkLifetime.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "deriveScope",
+                                  "className": "ModuleScript",
+                                  "guid": "4807788",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Memory/deriveScope.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "deriveScopeImpl",
+                                  "className": "ModuleScript",
+                                  "guid": "4807815",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Memory/deriveScopeImpl.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "doCleanup",
+                                  "className": "ModuleScript",
+                                  "guid": "4807813",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Memory/doCleanup.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "innerScope",
+                                  "className": "ModuleScript",
+                                  "guid": "4807778",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Memory/innerScope.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "legacyCleanup",
+                                  "className": "ModuleScript",
+                                  "guid": "4807786",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Memory/legacyCleanup.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "needsDestruction",
+                                  "className": "ModuleScript",
+                                  "guid": "4807776",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Memory/needsDestruction.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "poisonScope",
+                                  "className": "ModuleScript",
+                                  "guid": "4807750",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Memory/poisonScope.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "scoped",
+                                  "className": "ModuleScript",
+                                  "guid": "4807712",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Memory/scoped.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "scopePool",
+                                  "className": "ModuleScript",
+                                  "guid": "4807730",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Memory/scopePool.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "whichLivesLonger",
+                                  "className": "ModuleScript",
+                                  "guid": "4807766",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Memory/whichLivesLonger.luau"
+                                  ]
+                                }
+                              ]
+                            },
+                            {
+                              "name": "RobloxExternal",
+                              "className": "ModuleScript",
+                              "guid": "4807690",
+                              "filePaths": [
+                                "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/RobloxExternal.luau"
+                              ]
+                            },
+                            {
+                              "name": "State",
+                              "className": "Folder",
+                              "guid": "4807692",
+                              "children": [
+                                {
+                                  "name": "castToState",
+                                  "className": "ModuleScript",
+                                  "guid": "4807738",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/State/castToState.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "Computed",
+                                  "className": "ModuleScript",
+                                  "guid": "4807780",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/State/Computed.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "For",
+                                  "className": "ModuleScript",
+                                  "guid": "4807817",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/State/For.luau"
+                                  ],
+                                  "children": [
+                                    {
+                                      "name": "Disassembly",
+                                      "className": "ModuleScript",
+                                      "guid": "4808067",
+                                      "filePaths": [
+                                        "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/State/For/Disassembly.luau"
+                                      ]
+                                    },
+                                    {
+                                      "name": "ForTypes",
+                                      "className": "ModuleScript",
+                                      "guid": "4808069",
+                                      "filePaths": [
+                                        "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/State/For/ForTypes.luau"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                {
+                                  "name": "ForKeys",
+                                  "className": "ModuleScript",
+                                  "guid": "4807935",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/State/ForKeys.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "ForPairs",
+                                  "className": "ModuleScript",
+                                  "guid": "4807819",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/State/ForPairs.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "ForValues",
+                                  "className": "ModuleScript",
+                                  "guid": "4807941",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/State/ForValues.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "peek",
+                                  "className": "ModuleScript",
+                                  "guid": "4807945",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/State/peek.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "updateAll",
+                                  "className": "ModuleScript",
+                                  "guid": "4807949",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/State/updateAll.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "Value",
+                                  "className": "ModuleScript",
+                                  "guid": "4807947",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/State/Value.luau"
+                                  ]
+                                }
+                              ]
+                            },
+                            {
+                              "name": "Types",
+                              "className": "ModuleScript",
+                              "guid": "4807695",
+                              "filePaths": [
+                                "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Types.luau"
+                              ]
+                            },
+                            {
+                              "name": "Utility",
+                              "className": "Folder",
+                              "guid": "4807693",
+                              "children": [
+                                {
+                                  "name": "Contextual",
+                                  "className": "ModuleScript",
+                                  "guid": "4807939",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Utility/Contextual.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "isSimilar",
+                                  "className": "ModuleScript",
+                                  "guid": "4807943",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Utility/isSimilar.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "merge",
+                                  "className": "ModuleScript",
+                                  "guid": "4807937",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Utility/merge.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "nameOf",
+                                  "className": "ModuleScript",
+                                  "guid": "4807919",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Utility/nameOf.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "never",
+                                  "className": "ModuleScript",
+                                  "guid": "4807917",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Utility/never.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "nicknames",
+                                  "className": "ModuleScript",
+                                  "guid": "4807921",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Utility/nicknames.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "Safe",
+                                  "className": "ModuleScript",
+                                  "guid": "4807925",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Utility/Safe.luau"
+                                  ]
+                                },
+                                {
+                                  "name": "xtypeof",
+                                  "className": "ModuleScript",
+                                  "guid": "4807923",
+                                  "filePaths": [
+                                    "sync/ReplicatedFirst/QuackPlugin/Packages/.lpm/elttob_fusion/src/Utility/xtypeof.luau"
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "fusion",
+                  "className": "ModuleScript",
+                  "guid": "4807539",
+                  "filePaths": [
+                    "sync/ReplicatedFirst/QuackPlugin/Packages/fusion.luau"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Serializer",
+              "className": "ModuleScript",
+              "guid": "4807435",
+              "filePaths": [
+                "sync/ReplicatedFirst/QuackPlugin/Serializer.luau"
+              ]
+            },
+            {
+              "name": "OutputRelay",
+              "className": "ModuleScript",
+              "guid": "595583",
+              "filePaths": [
+                "sync/ReplicatedFirst/QuackPlugin/OutputRelay.luau"
+              ]
+            },
+            {
+              "name": "PlayOverlay",
+              "className": "ModuleScript",
+              "filePaths": [
+                "sync/ReplicatedFirst/QuackPlugin/PlayOverlay.luau"
+              ]
+            },
+            {
+              "name": "SettingsStore",
+              "className": "ModuleScript",
+              "guid": "4807433",
+              "filePaths": [
+                "sync/ReplicatedFirst/QuackPlugin/SettingsStore.luau"
+              ]
+            },
+            {
+              "name": "SyncSession",
+              "className": "ModuleScript",
+              "guid": "4807443",
+              "filePaths": [
+                "sync/ReplicatedFirst/QuackPlugin/SyncSession.luau"
+              ]
+            },
+            {
+              "name": "Vendor",
+              "className": "Folder",
+              "guid": "4807499",
+              "children": [
+                {
+                  "name": "rbx_dom_lua",
+                  "className": "ModuleScript",
+                  "guid": "4807541",
+                  "filePaths": [
+                    "sync/ReplicatedFirst/QuackPlugin/Vendor/rbx_dom_lua.luau"
+                  ],
+                  "children": [
+                    {
+                      "name": "base64",
+                      "className": "ModuleScript",
+                      "guid": "4807561",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/Vendor/rbx_dom_lua/base64.luau"
+                      ]
+                    },
+                    {
+                      "name": "customProperties",
+                      "className": "ModuleScript",
+                      "guid": "4807571",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/Vendor/rbx_dom_lua/customProperties.luau"
+                      ]
+                    },
+                    {
+                      "name": "database",
+                      "className": "ModuleScript",
+                      "guid": "4807578",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/Vendor/rbx_dom_lua/database.luau"
+                      ]
+                    },
+                    {
+                      "name": "EncodedValue",
+                      "className": "ModuleScript",
+                      "guid": "4807580",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/Vendor/rbx_dom_lua/EncodedValue.luau"
+                      ]
+                    },
+                    {
+                      "name": "Error",
+                      "className": "ModuleScript",
+                      "guid": "4807576",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/Vendor/rbx_dom_lua/Error.luau"
+                      ]
+                    },
+                    {
+                      "name": "PropertyDescriptor",
+                      "className": "ModuleScript",
+                      "guid": "4807573",
+                      "filePaths": [
+                        "sync/ReplicatedFirst/QuackPlugin/Vendor/rbx_dom_lua/PropertyDescriptor.luau"
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "WebSocketClient",
+              "className": "ModuleScript",
+              "guid": "4807471",
+              "filePaths": [
+                "sync/ReplicatedFirst/QuackPlugin/WebSocketClient.luau"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "_quack": {
+    "packVersion": 2,
+    "packedAt": "2026-09-28T00:28:45.987Z",
+    "mode": "all",
+    "placeId": 132762411481199
+  }
+}

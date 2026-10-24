@@ -1,0 +1,68 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Quack Dev",
+  "version": "1.0.0",
+  "identifier": "dev.enderex.quack.dev",
+  "build": {
+    "frontendDist": "../ui",
+    "beforeBuildCommand": "npm --prefix .. run bundle:hub"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Quack Dev",
+        "url": "index.html",
+        "width": 1120,
+        "height": 740,
+        "minWidth": 820,
+        "minHeight": 560,
+        "visible": false,
+        "center": true,
+        "backgroundColor": "#0d0b08"
+      },
+      {
+        "label": "tray",
+        "title": "Quack",
+        "url": "tray.html",
+        "width": 320,
+        "height": 400,
+        "visible": false,
+        "decorations": false,
+        "resizable": false,
+        "skipTaskbar": true,
+        "alwaysOnTop": true,
+        "transparent": true,
+        "shadow": false,
+        "focus": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERGNjA3REQ2MTc3OThDNTAKUldSUWpIa1gxbjFnMzY3TkRwTGZHblFMVTBBYmVvUVA3ZmJGL0FZWmZncVFWbUNSVVl6aXhIMGMK",
+      "endpoints": ["https://github.com/EnderexDev/quack-releases/releases/download/dev-channel/latest-dev.json"],
+      "windows": { "installMode": "quiet" }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons-dev/32x32.png",
+      "icons-dev/128x128.png",
+      "icons-dev/128x128@2x.png",
+      "icons-dev/icon.ico"
+    ],
+    "resources": [
+      "resources/hub/*",
+      "resources/plugin/*"
+    ]
+  }
+}

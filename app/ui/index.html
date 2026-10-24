@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Quack</title>
+<link rel="stylesheet" href="style.css">
+<script type="module" src="main.js"></script>
+</head>
+<body>
+  <div class="app">
+    <nav class="nav chunk">
+      <span class="brandtag">Quack</span>
+      <button class="navlink" data-view="output" data-t="output"></button>
+      <button class="navlink" data-view="playtest" data-t="playtest"></button>
+      <button class="navlink" data-view="merges"><span data-t="merges"></span><span class="n hidden" id="mergeBadge"></span></button>
+      <button class="navlink" data-view="folder" data-t="folder"></button>
+      <span class="grow"></span>
+      <button class="btn yellow chunk-bright press hidden" id="openCode" data-t="openVsc"></button>
+    </nav>
+    <div class="card chunk row update hidden" id="appUpdate"></div>
+    <div class="card chunk row update hidden" id="hubUpdate"></div>
+    <div class="body">
+      <aside class="side" id="side"></aside>
+      <section class="main" id="main"></section>
+    </div>
+  </div>
+</body>
+</html>

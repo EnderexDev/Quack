@@ -1,0 +1,5 @@
+{
+  "luau-lsp.platform.type": "roblox",
+  "luau-lsp.completion.imports.stringRequires.enabled": true,
+  "luau-lsp.sourcemap.sourcemapFile": "./plugin/sourcemap.json"
+}

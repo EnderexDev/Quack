@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Quack</title>
+<link rel="stylesheet" href="style.css">
+<script type="module" src="tray.js"></script>
+</head>
+<body class="traybody">
+  <div class="tray chunk" id="tray">
+    <div class="trayhead sky">
+      <div class="cloud" style="top:12%;left:52%;width:26%;height:16%"></div>
+      <div class="cloud" style="top:6%;left:64%;width:16%;height:20%"></div>
+      <div class="cloud" style="bottom:-14%;right:-6%;width:44%;height:30%;background:rgba(255,255,255,.4)"></div>
+      <img src="avatar.png" alt="">
+      <div class="who"><span class="display">Quack</span><span id="port"></span></div>
+    </div>
+    <div class="traylist" id="list"></div>
+    <div class="trayfoot">
+      <button class="btn yellow chunk-bright press" id="open" data-t="openWindow"></button>
+      <button class="btn dark chunk press" id="pause"></button>
+      <button class="btn dark chunk press" id="quit" data-t="quit"></button>
+    </div>
+  </div>
+</body>
+</html>

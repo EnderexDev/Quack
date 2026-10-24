@@ -1,0 +1,242 @@
+import fs from "node:fs";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { log } from "../util/log.js";
+import {
+  isScriptClassName,
+  stripScriptDisambiguationSuffix,
+} from "../util/scriptFile.js";
+import type { InstanceData } from "../ipc/messages.js";
+
+interface SourcemapNode {
+  name: string;
+  className: string;
+  guid?: string;
+  properties?: Record<string, unknown>;
+  attributes?: Record<string, unknown>;
+  tags?: string[];
+  children?: SourcemapNode[];
+  filePaths?: string[];
+}
+
+interface SourcemapRoot {
+  name: string;
+  className: string;
+  children: SourcemapNode[];
+}
+
+// Interface for efficient lookup of sourcemap nodes by guid, path+class, or file path
+export interface SourcemapPropertyIndex {
+  byGuid: Map<string, SourcemapNode>;
+  byPathClass: Map<string, SourcemapNode[]>;
+  byFilePath: Map<string, SourcemapNode>;
+}
+
+const pathClassKey = (segments: string[], className: string): string =>
+  `${segments.join("\u0001")}::${className}`;
+
+const normalizeNodeName = (node: SourcemapNode): string =>
+  isScriptClassName(node.className)
+    ? stripScriptDisambiguationSuffix(node.name)
+    : node.name;
+
+export function loadSourcemapPropertyIndex(
+  sourcemapPath: string,
+): SourcemapPropertyIndex | null {
+  const resolved = path.resolve(sourcemapPath);
+  if (!fs.existsSync(resolved)) {
+    log.debug(`No sourcemap found at ${resolved}; skipping property merge.`);
+    return null;
+  }
+
+  let root: SourcemapRoot;
+  try {
+    const raw = fs.readFileSync(resolved, "utf8");
+    root = JSON.parse(raw) as SourcemapRoot;
+  } catch (error) {
+    log.warn(`Failed to read sourcemap at ${resolved}: ${error}`);
+    return null;
+  }
+
+  const byGuid = new Map<string, SourcemapNode>();
+  const byPathClass = new Map<string, SourcemapNode[]>();
+  const byFilePath = new Map<string, SourcemapNode>();
+
+  const visit = (node: SourcemapNode, currentPath: string[]) => {
+    const nodeName = normalizeNodeName(node);
+    const nodePath = [...currentPath, nodeName];
+
+    if (node.guid) {
+      byGuid.set(node.guid, node);
+    }
+
+    const key = pathClassKey(nodePath, node.className);
+    const bucket = byPathClass.get(key) ?? [];
+    bucket.push(node);
+    byPathClass.set(key, bucket);
+
+    if (node.filePaths) {
+      for (const filePath of node.filePaths) {
+        const resolvedPath = path.resolve(filePath);
+        byFilePath.set(resolvedPath, node);
+      }
+    }
+
+    for (const child of node.children ?? []) {
+      visit(child, nodePath);
+    }
+  };
+
+  for (const child of root.children ?? []) {
+    visit(child, []);
+  }
+
+  return { byGuid, byPathClass, byFilePath };
+}
+
+/**
+ * Applies properties/attributes/tags from a sourcemap index to a set of instances based on matching guid or path+class.
+ * @param instances
+ * @param index
+ * @returns
+ */
+export function applySourcemapProperties(
+  instances: InstanceData[],
+  index: SourcemapPropertyIndex | null,
+): number {
+  if (!index) return 0;
+
+  let applied = 0;
+  for (const instance of instances) {
+    const match = findNodeForInstance(instance, index);
+    if (!match) continue;
+
+    const hasProps =
+      match.properties && Object.keys(match.properties).length > 0;
+    const hasAttrs =
+      match.attributes && Object.keys(match.attributes).length > 0;
+    const hasTags = match.tags && match.tags.length > 0;
+
+    if (!hasProps && !hasAttrs && !hasTags) continue;
+
+    if (hasProps) {
+      instance.properties = match.properties;
+    }
+
+    if (hasAttrs) {
+      instance.attributes = match.attributes;
+    }
+
+    if (hasTags) {
+      instance.tags = match.tags;
+    }
+
+    applied += 1;
+  }
+
+  if (applied > 0) {
+    log.success(
+      `Applied properties from sourcemap to ${applied} instance(s) for ${instances.length} total instances.`,
+    );
+  }
+
+  return applied;
+}
+
+export function buildInstancesFromSourcemap(
+  sourcemapPath: string,
+): InstanceData[] | null {
+  const resolvedSourcemap = path.resolve(sourcemapPath);
+  if (!fs.existsSync(resolvedSourcemap)) {
+    log.error(`Sourcemap not found at ${resolvedSourcemap}`);
+    return null;
+  }
+
+  let root: SourcemapRoot;
+  try {
+    const raw = fs.readFileSync(resolvedSourcemap, "utf8");
+    root = JSON.parse(raw) as SourcemapRoot;
+  } catch (error) {
+    log.error(`Failed to parse sourcemap at ${resolvedSourcemap}: ${error}`);
+    return null;
+  }
+
+  const results: InstanceData[] = [];
+
+  const visit = (
+    node: SourcemapNode,
+    currentPath: string[],
+    parentGuid?: string,
+  ) => {
+    const nodeName = normalizeNodeName(node);
+    const nodePath = [...currentPath, nodeName];
+    const guid = node.guid ?? randomUUID().replace(/-/g, "");
+
+    const instance: InstanceData = {
+      guid,
+      className: node.className,
+      name: nodeName,
+      path: nodePath,
+      parentGuid,
+    };
+
+    if (node.properties) instance.properties = node.properties;
+    if (node.attributes) instance.attributes = node.attributes;
+    if (node.tags) instance.tags = node.tags;
+
+    const isScript = isScriptClassName(node.className);
+
+    if (isScript && node.filePaths && node.filePaths.length > 0) {
+      const scriptPath = path.resolve(process.cwd(), node.filePaths[0]);
+      try {
+        instance.source = fs.readFileSync(scriptPath, "utf8");
+      } catch (error) {
+        log.warn(
+          `Failed to read script file for ${nodePath.join("/")}: ${error}`,
+        );
+      }
+    }
+
+    results.push(instance);
+
+    for (const child of node.children ?? []) {
+      visit(child, nodePath, guid);
+    }
+  };
+
+  for (const child of root.children ?? []) {
+    visit(child, []);
+  }
+
+  results.sort((a, b) => a.path.length - b.path.length);
+  return results;
+}
+
+function findNodeForInstance(
+  instance: InstanceData,
+  index: SourcemapPropertyIndex,
+): SourcemapNode | null {
+  if (instance.guid) {
+    const byGuid = index.byGuid.get(instance.guid);
+    if (byGuid) return byGuid;
+  }
+
+  const key = pathClassKey(instance.path, instance.className);
+  const bucket = index.byPathClass.get(key);
+  if (!bucket || bucket.length === 0) return null;
+
+  if (bucket.length === 1) return bucket[0];
+
+  // Prefer a node that also carries a guid to reduce ambiguity
+  return bucket.find((node) => Boolean(node.guid)) ?? bucket[0];
+}
+
+export function findNodeForFilepath(
+  filepath: string,
+  index: SourcemapPropertyIndex | null,
+): SourcemapNode | null {
+  if (!index) return null;
+
+  const resolvedPath = path.resolve(filepath);
+  return index.byFilePath.get(resolvedPath) ?? null;
+}

@@ -1,0 +1,48 @@
+{
+  "productName": "Quack",
+  "identifier": "dev.enderex.quack",
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://github.com/EnderexDev/quack-releases/releases/latest/download/latest.json"]
+    }
+  },
+  "bundle": {
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ]
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Quack",
+        "url": "index.html",
+        "width": 1120,
+        "height": 740,
+        "minWidth": 820,
+        "minHeight": 560,
+        "visible": false,
+        "center": true,
+        "backgroundColor": "#0d0b08"
+      },
+      {
+        "label": "tray",
+        "title": "Quack",
+        "url": "tray.html",
+        "width": 320,
+        "height": 400,
+        "visible": false,
+        "decorations": false,
+        "resizable": false,
+        "skipTaskbar": true,
+        "alwaysOnTop": true,
+        "transparent": true,
+        "shadow": false,
+        "focus": true
+      }
+    ]
+  }
+}
