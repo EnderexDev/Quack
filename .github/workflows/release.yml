@@ -1,0 +1,117 @@
+# Builds the Quack app for a version tag and publishes it as a release of this repo, where
+# installed apps find it through latest.json. The tag is the source of exactly that build.
+#
+# Runs on a pushed tag v1.0.N, or by hand (Actions > Release > Run workflow) as a draft with a
+# version you give, to try the build without publishing anything.
+#
+# Secrets: TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD, the updater key.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version for the draft (e.g. 0.0.1)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+
+      - name: Install
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "draft=" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "draft=--draft" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the app
+        working-directory: app
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          npx @tauri-apps/cli@2 build \
+            --config src-tauri/tauri.official.conf.json \
+            --config '{"version":"${{ steps.version.outputs.version }}","bundle":{"createUpdaterArtifacts":true}}' \
+            --features official
+
+      - name: Collect installer, signature and manifest
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          out="release-out"
+          mkdir -p "$out"
+          dir="app/src-tauri/target/release/bundle/nsis"
+          installer=$(ls "$dir"/*-setup.exe | head -1)
+          sig="$installer.sig"
+          test -f "$installer" && test -f "$sig"
+          name="Quack_${version}_x64-setup.exe"
+          cp "$installer" "$out/$name"
+          cp "$sig" "$out/$name.sig"
+          node -e '
+            const fs = require("fs");
+            const [version, name, sigFile, repo, out] = process.argv.slice(1);
+            const manifest = {
+              version,
+              notes: `Quack ${version}`,
+              pub_date: new Date().toISOString(),
+              platforms: {
+                "windows-x86_64": {
+                  signature: fs.readFileSync(sigFile, "utf8").trim(),
+                  url: `https://github.com/${repo}/releases/download/v${version}/${name}`,
+                },
+              },
+            };
+            fs.writeFileSync(`${out}/latest.json`, JSON.stringify(manifest, null, 2));
+          ' "$version" "$name" "$out/$name.sig" "$GITHUB_REPOSITORY" "$out"
+          ls -la "$out"
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          if [ -n "${{ steps.version.outputs.draft }}" ]; then
+            gh release create "v${version}" release-out/* --draft --target "$GITHUB_SHA" \
+              --title "Quack ${version} (draft)" --notes "Test build of ${GITHUB_SHA}."
+          else
+            gh release create "v${version}" release-out/* --verify-tag --latest \
+              --title "Quack ${version}" --notes "Quack ${version}."
+          fi

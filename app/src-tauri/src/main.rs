@@ -356,7 +356,7 @@ fn update_marker() -> PathBuf {
 }
 
 /**
- * Looks for a newer version (Official: the latest release of EnderexDev/quack-releases; Dev:
+ * Looks for a newer version (Official: the latest release of EnderexDev/Quack; Dev: EnderexDev/quack-releases,
  * its dev-channel release) and downloads it in the background. The download is verified
  * against the signing key, and kept until the user clicks; nothing installs on its own.
  * Returns the version waiting for the click, if any.

@@ -12,6 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { compareVersions, existingVersions, highestVersion, nextVersion } from "./dev-version.mjs";
+import { publicSourceZip } from "../../scripts/export-public.mjs";
 
 const REPO = "EnderexDev/quack-releases";
 const TAG = "dev-channel";
@@ -83,9 +84,9 @@ fs.mkdirSync(out, { recursive: true });
 const name = `QuackDev_${version}_x64-setup.exe`;
 fs.copyFileSync(installer, path.join(out, name));
 fs.copyFileSync(`${installer}.sig`, path.join(out, `${name}.sig`));
-// The source of this build goes with it (GPL)
+// The source of this build goes with it (GPL), as the public copy: no private files
 const sourceZip = path.join(out, `quack-dev-${version}-source.zip`);
-run("git", ["archive", "--format=zip", `--prefix=quack-dev-${version}/`, "-o", sourceZip, "HEAD"], { cwd: repoRoot });
+publicSourceZip(sourceZip, `quack-dev-${version}/`);
 const manifest = {
   version,
   notes: `Quack Dev ${version}`,

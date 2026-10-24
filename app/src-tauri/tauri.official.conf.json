@@ -3,7 +3,7 @@
   "identifier": "dev.enderex.quack",
   "plugins": {
     "updater": {
-      "endpoints": ["https://github.com/EnderexDev/quack-releases/releases/latest/download/latest.json"]
+      "endpoints": ["https://github.com/EnderexDev/Quack/releases/latest/download/latest.json"]
     }
   },
   "bundle": {
