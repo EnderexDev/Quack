@@ -1123,52 +1123,94 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 		return instance, nil
 	end
 
+	local function queueStudioText(guid: string, instance: Instance, source: string)
+		if self.pendingScriptChanges[guid] then return end
+		local path = QuackService.getInstancePath(instance)
+		if path then
+			queueScriptChange({
+				guid = guid,
+				path = path,
+				className = instance.ClassName,
+				source = source,
+			})
+		end
+	end
+
+	local function applyScriptPatch(message)
+		local instance = self.guidMap[message.guid]
+		if instance and QuackService.isScript(instance) then
+			-- Quack: never overwrite a Studio edit the daemon has not seen. If Studio holds text
+			-- other than the last agreed one (an edit still queued, or typing in an open tab),
+			-- refuse the patch. The edit goes out when the typing pauses (the usual debounce),
+			-- and the daemon merges once. Sending it at once merged on every keystroke: 20
+			-- merges in 2.3 s of typing in the Anime Astral copy (each would be an AI call if
+			-- the text merge failed its check).
+			local current = ScriptEditorService:GetEditorSource(instance)
+			local synced = self.lastSyncedSource[message.guid]
+			local hasUnsentEdit = self.pendingScriptChanges[message.guid] ~= nil
+				or (synced ~= nil and current ~= synced)
+			if hasUnsentEdit and current ~= message.source then
+				self:debugPrint("Studio has an unsent edit; it goes for a merge when typing pauses:", `{instance.Parent}.{instance.Name}`)
+				queueStudioText(message.guid, instance, current)
+				return
+			end
+
+			-- Set before applying: .Source fires the change signal synchronously
+			self.lastSyncedSource[message.guid] = message.source
+			local _, changedUnderneath =
+				QuackService.setScriptSource(instance :: Script, message.source, { expected = current })
+			if changedUnderneath then
+				-- Typed into while the write yielded (UpdateSourceAsync, ~258 ms in Team Create):
+				-- nothing was written, and that text goes for a merge against the old agreed one
+				self.lastSyncedSource[message.guid] = synced
+				self:debugPrint("Typed into while patching; it goes for a merge:", `{instance.Parent}.{instance.Name}`)
+				queueStudioText(message.guid, instance, ScriptEditorService:GetEditorSource(instance))
+				return
+			end
+
+			self:infoPrint("Updated script:", `{instance.Parent}.{instance.Name}`)
+		else
+			warn("[Quack]: Cannot apply patch - instance not found for GUID:", message.guid)
+			local count = 0
+			for _ in pairs(self.guidMap) do
+				count += 1
+			end
+			warn("[Quack]: Total tracked instances:", count)
+		end
+	end
+
+	-- Quack: patches of one script apply one at a time, in arrival order. Each message runs in its
+	-- own thread, and a write that yields (an open tab, or Team Create, where every write is an
+	-- UpdateSourceAsync) let the next patch read the editor before the first landed and send that
+	-- old text back as a Studio edit. Patches of different scripts still run side by side.
+	local scriptPatchQueues: { [string]: { thread } } = {}
+	local function withScriptPatchLock(guid: string, apply: () -> ...any)
+		local queue = scriptPatchQueues[guid]
+		if queue then
+			table.insert(queue, coroutine.running())
+			coroutine.yield()
+		else
+			scriptPatchQueues[guid] = {}
+		end
+
+		local ok, err = pcall(apply)
+
+		local waiting = scriptPatchQueues[guid]
+		local nextThread = table.remove(waiting, 1)
+		if nextThread then
+			task.spawn(nextThread)
+		else
+			scriptPatchQueues[guid] = nil
+		end
+		if not ok then error(err, 0) end
+	end
+
 	local function processMessage(message)
 		self:debugPrint("Processing message type:", message.type)
 
 		if message.type == "patchScript" then
 			self:debugPrint("Patch requested for GUID:", message.guid)
-			local instance = self.guidMap[message.guid]
-			if instance and QuackService.isScript(instance) then
-				-- Quack: never overwrite a Studio edit the daemon has not seen. If Studio holds text
-				-- other than the last agreed one (an edit still queued, or typing in an open tab),
-				-- refuse the patch. The edit goes out when the typing pauses (the usual debounce),
-				-- and the daemon merges once. Sending it at once merged on every keystroke: 20
-				-- merges in 2.3 s of typing in the Anime Astral copy (each would be an AI call if
-				-- the text merge failed its check).
-				local current = ScriptEditorService:GetEditorSource(instance)
-				local synced = self.lastSyncedSource[message.guid]
-				local hasUnsentEdit = self.pendingScriptChanges[message.guid] ~= nil
-					or (synced ~= nil and current ~= synced)
-				if hasUnsentEdit and current ~= message.source then
-					self:debugPrint("Studio has an unsent edit; it goes for a merge when typing pauses:", `{instance.Parent}.{instance.Name}`)
-					if not self.pendingScriptChanges[message.guid] then
-						local path = QuackService.getInstancePath(instance)
-						if path then
-							queueScriptChange({
-								guid = message.guid,
-								path = path,
-								className = instance.ClassName,
-								source = current,
-							})
-						end
-					end
-					return
-				end
-
-				-- Set before applying: .Source fires the change signal synchronously
-				self.lastSyncedSource[message.guid] = message.source
-				QuackService.setScriptSource(instance :: Script, message.source)
-
-				self:infoPrint("Updated script:", `{instance.Parent}.{instance.Name}`)
-			else
-				warn("[Quack]: Cannot apply patch - instance not found for GUID:", message.guid)
-				local count = 0
-				for _ in pairs(self.guidMap) do
-					count += 1
-				end
-				warn("[Quack]: Total tracked instances:", count)
-			end
+			withScriptPatchLock(message.guid, function() applyScriptPatch(message) end)
 		elseif message.type == "createInstance" then
 			self:debugPrint("Create instance requested from filesystem:", message.name, message.className)
 			setOutboundSuppressed(true)
@@ -1212,7 +1254,8 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 							self.usedGuids
 						)
 						self.lastSyncedSource[createdGuid] = message.source
-						QuackService.setScriptSource(instance :: Script, message.source)
+						-- A script made in this call (not one already there) has no tab anywhere yet
+						QuackService.setScriptSource(instance :: Script, message.source, { fresh = instance ~= existing })
 					end
 				end
 
@@ -1324,7 +1367,7 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 					instance = migrated
 					if QuackService.isScript(instance) and message.source ~= nil then
 						self.lastSyncedSource[message.guid] = message.source
-						QuackService.setScriptSource(instance :: Script, message.source)
+						QuackService.setScriptSource(instance :: Script, message.source, { fresh = true })
 					end
 					attachListeners(instance)
 					return instance

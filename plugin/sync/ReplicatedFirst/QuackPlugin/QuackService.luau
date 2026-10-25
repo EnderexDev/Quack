@@ -6,6 +6,7 @@ QuackService.VERSION = "1.0.0"
 local ScriptEditorService = game:GetService("ScriptEditorService")
 local HttpService = game:GetService("HttpService")
 local InsertService = game:GetService("InsertService")
+local RunService = game:GetService("RunService")
 
 -- Modules
 local Serializer = require("./Serializer")
@@ -330,28 +331,92 @@ local function applyMinimalDocumentEdit(doc: ScriptDocument, source: string): bo
 	return ok and doc:GetText() == source
 end
 
+--- Quack: whether this Studio edits a Team Create place. FindScriptDocument only sees this
+--- Studio's tabs, and .Source leaves a collaborator's open tab on the old text: their next
+--- keystroke writes that whole old text back (EnemyConfig, Anime Astral, 23/10/26). Measured
+--- 25/10/26: an edit-mode Studio in Team Create has a NetworkClient; one on a local file has none.
+function QuackService.isTeamCreate(): boolean
+	return RunService:IsEdit() and game:FindService("NetworkClient") ~= nil
+end
+
+export type SetSourceOptions = {
+	-- The instance was created in this same call: no tab anywhere can show it yet
+	fresh: boolean?,
+	-- The text the caller checked; if the script holds anything else by the time the write
+	-- lands (someone typed while it yielded), nothing is written and the second result is true
+	expected: string?,
+}
+
 --- Utility: set script source safely (handles large sources via ScriptEditorService)
-function QuackService.setScriptSource(scriptInstance: Script | LocalScript | ModuleScript, source: string)
-	-- Quack: .Source costs ~80 us against ~80 ms for UpdateSourceAsync (measured 19/10/26), but it
-	-- refuses more than 200,000 characters, and on a script open in the editor it leaves the tab
-	-- showing the old text. Those two cases keep the slow path.
+function QuackService.setScriptSource(
+	scriptInstance: Script | LocalScript | ModuleScript,
+	source: string,
+	options: SetSourceOptions?
+): (boolean, boolean?)
+	local fresh = options and options.fresh
+	local expected = options and options.expected
+	-- Quack: .Source costs ~80 us against ~80 ms for UpdateSourceAsync (measured 19/10/26; 258 ms
+	-- in Team Create, 25/10/26), but it refuses more than 200,000 characters, it leaves a tab open
+	-- in this Studio on the old text, and in Team Create a collaborator's tab too (that one this
+	-- Studio cannot see). Those cases keep the slow path. Fresh instances have no tab anywhere.
 	local doc = ScriptEditorService:FindScriptDocument(scriptInstance)
-	if #source <= 200000 and doc == nil then
+	if doc == nil and scriptInstance.Source == source then return true, false end
+	if #source <= 200000 and doc == nil and (fresh or not QuackService.isTeamCreate()) then
 		local okDirect = pcall(function() scriptInstance.Source = source end)
-		if okDirect then return true end
+		if okDirect then return true, false end
 	end
 
-	if doc and applyMinimalDocumentEdit(doc, source) then return true end
+	if doc then
+		if expected ~= nil and doc:GetText() ~= expected then return false, true end
+		if applyMinimalDocumentEdit(doc, source) then return true, false end
+	end
 
+	local changedUnderneath = false
 	local okUpdateSource, errUpdateSource = pcall(function()
-		ScriptEditorService:UpdateSourceAsync(scriptInstance, function(...) return source end)
+		ScriptEditorService:UpdateSourceAsync(scriptInstance, function(old: string)
+			if expected ~= nil and old ~= expected then
+				changedUnderneath = true
+				return old
+			end
+			return source
+		end)
 	end)
 
 	if not okUpdateSource then
 		warn(`[Quack]: Failed to set script source for {scriptInstance}:`, errUpdateSource)
 	end
 
-	return okUpdateSource
+	if changedUnderneath then return false, true end
+	return okUpdateSource, false
+end
+
+--- Writes many scripts at once, `MAX_PARALLEL_WRITES` at a time. In Team Create each write is an
+--- UpdateSourceAsync of ~258 ms; measured 25/10/26, 20 of them took 5.3 s one after another and
+--- 281 ms side by side, every one landing.
+local MAX_PARALLEL_WRITES = 32
+function QuackService.setScriptSources(writes: { { instance: Script | LocalScript | ModuleScript, source: string } })
+	local nextIndex = 1
+	local running = 0
+	local caller = coroutine.running()
+	local finished = false
+
+	local function worker()
+		while nextIndex <= #writes do
+			local write = writes[nextIndex]
+			nextIndex += 1
+			local ok, err = pcall(QuackService.setScriptSource, write.instance, write.source)
+			if not ok then warn(`[Quack]: Failed to set script source for {write.instance}:`, err) end
+		end
+		running -= 1
+		if running == 0 and finished then task.spawn(caller) end
+	end
+
+	for _ = 1, math.min(MAX_PARALLEL_WRITES, #writes) do
+		running += 1
+		task.spawn(worker)
+	end
+	finished = true
+	if running > 0 then coroutine.yield() end
 end
 
 --- Create/update instance data with dedup tracking (returns data if changed, nil if duplicate)
@@ -533,6 +598,8 @@ function QuackService.applySnapshotInstances(
 	local initialStudioGuids: { [string]: boolean } = {}
 	local resolvedInstancesByGuid: { [string]: Instance } = {}
 	local deferredPropertyApplications: { { instance: Instance, properties: { [string]: any }? } } = {}
+	-- Written together after the loop: in Team Create each one yields (setScriptSources)
+	local scriptWrites: { { instance: Script | LocalScript | ModuleScript, source: string } } = {}
 
 	local lockedContainerParents = {
 		StarterPlayerScripts = "StarterPlayer",
@@ -781,7 +848,7 @@ function QuackService.applySnapshotInstances(
 
 		if QuackService.isScriptClass(item.className) and item.source and instance then
 			if QuackService.isScript(instance) then
-				QuackService.setScriptSource(instance :: Script, item.source)
+				table.insert(scriptWrites, { instance = instance :: Script, source = item.source })
 				updated += 1
 			else
 				debugPrint(
@@ -796,6 +863,7 @@ function QuackService.applySnapshotInstances(
 		local ok, err: string? = pcall(applyItem, item)
 		if not ok then warn(`[Quack]: Skipped snapshot instance "{item.name}" ({item.className}): {err}`) end
 	end
+	QuackService.setScriptSources(scriptWrites)
 
 	for _, pending in deferredPropertyApplications do
 		local ok, err: string? = pcall(function()

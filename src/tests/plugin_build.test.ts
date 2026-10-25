@@ -45,3 +45,20 @@ test("the Dev plugin is green and the Official one stays yellow", () => {
   assert.ok(official.includes('Brand = Color3.fromHex("ffd41f")'));
   assert.ok(!official.includes("5ee36a"));
 });
+
+// In Team Create, .Source leaves a collaborator's open tab on the old text and their next
+// keystroke writes it back (EnemyConfig, Anime Astral, 23/10/26). Measured 25/10/26 with two
+// Studios: UpdateSourceAsync and EditTextAsync reach that tab. Nothing here runs Luau, so this
+// pins the shape: the .Source shortcut only outside Team Create or on a fresh instance, and
+// patches of one script one at a time (each write there yields ~258 ms).
+test("in Team Create the plugin never writes an existing script by .Source", () => {
+  const plugin = build(false);
+  const setSource = plugin.match(/function QuackService\.setScriptSource\([\s\S]*?\nend\n/)?.[0] ?? "";
+  assert.ok(setSource.length > 0, "setScriptSource not found");
+  assert.match(plugin, /function QuackService\.isTeamCreate\(\)[\s\S]{0,120}FindService\("NetworkClient"\)/);
+  const shortcuts = [...setSource.matchAll(/^.*scriptInstance\.Source = source.*$/gm)];
+  assert.equal(shortcuts.length, 1);
+  const guard = setSource.slice(0, shortcuts[0].index).split("\n").slice(-2).join("\n");
+  assert.match(guard, /\(fresh or not QuackService\.isTeamCreate\(\)\)/);
+  assert.match(plugin, /if message\.type == "patchScript" then[\s\S]{0,200}withScriptPatchLock\(message\.guid/);
+});
