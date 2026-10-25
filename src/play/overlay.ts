@@ -6,8 +6,9 @@ import { classifyScriptFileName } from "../util/scriptFile.js";
 /**
  * Quack: a playtest of a git worktree's scripts (`quackdev play`). The place in edit mode stays on
  * the registered folder; for the moment Studio copies it into the play session, the plugin swaps
- * in the branch's scripts and then restores them. This works out what to swap: only scripts git
- * tracks in the worktree count, so the maps' scripts (ignored folders) are never touched.
+ * in the branch's scripts and then restores them. This works out what to swap: only what the
+ * branch changed since it forked from the place's folder, so Studio keeps everyone else's text
+ * (and the maps' scripts, ignored by git, are never touched).
  */
 
 export interface PlayPatch {
@@ -38,6 +39,8 @@ export interface PlayOverlay {
   disables: PlayDisable[];
   /** Branch changes the play cannot carry, said in the report */
   skipped: string[];
+  /** Scripts the branch changed that Studio holds changed by someone else, said in the report */
+  conflicts: string[];
 }
 
 /** What the overlay needs from the daemon's view of the place */
@@ -52,21 +55,6 @@ export interface PlaceView {
 
 const SCRIPT_FILE = /\.(luau|lua)$/i;
 
-/**
- * Whether the folder's file system ignores case (Foo.luau and foo.luau one file): Windows does;
- * a Mac volume may or may not, so it is asked, by looking the folder up in the other case
- */
-function ignoresCase(folder: string): boolean {
-  if (process.platform === "win32") return true;
-  const flipped = folder.replace(/[a-z]/gi, (c) => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase()));
-  if (flipped === folder) return false;
-  try {
-    return fs.realpathSync(flipped) === fs.realpathSync(folder);
-  } catch {
-    return false;
-  }
-}
-
 /** FNV-1a 32 over the UTF-8 bytes, as hex; the plugin computes the same in Luau */
 export function textHash(text: string): string {
   let hash = 0x811c9dc5;
@@ -78,7 +66,14 @@ export function textHash(text: string): string {
 }
 
 function git(cwd: string, args: string[]): string {
-  return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", windowsHide: true, timeout: 20_000, maxBuffer: 256 * 1024 * 1024 });
+  // stderr piped: a `git show` of a file the commit lacks is an answer here, not a line for the log
+  return execFileSync("git", ["-C", cwd, ...args], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+    timeout: 20_000,
+    maxBuffer: 256 * 1024 * 1024,
+  });
 }
 
 /** The path as it is on disk: git prints long names, a registered folder may hold an 8.3 one (RUNNER~1) */
@@ -116,13 +111,54 @@ export function worktreeOf(folder: string, registered: string): string {
   return path.resolve(top);
 }
 
-/** Files git tracks under `dir` (absolute paths) */
-function trackedFiles(root: string, dir: string): string[] {
-  const rel = path.relative(root, dir) || ".";
-  return git(root, ["ls-files", "-z", "--", rel])
+/**
+ * Said when the play's check finds a script with the place's text. Measured 25/10/26 in Anime
+ * Astral (Team Create): a script whose tab is open in the Studio running the swap, and was edited
+ * through the editor there (by hand, or by the sync writing to the open tab), goes into the play
+ * with the tab's text, not the .Source the swap set. The same tab open and not edited, or a
+ * collaborator's tab even with edits, did not get in the way; closing the tab let the play through
+ */
+export const PLAY_TAB_HINT =
+  "a script whose tab is open in the Studio running the play, and was edited there, goes into the play with the tab's text: close that tab and play again";
+
+/** The text git holds for a file at a commit, or undefined when the commit has no such file */
+function blobAt(root: string, commit: string, rel: string): string | undefined {
+  try {
+    return git(root, ["show", `${commit}:${rel.split(path.sep).join("/")}`]);
+  } catch {
+    return undefined;
+  }
+}
+
+const lfOf = (text: string) => text.replace(/\r\n/g, "\n");
+
+/**
+ * What the branch brings: the merge-base of the worktree's HEAD with the registered checkout's
+ * HEAD, and every file under the sync folder the worktree changed since then (committed or not).
+ * 24/10/26 on Anime Astral: comparing every tracked script with Studio swapped in any script
+ * someone else had edited in Studio without a commit (the balancer's AccessoryConfig), so every
+ * worktree's play tried to revert it, and every play failed its check on it (that script also
+ * had a tab edited in the swapping Studio, which the copy takes over .Source: PLAY_TAB_HINT)
+ */
+function branchChanges(
+  registeredRoot: string,
+  worktreeRoot: string,
+  syncRel: string,
+): { base: string; registeredHead: string; changes: string[] } {
+  let base: string;
+  let registeredHead: string;
+  try {
+    registeredHead = git(registeredRoot, ["rev-parse", "HEAD"]).trim();
+    base = git(worktreeRoot, ["merge-base", "HEAD", registeredHead]).trim();
+  } catch {
+    throw new Error("the worktree's branch shares no commit with the place's folder, so there is no telling what it brings");
+  }
+  // --no-renames: a moved script is the old one deleted and a new one created
+  const changes = git(worktreeRoot, ["diff", "--name-only", "-z", "--no-renames", base, "--", syncRel ? syncRel.split(path.sep).join("/") : "."])
     .split("\0")
     .filter(Boolean)
-    .map((file) => path.resolve(root, file));
+    .map((file) => path.normalize(file));
+  return { base, registeredHead, changes };
 }
 
 export function computePlayOverlay(registeredRoot: string, worktreeRoot: string, place: PlaceView): PlayOverlay {
@@ -131,68 +167,76 @@ export function computePlayOverlay(registeredRoot: string, worktreeRoot: string,
   if (syncRel === ".." || syncRel.startsWith(`..${path.sep}`) || path.isAbsolute(syncRel)) {
     throw new Error("the sync folder is outside the place's folder");
   }
-  const branchSync = path.join(worktreeRoot, syncRel);
-  const overlay: PlayOverlay = { patches: [], creates: [], disables: [], skipped: [] };
+  const overlay: PlayOverlay = { patches: [], creates: [], disables: [], skipped: [], conflicts: [] };
+  const { base, registeredHead, changes } = branchChanges(registeredRoot, worktreeRoot, syncRel);
 
-  const branchFiles = trackedFiles(worktreeRoot, branchSync);
-  const foldCase = ignoresCase(worktreeRoot);
-  const fileKey = (rel: string) => (foldCase ? rel.toLowerCase() : rel);
-  const inBranch = new Set<string>();
-  for (const file of branchFiles) {
-    const rel = path.relative(branchSync, file);
-    if (!SCRIPT_FILE.test(file)) continue;
-    let raw: string;
+  for (const repoRel of changes) {
+    if (!SCRIPT_FILE.test(repoRel)) continue;
+    const rel = path.relative(syncRel, repoRel);
+    const file = path.join(worktreeRoot, repoRel);
+    const guid = place.guidByFile(path.join(place.syncDir, rel));
+    const node = guid ? place.node(guid) : undefined;
+
+    // Studio holds someone else's text when it differs from the text the branch started from:
+    // a later commit of the place's folder, or an edit made in Studio and not committed. The
+    // branch's text replaces it in the play, and the report names the file
+    const conflict = (studio: string | undefined) => {
+      if (studio === undefined) return;
+      const baseText = blobAt(worktreeRoot, base, repoRel);
+      if (baseText === undefined || lfOf(baseText) === lfOf(studio)) return;
+      const headText = registeredHead === base ? undefined : blobAt(registeredRoot, registeredHead, repoRel);
+      overlay.conflicts.push(
+        headText !== undefined && lfOf(headText) === lfOf(studio)
+          ? `${rel}: the place's folder committed a change to it after the branch forked; the play runs the branch's text without that change (rebase the branch to get both)`
+          : `${rel}: changed in Studio and not committed (someone's edit there); the play runs the branch's text without that edit`,
+      );
+    };
+
+    // Read whatever git says: it calls a file turned into a folder a deletion too
+    let raw: string | undefined;
     try {
       raw = fs.readFileSync(file, "utf8");
     } catch (error) {
-      // Tracked but deleted and not committed: the branch as it is has no script, so the place's
-      // one is turned off below like any other deletion. Any other failure is not a deletion:
-      // the script stays as the place has it, and the report says so
+      // Not there (deleted, committed or not) is a deletion. Any other failure is not one: the
+      // script stays as the place has it, and the report says so
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        inBranch.add(fileKey(rel));
         overlay.skipped.push(`${rel}: could not be read, left as the place has it (${(error as Error).message})`);
+        continue;
       }
+    }
+
+    if (raw === undefined) {
+      if (!guid || !node) continue;
+      conflict(node.source);
+      if (node.className === "ModuleScript") {
+        overlay.skipped.push(`${rel}: deleted in the branch, a ModuleScript stays in the play (nothing in the branch requires it)`);
+        continue;
+      }
+      overlay.disables.push({ guid, path: node.path });
       continue;
     }
-    inBranch.add(fileKey(rel));
+
     // git on Windows checks a worktree out with CRLF (core.autocrlf, no .gitattributes in the
     // games), while Studio and the synced folder hold LF: without this every script of a fresh
     // worktree differs (measured 22/10/26 on PA). A script whose Studio text has CR keeps it
-    const lf = raw.replace(/\r\n/g, "\n");
-    const guid = place.guidByFile(path.join(place.syncDir, rel));
+    const lf = lfOf(raw);
     if (guid) {
-      const node = place.node(guid);
       if (!node) continue;
       const source = node.source?.includes("\r\n") ? raw : lf;
-      if (node.source !== source) overlay.patches.push({ guid, source, path: node.path, hash: textHash(source) });
+      if (node.source === source) continue;
+      conflict(node.source);
+      overlay.patches.push({ guid, source, path: node.path, hash: textHash(source) });
       continue;
     }
-    const source = lf;
     const segments = rel.split(/[/\\]/).filter(Boolean);
     const classified = classifyScriptFileName(segments[segments.length - 1], { stripDisambiguationSuffix: true });
     overlay.creates.push({
       className: classified.className,
       name: classified.scriptName,
       parentPath: segments.slice(0, -1),
-      source,
-      hash: textHash(source),
+      source: lf,
+      hash: textHash(lf),
     });
-  }
-
-  // Deleted by the branch: tracked in the registered folder, absent from the branch. Only tracked
-  // files: a script git ignores (inside a map) is the place's, never the branch's to remove
-  for (const file of trackedFiles(registeredRoot, place.syncDir)) {
-    if (!SCRIPT_FILE.test(file)) continue;
-    const rel = path.relative(place.syncDir, file);
-    if (inBranch.has(fileKey(rel))) continue;
-    const guid = place.guidByFile(file);
-    const node = guid ? place.node(guid) : undefined;
-    if (!guid || !node) continue;
-    if (node.className === "ModuleScript") {
-      overlay.skipped.push(`${rel}: deleted in the branch, a ModuleScript stays in the play (nothing in the branch requires it)`);
-      continue;
-    }
-    overlay.disables.push({ guid, path: node.path });
   }
   return overlay;
 }

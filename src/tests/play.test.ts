@@ -130,6 +130,92 @@ test("play: only the branch's tracked scripts are swapped, and the play session'
   }
 });
 
+// 24/10/26, Anime Astral: the balancer edited AccessoryConfig in Studio without a commit, and every
+// worktree's play tried to swap it back, since every tracked script that differed from Studio
+// was swapped. Only what the branch changed since it forked is the branch's
+test("play: only what the branch changed since it forked is swapped; Studio's and main's own edits stay", async () => {
+  const { root, repo, worktree } = fixture();
+  const prev = { syncDir: config.syncDir, sourcemapPath: config.sourcemapPath, port: config.port };
+  let daemon: SyncDaemon | undefined;
+  try {
+    config.syncDir = path.join(repo, "sync");
+    config.sourcemapPath = path.join(repo, "sourcemap.json");
+    config.port = 0;
+    daemon = new SyncDaemon();
+    const sent: any[] = [];
+    (daemon as any).ipc.send = (message: any) => {
+      sent.push(message);
+      return true;
+    };
+    (daemon as any).ipc.isConnected = () => true;
+    const data = [
+      ...placeData,
+      { guid: "acc", className: "ModuleScript", name: "AccessoryConfig", path: ["ReplicatedStorage", "AccessoryConfig"], parentGuid: "rs", source: "return { power = 1 }" },
+      { guid: "late", className: "Script", name: "MainSystem", path: ["ServerScriptService", "MainSystem"], parentGuid: "sss", source: "print('main')" },
+    ];
+    (daemon as any).handleStudioMessage({ type: "fullSnapshot", data, placeId: 5 });
+    const sync = path.join(repo, "sync");
+    const mainSystem = path.join("sync", "ServerScriptService", "MainSystem.server.luau");
+    git(repo, "add", "-A");
+    git(repo, "reset", "-q", "--", mainSystem);
+    git(repo, "commit", "-q", "-m", "place");
+    git(repo, "worktree", "add", "-q", "-b", "feature", worktree);
+
+    // main moves on after the fork: a new system, and a change to Same
+    write(path.join(sync, "ReplicatedStorage", "Same.luau"), "local a = 2\nreturn a");
+    (daemon as any).tree.getNode("same").source = "local a = 2\nreturn a";
+    git(repo, "add", "-A");
+    git(repo, "commit", "-q", "-m", "main moves on");
+
+    // Edited in Studio and not committed: AccessoryConfig (the branch leaves it) and Config (the
+    // branch changes it too: a real conflict)
+    (daemon as any).tree.getNode("acc").source = "return { power = 7 }";
+    (daemon as any).tree.getNode("cfg").source = "return { damage = 12 }";
+
+    const branchSync = path.join(worktree, "sync");
+    write(path.join(branchSync, "ReplicatedStorage", "Config.luau"), "return { damage = 25 }");
+    // and Same, which main changed after the fork: the play runs the branch's without main's
+    write(path.join(branchSync, "ReplicatedStorage", "Same.luau"), "local a = 3\nreturn a");
+    git(worktree, "add", "-A");
+    git(worktree, "commit", "-q", "-m", "feature");
+
+    const playing = daemon.startPlay(worktree);
+    await new Promise((r) => setTimeout(r, 50));
+    const swap = sent.find((m) => m.type === "playOverlay");
+    assert.deepEqual(
+      swap.patches,
+      [
+        { guid: "cfg", source: "return { damage = 25 }" },
+        { guid: "same", source: "local a = 3\nreturn a" },
+      ],
+      "Studio's own AccessoryConfig is not the branch's to swap",
+    );
+    assert.deepEqual(swap.disables, [], "a script main added after the fork is not turned off");
+    assert.deepEqual(swap.creates, []);
+    assert.equal(swap.checks.length, 2);
+    (daemon as any).handleStudioMessage({ type: "playOverlayResult", id: swap.id, ok: true, windowMs: 1 });
+    const state = await playing;
+    assert.equal(state.checks, 2);
+    assert.equal(state.conflicts.length, 2);
+    assert.match(state.conflicts[0], /Config\.luau: changed in Studio and not committed/);
+    assert.match(state.conflicts[1], /Same\.luau: the place's folder committed a change to it after the branch forked/);
+
+    // A branch that brings nothing swaps nothing, whatever Studio holds
+    sent.length = 0;
+    git(worktree, "reset", "-q", "--hard", "HEAD~1");
+    const empty = daemon.startPlay(worktree);
+    await new Promise((r) => setTimeout(r, 50));
+    const none = sent.find((m) => m.type === "playOverlay");
+    assert.deepEqual([none.patches, none.creates, none.disables], [[], [], []]);
+    (daemon as any).handleStudioMessage({ type: "playOverlayResult", id: none.id, ok: true, windowMs: 1 });
+    assert.equal((await empty).checks, 0);
+  } finally {
+    await daemon?.stop();
+    Object.assign(config, prev);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("play: Studio failing to swap leaves the play failed, and a second play waits for the first", async () => {
   const { root, repo, worktree } = fixture();
   const prev = { syncDir: config.syncDir, sourcemapPath: config.sourcemapPath, port: config.port };
@@ -259,10 +345,22 @@ test("play: a branch script that cannot be read is left as the place has it, nev
 
 test("quackdev play: says the branch is there only when the check passed, and keeps removed scripts apart", async () => {
   const { runControl } = await import("../control/commands.js");
-  const run = async (verify: any, laterId?: string) => {
+  const run = async (verify: any, laterId?: string, change: Record<string, unknown> = {}) => {
     const out: string[] = [];
     const err: string[] = [];
-    const started = { id: "p1", worktree: "W", done: true, patches: 2, creates: 0, disables: 0, skipped: [], result: { ok: true, windowMs: 1500 } };
+    const started = {
+      id: "p1",
+      worktree: "W",
+      done: true,
+      patches: 2,
+      creates: 0,
+      disables: 0,
+      skipped: [],
+      conflicts: ["ReplicatedStorage\\Config.luau: changed in Studio and not committed (someone's edit there); the play runs the branch's text without that edit"],
+      checks: 2,
+      result: { ok: true, windowMs: 1500 },
+      ...change,
+    };
     const client = {
       get: async (pathname: string) => {
         if (pathname === "/api/state") return { places: [{ placeId: "5", name: "Game", folder: os.tmpdir() }] };
@@ -300,6 +398,22 @@ test("quackdev play: says the branch is there only when the check passed, and ke
   assert.equal(bad.code, 1);
   assert.match(bad.err, /does NOT have the branch: ReplicatedStorage\.Config/);
   assert.doesNotMatch(bad.out, /have the branch\./);
+  assert.match(bad.err, /tab is open in the Studio running the play/, "the cause measured 25/10/26 is named");
+  assert.match(bad.out, /conflict: ReplicatedStorage\\Config\.luau: changed in Studio/);
+
+  // The denominator is what was sent, not what passed
+  const part = await run({ ok: true, passed: 1, failed: [], unverified: ["ServerScriptService.Gone"] }, undefined, { checks: 2 });
+  assert.match(part.out, /1 of 2 have the branch/);
+
+  // A swap Studio refused names the scripts (24/10/26: only "could not be swapped in" came out)
+  const refused = await run(undefined, undefined, {
+    result: { ok: false, error: "the branch could not be swapped in", failed: ["ReplicatedStorage.Big: Source too long"] },
+  });
+  assert.equal(refused.code, 1);
+  assert.match(refused.err, /could not be swapped in\n {2}ReplicatedStorage\.Big: Source too long/);
+
+  const nothing = await run({ ok: true, passed: 0, failed: [], unverified: [] }, undefined, { checks: 0, patches: 0, conflicts: [] });
+  assert.match(nothing.out, /brings no script change since it forked/);
 
   const replaced = await run(undefined, "p2");
   assert.equal(replaced.code, 1);

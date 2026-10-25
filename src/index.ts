@@ -44,6 +44,10 @@ export interface PlayState {
   creates: number;
   disables: number;
   skipped: string[];
+  /** Scripts the branch changed that Studio holds changed by someone else (the play runs the branch's) */
+  conflicts: string[];
+  /** Checks the play session runs: one per script the play carries */
+  checks: number;
   result?: { ok: boolean; error?: string; windowMs?: number; applied?: number; failed?: string[] };
   verify?: { ok: boolean; passed: number; failed: string[]; unverified: string[]; at: number };
 }
@@ -1966,10 +1970,13 @@ export class SyncDaemon {
       creates: overlay.creates.length,
       disables: overlay.disables.length,
       skipped: overlay.skipped,
+      conflicts: overlay.conflicts,
+      checks: checks.length,
     };
     this.play = state;
     log.info(`Play of ${root}: ${state.patches} changed, ${state.creates} new, ${state.disables} turned off${overlay.skipped.length ? `, ${overlay.skipped.length} the play cannot carry` : ""}`);
     for (const line of overlay.skipped) log.warn(`Play: ${line}`);
+    for (const line of overlay.conflicts) log.warn(`Play conflict: ${line}`);
     const result = await new Promise<PlayOverlayResultMessage>((resolve) => {
       const timer = setTimeout(
         () => resolve({ type: "playOverlayResult", id, ok: false, error: "Studio did not answer in 40 s (a plugin without play support, or the place closed)" }),

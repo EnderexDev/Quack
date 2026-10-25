@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { HubClient, HubError, HubOffline, type FlavorInfo } from "./hubClient.js";
+import { PLAY_TAB_HINT } from "../play/overlay.js";
 
 /**
  * `quack` / `quackdev`: the hub from a terminal. Every command is one or a few calls to the
@@ -135,8 +136,9 @@ Wait
       --timeout <s>           give up after this long (default 120), exit ${EXIT.timeout}
 
 Play
-  play [place] [-w <folder>]  A playtest with a git worktree's scripts (default: the worktree
-                            you are in). The place in edit mode keeps its own scripts; Studio
+  play [place] [-w <folder>]  A playtest with the scripts a git worktree's branch changed since
+                            it forked (default: the worktree you are in); every other script
+                            runs as Studio has it. The place in edit mode keeps its own; Studio
                             holds the branch's only while it copies the place (~1 to 2 s)
 
 Change${info.flavor === "official" ? " (each asks first; --yes to skip, required without a terminal)" : ""}
@@ -673,7 +675,12 @@ async function play(ctx: ControlContext, options: Options, query: string | undef
   if (!started?.result?.ok) {
     const why = started?.result?.error ?? "the swap did not finish";
     if (options.json) ctx.out(JSON.stringify({ play: started }, null, 2));
-    else ctx.err(`Play of ${worktree} in ${placeLabel(place)} failed: ${why}`);
+    else {
+      ctx.err(`Play of ${worktree} in ${placeLabel(place)} failed: ${why}`);
+      // Which scripts, as Studio said it (before 25/10/26 only "could not be swapped in" came out)
+      for (const line of started?.result?.failed ?? []) ctx.err(`  ${line}`);
+      for (const line of started?.conflicts ?? []) ctx.err(`  conflict: ${line}`);
+    }
     return EXIT.error;
   }
   // The play session's check comes once its plugin loads (seconds after the game's scripts)
@@ -690,11 +697,18 @@ async function play(ctx: ControlContext, options: Options, query: string | undef
     ctx.out(JSON.stringify({ play: state }, null, 2));
   } else {
     ctx.out(`Playing ${state.worktree} in ${placeLabel(place)}: ${state.patches} changed, ${state.creates} new, ${state.disables} turned off.`);
+    if (state.checks === 0) ctx.out("The branch brings no script change since it forked from the place's folder: this play runs the place as Studio has it.");
     ctx.out(`The place in edit mode held the branch for ${Math.round(state.result.windowMs ?? 0)} ms, and has its own scripts again.`);
     for (const line of state.skipped ?? []) ctx.out(`  not carried: ${line}`);
+    for (const line of state.conflicts ?? []) ctx.out(`  conflict: ${line}`);
+    // A hub from before 25/10/26 does not say how many checks it sent
+    const total = state.checks ?? state.verify?.passed;
     if (!state.verify) ctx.err("The play session did not report its check (closed early, or a plugin without play support).");
-    else if (state.verify.ok) ctx.out(`Checked inside the play: ${state.verify.passed} of ${state.verify.passed} have the branch.`);
-    else ctx.err(`The play session does NOT have the branch: ${state.verify.failed.slice(0, 10).join("; ")}`);
+    else if (state.verify.ok) ctx.out(`Checked inside the play: ${state.verify.passed} of ${total} have the branch.`);
+    else {
+      ctx.err(`The play session does NOT have the branch: ${state.verify.failed.slice(0, 10).join("; ")}`);
+      if (state.verify.failed.some((line: string) => line.includes("has the place's text"))) ctx.err(`  Likely cause: ${PLAY_TAB_HINT}.`);
+    }
     if (state.verify?.unverified?.length) ctx.out(`  ${state.verify.unverified.length} swapped script(s) were gone before the check (the game removed them), so not checked.`);
   }
   if (!state.verify) return EXIT.timeout;
