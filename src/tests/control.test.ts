@@ -461,7 +461,7 @@ test("mcp: no hub running is a tool error that says so, and the real command spe
 test("connect-ai: Cursor's file keeps every other server and key, a broken one is never overwritten, a missing CLI is not installed", { timeout: 30000 }, async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "quack-clients-"));
   try {
-    const clients = { home, claudeBin: "quack-no-such-claude", codexBin: "quack-no-such-codex" };
+    const clients = { home, claudeBin: "quack-no-such-claude", codexBin: "quack-no-such-codex", env: {} };
     const server = { command: process.execPath, args: ["cli.mjs", "--flavor", "dev", "mcp"] };
     const run = async (...argv: string[]) => {
       const out: string[] = [];
@@ -497,6 +497,87 @@ test("connect-ai: Cursor's file keeps every other server and key, a broken one i
 
     assert.equal((await run("connect-ai", "vscode")).code, 1);
   } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("connect-ai reaches every config folder: the default, ~/.claude-*, ~/.codex-* and T3 Code's providers, named by app and proxy", { timeout: 60000, skip: process.platform !== "win32" }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "quack-homes-"));
+  const savedDir = process.env.CLAUDE_CONFIG_DIR;
+  try {
+    // A fake claude/codex: `mcp get|add|remove` on a JSON file in the folder it is pointed at
+    const bin = path.join(home, "bin");
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, "fake.mjs"), `
+      import fs from "node:fs"; import path from "node:path";
+      const [kind, , verb, ...rest] = process.argv.slice(2);
+      const dir = (kind === "claude" ? process.env.CLAUDE_CONFIG_DIR : process.env.CODEX_HOME) || process.env.QUACK_FAKE_DEFAULT + "-" + kind;
+      fs.mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, "fake-mcp.json");
+      const servers = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
+      const name = rest.filter((a) => !a.startsWith("--") && a !== "user")[0];
+      if (verb === "get") process.exit(servers[name] ? 0 : 1);
+      if (verb === "remove") delete servers[name];
+      if (verb === "add") servers[name] = rest.slice(rest.indexOf("--") + 1);
+      fs.writeFileSync(file, JSON.stringify(servers));
+    `);
+    for (const kind of ["claude", "codex"]) fs.writeFileSync(path.join(bin, `${kind}.cmd`), `@node "%~dp0fake.mjs" ${kind} %*\r\n`);
+    process.env.QUACK_FAKE_DEFAULT = path.join(home, "default");
+
+    const proxy = path.join(home, ".claude-proxy");
+    fs.mkdirSync(proxy);
+    fs.writeFileSync(path.join(proxy, ".claude.json"), "{}");
+    fs.writeFileSync(path.join(proxy, "settings.json"), JSON.stringify({ env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:8317" } }));
+    fs.mkdirSync(path.join(home, ".claude-unused"));
+    fs.mkdirSync(path.join(home, ".claude"));
+    fs.writeFileSync(path.join(home, ".claude", ".claude.json"), "{}");
+    const t3Claude = path.join(home, "t3-claude");
+    fs.mkdirSync(t3Claude);
+    const work = path.join(home, ".codex-work");
+    fs.mkdirSync(work);
+    fs.writeFileSync(path.join(work, "config.toml"), "");
+    const t3Settings = path.join(home, "t3.json");
+    fs.writeFileSync(t3Settings, JSON.stringify({ providerInstances: {
+      a: { driver: "claudeAgent", displayName: "Proxy", config: { homePath: proxy } },
+      b: { driver: "claudeAgent", displayName: "Second", config: { homePath: t3Claude } },
+      c: { driver: "claudeAgent", displayName: "Main", config: { homePath: "" } },
+      d: { driver: "codex", config: { homePath: "", shadowHomePath: "" } },
+    } }));
+    // This process runs inside one of them, as a T3 session does: the default must still be the default
+    process.env.CLAUDE_CONFIG_DIR = proxy;
+    const clients = { home, claudeBin: path.join(bin, "claude.cmd"), codexBin: path.join(bin, "codex.cmd"), env: {}, t3Settings };
+    const server = { command: process.execPath, args: ["cli.mjs", "--flavor", "official", "mcp"] };
+    const run = async (...argv: string[]) => {
+      const out: string[] = [];
+      const code = await runControl([...argv, "--json"], {
+        info: flavorInfo("official"), client: new HubClient(await freePort()), out: (l) => out.push(l), err: (l) => out.push(l),
+        confirm: async () => false, interactive: false, color: false, cwd: home, openUri: async () => {}, server, clients,
+      });
+      return { code, clients: JSON.parse(out.join("\n")).clients as any[] };
+    };
+    const stored = (dir: string) => JSON.parse(fs.readFileSync(path.join(dir, "fake-mcp.json"), "utf8"));
+
+    const listed = await run("ai-clients");
+    assert.deepEqual(listed.clients.map((c) => c.label), [
+      "Claude Code", "Claude Code (T3 Code: Proxy, CLIProxyAPI)", "Claude Code (T3 Code: Second)", "Cursor", "Codex", "Codex (.codex-work)",
+    ], "~/.claude, a folder with no .claude.json and an empty T3 home are not targets");
+
+    const only = await run("connect-ai", `claude:${t3Claude}`);
+    assert.equal(only.code, 0);
+    assert.deepEqual(only.clients.filter((c) => c.connected).map((c) => c.id), [`claude:${t3Claude}`], "an id connects that folder alone");
+    assert.deepEqual(stored(t3Claude).quack, ["--", process.execPath, "cli.mjs", "--flavor", "official", "mcp"].slice(1));
+
+    const all = await run("connect-ai", "claude", "codex");
+    assert.equal(all.code, 0);
+    assert.deepEqual(all.clients.filter((c) => !c.connected).map((c) => c.id), ["cursor"]);
+    assert.ok(stored(`${process.env.QUACK_FAKE_DEFAULT}-claude`).quack, "the default target ran without this process's CLAUDE_CONFIG_DIR");
+    assert.ok(stored(proxy).quack);
+    assert.ok(stored(work).quack);
+    assert.ok(stored(`${process.env.QUACK_FAKE_DEFAULT}-codex`).quack);
+  } finally {
+    if (savedDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = savedDir;
+    delete process.env.QUACK_FAKE_DEFAULT;
     fs.rmSync(home, { recursive: true, force: true });
   }
 });

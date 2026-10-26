@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { CLIENTS, connectClients, defaultClientsEnv, listClients, serverName, type ClientName, type ClientsEnv, type ClientStatus, type ServerCommand } from "./connect.js";
+import { CLIENTS, connectClients, defaultClientsEnv, listClients, serverName, type ClientsEnv, type ClientStatus, type ServerCommand } from "./connect.js";
 import { HubClient, HubError, HubOffline, type FlavorInfo } from "./hubClient.js";
 import { PLAY_TAB_HINT } from "../play/overlay.js";
 
@@ -160,7 +160,9 @@ AI
   mcp                       An MCP server on stdio for Claude Code, Cursor, Codex: status, wait, log,
                             conflicts, doctor and play as tools, with how to use ${info.appName} as its instructions
   ai-clients                Claude Code, Cursor and Codex on this computer, and whether each has the MCP
-  connect-ai [claude|cursor|codex]...   Add the MCP to each one named (default: every one installed)
+  connect-ai [claude|cursor|codex|<id>]...   Add the MCP to each one named (default: every one installed).
+                            Every config folder counts: CLAUDE_CONFIG_DIR / CODEX_HOME, ~/.claude-*,
+                            ~/.codex-*, and each T3 Code provider's home
 
 Every command takes --json. Exit codes: 0 ok, 1 error, ${EXIT.offline} hub not running, ${EXIT.timeout} wait timed out.
 push, build and pack stay in the old command: node dist/cli.js.`;
@@ -345,12 +347,12 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
 
 async function aiClients(ctx: ControlContext, options: Options, connect: boolean, names: string[]): Promise<number> {
   const env = ctx.clients ?? defaultClientsEnv();
-  const unknown = names.filter((n) => !CLIENTS.includes(n as ClientName));
+  const unknown = names.filter((n) => !CLIENTS.some((kind) => n === kind || (kind !== "cursor" && n.startsWith(`${kind}:`))));
   if (unknown.length) throw new UsageError(`connect-ai takes ${CLIENTS.join(", ")}, not ${unknown.join(", ")}`);
   let found: ClientStatus[];
   if (connect) {
     if (!ctx.server) throw new UsageError("connect-ai runs only from the installed command");
-    found = await connectClients(ctx.info, ctx.server, env, names as ClientName[]);
+    found = await connectClients(ctx.info, ctx.server, env, names);
   } else found = await listClients(ctx.info, env);
   const name = serverName(ctx.info);
   ctx.out(options.json ? JSON.stringify({ server: name, clients: found }, null, 2) : found.map((c) =>

@@ -22,16 +22,28 @@ export function run(
   input?: string,
   timeoutMs = 30000,
   cwd?: string,
+  /** Added to this process's environment (a client's config folder) */
+  env?: NodeJS.ProcessEnv,
 ): Promise<RunResult> {
   // A path relative to this process, not to the folder the command runs in
   if (/[\\/]/.test(command) && !path.isAbsolute(command)) command = path.resolve(command);
+  // A variable set to undefined is removed: a child must not inherit one meant for this process.
+  // Windows names are case-insensitive, so any spelling of the name goes.
+  let childEnv: NodeJS.ProcessEnv | undefined;
+  if (env) {
+    childEnv = { ...process.env };
+    for (const [key, value] of Object.entries(env)) {
+      for (const own of Object.keys(childEnv)) if (own.toUpperCase() === key.toUpperCase()) delete childEnv[own];
+      if (value !== undefined) childEnv[key] = value;
+    }
+  }
   return new Promise((resolve, reject) => {
     let child: ChildProcessWithoutNullStreams;
     try {
       const shim = process.platform === "win32" ? windowsShim(command) : null;
       child = shim
-        ? spawn([shim, ...args].map(quoteForCmd).join(" "), { windowsHide: true, cwd, shell: true })
-        : spawn(command, args, { windowsHide: true, cwd, detached: process.platform !== "win32" });
+        ? spawn([shim, ...args].map(quoteForCmd).join(" "), { windowsHide: true, cwd, shell: true, env: childEnv })
+        : spawn(command, args, { windowsHide: true, cwd, detached: process.platform !== "win32", env: childEnv });
     } catch (error) {
       reject(error);
       return;
