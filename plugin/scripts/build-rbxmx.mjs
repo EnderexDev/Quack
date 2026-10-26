@@ -42,6 +42,9 @@ const DEV_REPLACEMENTS = [
   ['UI.logo = "rbxassetid://79454901305076"', 'UI.logo = "rbxassetid://132862432873131"'],
   ['UI.syncedLogo = "rbxassetid://101555384706119"', 'UI.syncedLogo = "rbxassetid://86744950721031"'],
   ['Brand = Color3.fromHex("ffd41f"),', 'Brand = Color3.fromHex("5ee36a"),'],
+  // The lockup's mark (logo-dev-mark.png, decal 128100074314929, 23/10/26) and the word's greens
+  ['UI.mark = "rbxassetid://137540661809005"', 'UI.mark = "rbxassetid://124734565720834"'],
+  ['UI.wordGradient = { "fff6c8", "ffcc1f", "b87400" }', 'UI.wordGradient = { "f0ffe8", "5ee36a", "1f8a3a" }'],
 ];
 const devApplied = new Map(DEV_REPLACEMENTS.map(([from]) => [from, 0]));
 

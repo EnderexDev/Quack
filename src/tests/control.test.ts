@@ -7,7 +7,9 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
+import { PassThrough } from "node:stream";
 import { runControl, type ControlContext } from "../control/commands.js";
+import { serveMcp } from "../control/mcp.js";
 import { flavorInfo, HubClient, type Flavor } from "../control/hubClient.js";
 import { QuackHub } from "../hub/hub.js";
 import { saveRegistry } from "../hub/registry.js";
@@ -342,4 +344,159 @@ test("open --wait on a place not registered yet waits for Set up instead of fail
     assert.deepEqual(opened, ["roblox-studio:1+task:EditPlace+placeId:444+universeId:0"]);
     studio.ws.terminate();
   });
+});
+
+/** An MCP client on a pipe to serveMcp: `call` sends one request and returns its answer */
+function mcpSession(port: number, cwd = os.tmpdir()) {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const answers = new Map<number, (message: any) => void>();
+  let buffer = "";
+  output.on("data", (chunk) => {
+    buffer += chunk.toString();
+    for (let at = buffer.indexOf("\n"); at >= 0; at = buffer.indexOf("\n")) {
+      const message = JSON.parse(buffer.slice(0, at));
+      buffer = buffer.slice(at + 1);
+      answers.get(message.id)?.(message);
+    }
+  });
+  const done = serveMcp(input, output, { info: { ...flavorInfo("dev"), port }, client: new HubClient(port), cwd, openUri: async () => {}, pollMs: 50 });
+  let next = 1;
+  const call = (method: string, params?: object): Promise<any> => {
+    const id = next++;
+    return new Promise((resolve) => {
+      answers.set(id, resolve);
+      input.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    });
+  };
+  const tool = async (name: string, args: object = {}) => (await call("tools/call", { name, arguments: args })).result;
+  const close = () => {
+    input.end();
+    return done;
+  };
+  return { call, tool, close, write: (line: string) => input.write(`${line}\n`) };
+}
+
+test("mcp: initialize carries the instructions, and the tools are the reading ones, wait and play", { timeout: 15000 }, async () => {
+  const mcp = mcpSession(await freePort());
+  const init = await mcp.call("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "0" } });
+  assert.equal(init.result.protocolVersion, "2025-03-26");
+  assert.equal(init.result.serverInfo.name, "quack-dev");
+  assert.match(init.result.instructions, /git add/);
+  assert.match(init.result.instructions, /Never switch branches/);
+  mcp.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }));
+  assert.equal((await mcp.call("initialize", { protocolVersion: "1999-01-01" })).result.protocolVersion, "2025-06-18", "an unknown version gets the newest");
+  const names = (await mcp.call("tools/list")).result.tools.map((t: any) => t.name);
+  assert.deepEqual(names, ["status", "wait", "log", "conflicts", "conflict", "doctor", "play"]);
+  for (const mutating of ["resolve", "pause", "resume", "register", "unregister", "choose", "restart-hub", "open", "ai"]) {
+    assert.ok(!names.includes(mutating), `${mutating} is a person's, not a tool`);
+  }
+  assert.equal((await mcp.call("tools/call", { name: "pause" })).error.code, -32602);
+  assert.equal((await mcp.call("resources/list")).error.code, -32601);
+  assert.deepEqual((await mcp.call("ping")).result, {});
+  await mcp.close();
+});
+
+test("mcp: the tools answer what the commands print, and refuse a value that would read as an option", { timeout: 60000 }, async () => {
+  await withHub(async ({ port, folders }) => {
+    const studio = fakeStudio(port, 111, "AlphaScript");
+    const mcp = mcpSession(port, path.join(folders["111"], "sync"));
+    await waitFor(async () => (await control(port)("status", "--json")).json().sessions[0]?.instances === 3);
+
+    const status = await mcp.tool("status");
+    assert.equal(status.isError, undefined);
+    assert.match(status.content[0].text, /Alpha Game\s+111\s+connected/);
+
+    const waited = await mcp.tool("wait", { idleMs: 200 });
+    assert.match(waited.content[0].text, /Alpha Game \(111\) is connected and in sync/, "the folder the AI runs in names the place");
+
+    const log = await mcp.tool("log", { place: "alpha", lines: 1 });
+    assert.match(log.content[0].text, /^\(last 1 of \d+ lines\)\n/);
+    assert.equal(log.content[0].text.split("\n").length, 2);
+    const fraction = await mcp.tool("log", { place: "alpha", lines: 0.5 });
+    assert.match(fraction.content[0].text, /^\(last 1 of \d+ lines\)\n/, "less than one line still cuts the log");
+
+    assert.match((await mcp.tool("conflicts", { place: "111" })).content[0].text, /No conflicts waiting/);
+    const noId = await mcp.tool("conflict");
+    assert.equal(noId.isError, true);
+    assert.match(noId.content[0].text, /id is required/);
+    const option = await mcp.tool("log", { place: "--follow" });
+    assert.equal(option.isError, true);
+    assert.match(option.content[0].text, /cannot start with "-"/);
+    const ambiguous = await mcp.tool("log", { place: "game" });
+    assert.equal(ambiguous.isError, true);
+    assert.match(ambiguous.content[0].text, /more than one place/);
+
+    // Two calls at once each get their own answer
+    const [a, b] = await Promise.all([mcp.tool("conflicts", { place: "222" }), mcp.tool("status")]);
+    assert.match(a.content[0].text, /No conflicts/);
+    assert.match(b.content[0].text, /Beta Game/);
+    await mcp.close();
+    studio.ws.terminate();
+  });
+});
+
+test("mcp: no hub running is a tool error that says so, and the real command speaks only protocol on stdout", { timeout: 30000 }, async () => {
+  const mcp = mcpSession(await freePort());
+  const status = await mcp.tool("status");
+  assert.equal(status.isError, true);
+  assert.match(status.content[0].text, /no hub answers/);
+  await mcp.close();
+
+  const { spawn } = await import("node:child_process");
+  const child = spawn(process.execPath, [path.join(here, "..", "control", "main.js"), "mcp"], { stdio: ["pipe", "pipe", "pipe"] });
+  let stdout = "";
+  child.stdout.on("data", (chunk) => (stdout += chunk));
+  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } })}\n`);
+  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })}\n`);
+  await waitFor(() => stdout.split("\n").filter(Boolean).length >= 2, 10000);
+  child.stdin.end();
+  const code = await new Promise<number | null>((resolve) => child.on("exit", resolve));
+  assert.equal(code, 0, "closing stdin ends the server");
+  const messages = stdout.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  assert.deepEqual(messages.map((m) => m.id).sort(), [1, 2]);
+  assert.equal(messages.find((m) => m.id === 2).result.tools.length, 7);
+});
+
+test("connect-ai: Cursor's file keeps every other server and key, a broken one is never overwritten, a missing CLI is not installed", { timeout: 30000 }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "quack-clients-"));
+  try {
+    const clients = { home, claudeBin: "quack-no-such-claude", codexBin: "quack-no-such-codex" };
+    const server = { command: process.execPath, args: ["cli.mjs", "--flavor", "dev", "mcp"] };
+    const run = async (...argv: string[]) => {
+      const out: string[] = [];
+      const code = await runControl([...argv, "--json"], {
+        info: flavorInfo("dev"), client: new HubClient(await freePort()), out: (l) => out.push(l), err: (l) => out.push(l),
+        confirm: async () => false, interactive: false, color: false, cwd: home, openUri: async () => {}, server, clients,
+      });
+      return { code, json: () => JSON.parse(out.join("\n")) };
+    };
+    const byName = (r: any) => Object.fromEntries(r.clients.map((c: any) => [c.client, c]));
+
+    let listed = byName((await run("ai-clients")).json());
+    assert.deepEqual([listed.claude.installed, listed.cursor.installed, listed.codex.installed], [false, false, false]);
+
+    fs.mkdirSync(path.join(home, ".cursor"));
+    const file = path.join(home, ".cursor", "mcp.json");
+    fs.writeFileSync(file, JSON.stringify({ mcpServers: { Other: { command: "x" } }, keep: 1 }));
+    const connected = await run("connect-ai");
+    assert.equal(connected.code, 0);
+    listed = byName(connected.json());
+    assert.equal(listed.cursor.connected, true);
+    assert.equal(listed.claude.installed, false, "a client not installed is left alone");
+    const written = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.deepEqual(written.mcpServers.Other, { command: "x" });
+    assert.equal(written.keep, 1);
+    assert.deepEqual(written.mcpServers["quack-dev"], server);
+
+    fs.writeFileSync(file, "{ not json");
+    const broken = await run("connect-ai", "cursor");
+    assert.equal(broken.code, 1);
+    assert.match(byName(broken.json()).cursor.problem, /JSON/);
+    assert.equal(fs.readFileSync(file, "utf8"), "{ not json", "a file Quack cannot read stays as it was");
+
+    assert.equal((await run("connect-ai", "vscode")).code, 1);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });

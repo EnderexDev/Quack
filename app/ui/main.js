@@ -633,6 +633,44 @@ function aiCard(ai) {
   return card;
 }
 
+/**
+ * Connect to AI: finds Claude Code, Cursor and Codex, shows which have this Quack's MCP, and
+ * adds it only after the Connect click (the first click only looks).
+ */
+function mcpCard() {
+  const card = h("div", { class: "card chunk" }, h("span", { class: "label" }, t("mcpCard")), h("p", { class: "note" }, t("mcpNote")));
+  const list = h("div", {});
+  const button = h("button", { class: "btn yellow chunk-bright press" }, t("mcpFind"));
+  let found = null;
+  const show = (clients) => {
+    found = clients;
+    list.replaceChildren(...clients.map((c) => h("div", { class: "field" },
+      h("span", { class: "grow" }, c.label),
+      h("span", { class: c.connected ? "pill brand" : "pill", title: c.problem ?? "" }, c.problem ? c.problem : t(!c.installed ? "mcpMissing" : c.connected ? "mcpHas" : "mcpNo")))));
+    const toConnect = clients.filter((c) => c.installed && !c.connected).length;
+    if (!clients.some((c) => c.installed)) list.append(h("p", { class: "note" }, t("mcpNone")));
+    button.textContent = toConnect ? `${t("mcpConnect")} (${toConnect})` : t("mcpFind");
+  };
+  button.addEventListener("click", async () => {
+    const connect = !!found?.some((c) => c.installed && !c.connected);
+    button.disabled = true;
+    button.textContent = t(connect ? "mcpConnecting" : "mcpFinding");
+    try {
+      const result = await invoke("ai_clients", { connect });
+      if (result.error) throw new Error(result.error);
+      show(result.clients);
+      if (connect && result.clients.some((c) => c.connected)) toast(t("mcpRestart"));
+    } catch (error) {
+      fail(error);
+      button.textContent = t("mcpFind");
+    } finally {
+      button.disabled = false;
+    }
+  });
+  card.append(list, h("div", { class: "row", style: "margin-top:8px" }, h("span", { class: "grow" }), button));
+  return card;
+}
+
 async function renderSettings(target) {
   const s = state();
   const mine = generation;
@@ -754,6 +792,7 @@ async function renderSettings(target) {
             h("span", { class: "mono muted", title: `hub ${s?.build ?? "?"}` }, `${ui.app.version}${ui.app.build ? ` · ${ui.app.build}` : ""}`),
             checkUpdate)),
         aiCard(ai),
+        mcpCard(),
         h("div", { class: "card chunk" },
           h("span", { class: "label" }, t("daemonSettings")),
           ro(t("mergeCrossed"), cfg.merge?.enabled !== false),

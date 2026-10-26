@@ -37,6 +37,9 @@ const DEV_GREEN = {
   "#ffd54a": "#7fe88a", // filete (metallic middle, the small cut's flat one)
   "#9a6200": "#1f7a33", // metallic filete bottom
 };
+// The wordmark beside the mark (Figma lockup "quack-lockup-ouro") is drawn by the app and the
+// plugin, not here: gold #fff6c8 / #ffcc1f / #b87400, Dev #f0ffe8 / #5ee36a / #1f8a3a, in
+// app/ui/style.css (--word-*), Theme.luau (Word) and build-rbxmx.mjs
 const recolor = (svg, swap) => Object.entries(swap).reduce((out, [from, to]) => out.split(from).join(to), svg);
 
 const flavors = [
@@ -44,6 +47,7 @@ const flavors = [
   { icons: "icons-dev", tray: "tray-dev", logo: "logo-dev", swap: DEV_GREEN },
 ];
 const pluginDir = path.join(here, "..", "..", "plugin", "assets");
+const uiDir = path.join(here, "..", "ui");
 
 const dots = { ok: "#4ade80", warn: "#f0b232", bad: "#f23f43", paused: "#9a8f80" };
 /**
@@ -101,5 +105,9 @@ for (const { icons, tray, logo, swap } of flavors) {
   fs.mkdirSync(pluginDir, { recursive: true });
   fs.writeFileSync(path.join(pluginDir, `${logo}.png`), render(128, withDot(small, dots.paused)));
   fs.writeFileSync(path.join(pluginDir, `${logo}-synced.png`), render(128, withDot(small, dots.ok)));
-  console.log(`icons written to ${iconsDir}, ${trayDir} and ${pluginDir}`);
+  // The mark beside the name (the lockup): plain, no dot. The app's window shows the SVG; the
+  // plugin's top bar a decal of the PNG, its image id in UI.luau (Official) and build-rbxmx.mjs (Dev)
+  fs.writeFileSync(path.join(uiDir, `${logo}.svg`), big);
+  fs.writeFileSync(path.join(pluginDir, `${logo}-mark.png`), render(128, big));
+  console.log(`icons written to ${iconsDir}, ${trayDir}, ${uiDir} and ${pluginDir}`);
 }

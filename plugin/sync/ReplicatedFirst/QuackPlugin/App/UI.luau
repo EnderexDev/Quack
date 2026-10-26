@@ -125,6 +125,11 @@ type QuackUI = {
 -- 77079393892035 (idle) and 111806008879312 (synced), uploaded 22/10/26 with the dot moved off the Q's tail
 UI.logo = "rbxassetid://79454901305076"
 UI.syncedLogo = "rbxassetid://101555384706119"
+-- The name as the logo's lockup (Figma "Quack - Logo", "quack-lockup-ouro"): the plain mark
+-- (plugin/assets/logo-mark.png, decal 84440383015365, 23/10/26) and the word's gradient, top to
+-- bottom; build-rbxmx.mjs swaps both for Dev's green (app/ui/style.css --word-*)
+UI.mark = "rbxassetid://137540661809005"
+UI.wordGradient = { "fff6c8", "ffcc1f", "b87400" }
 
 local function debugPrint(...)
 	if not Config.DEBUG_MODE then return end
@@ -816,27 +821,58 @@ local function buildContent(self, scope: Scope, helpers)
 	return {
 		scope:Padding { Padding = Theme.WidgetPadding },
 		scope:List { Spacing = Theme.ListSpacing },
-		-- Top bar: the app's yellow tag and the version, nothing else
+		-- Top bar: the name as the logo's lockup and the version, nothing else
 		scope:Container {
 			Size = UDim2.fromScale(1, 0),
 			AutomaticSize = Enum.AutomaticSize.Y,
 			[Children] = {
-				scope:Text {
-					Text = "QUACK",
-					Font = Theme.Fonts.Logo,
-					TextSize = Theme.TextSize.Large + 2,
-					Color = Theme.Colors.TextBranded,
+				scope:Container {
 					AutomaticSize = Enum.AutomaticSize.XY,
-					BackgroundColor3 = Theme.Colors.Brand,
-					BackgroundTransparency = 0,
 					[Children] = {
-						scope:New "UIPadding" {
-							PaddingLeft = UDim.new(0, 10),
-							PaddingRight = UDim.new(0, 10),
-							PaddingTop = UDim.new(0, 3),
-							PaddingBottom = UDim.new(0, 3),
+						scope:New "UIListLayout" {
+							FillDirection = Enum.FillDirection.Horizontal,
+							VerticalAlignment = Enum.VerticalAlignment.Center,
+							Padding = UDim.new(0, 7),
+							SortOrder = Enum.SortOrder.LayoutOrder,
 						},
-						scope:Border {},
+						scope:New "ImageLabel" {
+							LayoutOrder = 1,
+							Size = UDim2.fromOffset(26, 26),
+							BackgroundTransparency = 1,
+							Image = UI.mark,
+						},
+						scope:Container {
+							LayoutOrder = 2,
+							AutomaticSize = Enum.AutomaticSize.XY,
+							[Children] = {
+								-- The word's drop shadow, a black copy 2 px below it
+								scope:Text {
+									Position = UDim2.fromOffset(0, 2),
+									Text = "Quack",
+									Font = Theme.Fonts.Logo,
+									TextSize = 22,
+									Color = Color3.new(0, 0, 0),
+									TextTransparency = 0.45,
+								},
+								scope:Text {
+									ZIndex = 2,
+									Text = "Quack",
+									Font = Theme.Fonts.Logo,
+									TextSize = 22,
+									Color = Color3.new(1, 1, 1),
+									[Children] = {
+										scope:New "UIGradient" {
+											Rotation = 90,
+											Color = ColorSequence.new {
+												ColorSequenceKeypoint.new(0, Color3.fromHex(UI.wordGradient[1])),
+												ColorSequenceKeypoint.new(0.45, Color3.fromHex(UI.wordGradient[2])),
+												ColorSequenceKeypoint.new(1, Color3.fromHex(UI.wordGradient[3])),
+											},
+										},
+									},
+								},
+							},
+						},
 					},
 				},
 				scope:Text {

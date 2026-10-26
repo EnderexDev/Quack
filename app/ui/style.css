@@ -14,6 +14,8 @@
   --ink-500: #6e6458; --ink-400: #9a8f80; --ink-300: #ada294; --ink-200: #f3e9d8; --ink-100: #fff7e6;
   --line: #0a0806; --shade: #050403;
   --brand-300: #ffe27a; --brand-400: #ffd41f; --brand-500: #ffc20a; --brand-end: #ff8a0f; --brand-ink: #3d3000;
+  /* The wordmark's gradient, top to bottom (Figma "Quack - Logo", lockup "quack-lockup-ouro") */
+  --word-1: #fff6c8; --word-2: #ffcc1f; --word-3: #b87400;
   --sky-100: #afe2ff; --sky-300: #6ec5fb; --sky-500: #2e9be8;
   --live: #4ade80; --live-soft: #a7f3c4; --idle: #f0b232; --busy: #f23f43;
   --ease: cubic-bezier(0.22, 1, 0.36, 1);
@@ -25,7 +27,8 @@
 }
 /* Quack Dev wears green where Official wears yellow, so the two apps tell apart by colour alone
    (common.js sets the class; the same greens are in app/scripts/icons.mjs and the plugin) */
-html.dev { --brand-300: #a8f29c; --brand-400: #5ee36a; --brand-500: #2fbf4a; --brand-end: #1fa88c; --brand-ink: #0f3d16; }
+html.dev { --brand-300: #a8f29c; --brand-400: #5ee36a; --brand-500: #2fbf4a; --brand-end: #1fa88c; --brand-ink: #0f3d16;
+  --word-1: #f0ffe8; --word-2: #5ee36a; --word-3: #1f8a3a; }
 
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; }
@@ -79,9 +82,6 @@ button.pill { cursor: pointer; }
 .game small { font-size: 10.5px; font-weight: 600; letter-spacing: .06em; color: var(--ink-400); white-space: nowrap; }
 .game.sel { background: var(--ink-800); outline: 3px solid var(--brand-400); outline-offset: -3px; }
 
-.sky { position: relative; overflow: hidden; background: linear-gradient(var(--sky-500), var(--sky-300), var(--sky-100)); border: 3px solid var(--line); }
-.sky .cloud { position: absolute; border-radius: 999px; background: rgba(255,255,255,.85); }
-.sky img { position: absolute; border: 3px solid var(--line); box-shadow: 0 4px 0 rgba(10,8,6,.45); transform: rotate(-3deg); }
 
 .tog { width: 38px; height: 22px; border-radius: 999px; border: 3px solid var(--line); background: var(--brand-400); position: relative; flex: none; cursor: pointer; transition: background-color .18s; }
 .tog::after { content: ""; position: absolute; top: 2px; right: 2px; width: 12px; height: 12px; border-radius: 50%; background: var(--line); transition: transform .2s var(--ease); }
@@ -101,7 +101,15 @@ input.field-input:focus { border-color: var(--brand-400); }
 /* ---------- Main window ---------- */
 .app { height: 100%; display: flex; flex-direction: column; padding: 16px 18px 18px; gap: 18px; }
 .nav { background: var(--ink-900); border-radius: 16px; padding: 10px 12px; display: flex; align-items: center; gap: 18px; }
-.brandtag { font-family: var(--logo); font-weight: 700; font-size: 13px; letter-spacing: 0.02em; text-transform: uppercase; color: var(--line); background: var(--brand-400); border-radius: 8px; padding: 5px 10px; }
+/* The name as the logo's lockup: the mark (logo.svg, written by app/scripts/icons.mjs) and the word
+   in Fredoka with the gold gradient and its drop shadow. Figma's white top light on the letters has
+   no CSS form on clipped text, so it is left out */
+.word { font-family: var(--logo); font-weight: 700; line-height: 1; background: linear-gradient(var(--word-1), var(--word-2) 45%, var(--word-3));
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; filter: drop-shadow(0 2px 3px rgba(0, 0, 0, .7)); }
+.brand { display: inline-flex; align-items: center; gap: 9px; flex: none; }
+.brand .mark { width: 30px; height: 30px; flex: none; background: url(logo.svg) center / contain no-repeat; }
+html.dev .brand .mark { background-image: url(logo-dev.svg); }
+.brand .word { font-size: 23px; padding-bottom: 2px; }
 .navlink { position: relative; font-size: 10.5px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-200); cursor: pointer; transition: color .18s; white-space: nowrap; }
 .navlink::after { content: ""; position: absolute; inset-inline: 0; bottom: -6px; height: 2px; border-radius: 2px; background: var(--brand-400); transform: scaleX(0); transform-origin: left; transition: transform .28s var(--ease); }
 .navlink:hover { color: var(--brand-400); } .navlink:hover::after, .navlink.on::after { transform: scaleX(1); }
@@ -207,11 +215,15 @@ input.field-input:focus { border-color: var(--brand-400); }
 /* ---------- Tray panel ---------- */
 body.traybody { background: transparent; overflow: hidden; }
 .tray { margin: 0 0 9px; background: var(--ink-800); border-radius: 20px; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
-.trayhead { border-radius: 14px; height: 74px; display: flex; align-items: center; padding: 0 12px 0 84px; flex: none; }
-.trayhead img { left: 14px; top: 8px; width: 52px; height: 52px; border-radius: 12px; }
-.trayhead .who { position: relative; display: flex; flex-direction: column; gap: 3px; }
-.trayhead .who .display { font-family: var(--logo); font-weight: 700; font-size: 21px; letter-spacing: 0.01em; color: var(--line); text-transform: uppercase; }
-.trayhead .who span:last-child { font-size: 10px; font-weight: 700; letter-spacing: .14em; color: #0a3a66; text-transform: uppercase; }
+/* The tray's head is the app's own lockup, as in the main window's nav, only bigger, straight on
+   the panel: a box of its own was one outline too many inside the panel's */
+.trayhead { display: flex; gap: 12px; height: 58px; padding: 0 4px; }
+.trayhead .mark { width: 46px; height: 46px; }
+.trayhead .who { display: flex; flex-direction: column; gap: 5px; }
+.trayhead .who .word { font-size: 28px; }
+.trayhead .who span:last-child { font-size: 10px; font-weight: 700; letter-spacing: .14em; color: var(--ink-400); text-transform: uppercase; }
 .traylist { display: flex; flex-direction: column; gap: 10px; }
 .trayfoot { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; }
+/* The three labels at the usual 12 px sides needed 299 px of the panel's 290 (measured 23/10/26) */
+.trayfoot .btn { padding-inline: 9px; }
 .traymsg { color: var(--ink-400); text-align: center; padding: 8px 4px; line-height: 1.5; }

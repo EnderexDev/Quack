@@ -654,6 +654,32 @@ fn write_user_path(value: &str) -> Result<(), String> {
     if output.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&output.stderr).trim().to_string()) }
 }
 
+/**
+ * Claude Code, Cursor and Codex on this computer and whether each has this flavor's MCP
+ * (`ai-clients`), or the MCP added to each one installed (`connect-ai`): the shipped command
+ * does both, so the button and `quack connect-ai` never disagree.
+ */
+#[tauri::command]
+async fn ai_clients(app: AppHandle, connect: bool) -> Result<Value, String> {
+    let node = app.state::<Shared>().settings.lock().unwrap().node.clone();
+    let cli = if cfg!(debug_assertions) {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("dist").join("control").join("main.js")
+    } else {
+        resource(&app, &["hub", "cli.mjs"]).ok_or("the app's files were not found")?
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let output = hidden_command(&node)
+            .arg(&cli)
+            .args(["--flavor", flavor::CLI_FLAVOR, if connect { "connect-ai" } else { "ai-clients" }, "--json"])
+            .output()
+            .map_err(|e| format!("could not run {node}: {e}"))?;
+        // Exit 1 still carries the list, with the problem on the client it concerns
+        serde_json::from_slice::<Value>(&output.stdout).map_err(|_| String::from_utf8_lossy(&output.stderr).trim().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /** The daemon settings, read only: one file for every game, shared by Quack and Quack Dev */
 #[tauri::command]
 fn read_daemon_config() -> Value {
@@ -1210,6 +1236,7 @@ fn main() {
             check_update,
             install_update,
             read_daemon_config,
+            ai_clients,
             open_path,
             show_main,
             tray_fit,
