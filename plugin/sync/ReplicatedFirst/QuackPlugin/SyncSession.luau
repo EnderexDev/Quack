@@ -413,8 +413,8 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 		end)
 	end
 
-	local function queueInstanceUpdate(data)
-		if self.suppressOutbound or not self.syncEnabled then return end
+	local function queueInstanceUpdate(data, isReply: boolean?)
+		if (self.suppressOutbound and not isReply) or not self.syncEnabled then return end
 		if not data or not data.guid then return end
 
 		self.pendingInstanceUpdates[data.guid] = data
@@ -470,8 +470,11 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 		self.suppressOutbound = outboundSupressDepth > 0
 	end
 
-	local function sendInstanceUpdateDedup(instance)
-		if self.suppressOutbound or not self.syncEnabled then return end
+	--- isReply: the daemon asked for this instance (a create or move from disk) and maps its file
+	--- only from this update. It goes out even while another operation holds outbound off: a
+	--- create that landed during a play swap was made in Studio and never mapped (Astral, 27/10/26)
+	local function sendInstanceUpdateDedup(instance, isReply: boolean?)
+		if (self.suppressOutbound and not isReply) or not self.syncEnabled then return end
 
 		local data = QuackService.instanceToDataDedup(
 			instance,
@@ -486,7 +489,7 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 		self.trackedInstances[instance] = guid
 		self.guidMap[guid] = instance
 
-		queueInstanceUpdate(data)
+		queueInstanceUpdate(data, isReply)
 	end
 
 	local function shouldSync(instance)
@@ -1267,7 +1270,7 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 
 			if ok and err then
 				local createdInst = err :: Instance
-				sendInstanceUpdateDedup(createdInst)
+				sendInstanceUpdateDedup(createdInst, true)
 				self:infoPrint(`Created instance from filesystem: {createdInst.Name} ({createdInst.ClassName})`)
 			elseif not ok then
 				warn("[Quack]: Failed to create instance from filesystem:", err)
@@ -1384,7 +1387,7 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 
 			if ok and instanceResult then
 				local movedInst = instanceResult :: Instance
-				sendInstanceUpdateDedup(movedInst)
+				sendInstanceUpdateDedup(movedInst, true)
 				self:infoPrint(`Moved instance from filesystem: {movedInst.Name}`)
 			elseif ok and not instanceResult then
 				warn("[Quack]: Move requested from filesystem but no tracked instance matched GUID:", message.guid)

@@ -227,7 +227,12 @@ export class FileWatcher {
     }
   }
 
-  /** Walk a folder into the known tree; announce what it finds when emit is set */
+  /**
+   * Walk a folder into the known tree; announce what it finds when emit is set.
+   * Known folders are walked too: a rescan after lost events has to find a new file in a
+   * folder that already existed (a merge's new scripts in Config/ and Utils/ never reached
+   * Studio when only unknown folders were walked: Astral, 27/10/26)
+   */
   private scanInto(dirPath: string, emit: boolean): void {
     let entries: fs.Dirent[];
     try {
@@ -238,9 +243,10 @@ export class FileWatcher {
     for (const entry of entries) {
       const full = path.join(dirPath, entry.name);
       if (entry.isDirectory()) {
-        if (this.knownDirs.has(full)) continue;
-        this.knownDirs.add(full);
-        if (emit) this.handleFileEvent("addDir", full);
+        if (!this.knownDirs.has(full)) {
+          this.knownDirs.add(full);
+          if (emit) this.handleFileEvent("addDir", full);
+        }
         this.scanInto(full, emit);
       } else if (!this.knownFiles.has(full)) {
         let stamp = "";

@@ -751,6 +751,11 @@ export class QuackHub {
             daemonRequest<{ play: unknown }>(session.childPort, session.token, "GET", "/play").then((answer) => send(200, answer), fail);
             return;
           }
+          case "/api/unsynced": {
+            const session = this.playSession(q.get("placeId"));
+            daemonRequest<{ files: string[] }>(session.childPort, session.token, "GET", "/unsynced").then((answer) => send(200, answer), fail);
+            return;
+          }
         }
       } catch (error) {
         return fail(error);
@@ -801,6 +806,11 @@ export class QuackHub {
             // Checked first, so a choice right after start is held to what is really here
             const checked = this.aiLastUsable ? Promise.resolve() : this.aiStatus();
             checked.then(() => this.setAi(body)).then(() => this.aiStatus()).then((status) => send(200, status), fail);
+            return;
+          }
+          if (url.pathname === "/api/unsynced") {
+            const session = this.playSession(typeof body.placeId === "string" ? body.placeId : null);
+            daemonRequest<{ files: string[] }>(session.childPort, session.token, "POST", "/unsynced", {}).then((answer) => send(200, answer), fail);
             return;
           }
           if (url.pathname === "/api/play") {

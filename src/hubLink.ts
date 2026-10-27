@@ -66,6 +66,8 @@ export interface HubLinkHandlers {
   /** Quack: `quackdev play`: swap a worktree's scripts into a playtest (POST), or read the last (GET) */
   play?: (request: { worktree: unknown }) => Promise<unknown>;
   playState?: () => unknown;
+  /** Script files on disk with no instance in Studio (`quack wait` lists them); fix sends their creates again */
+  unsynced?: (fix: boolean) => string[];
 }
 
 export class HubLink {
@@ -105,7 +107,7 @@ export class HubLink {
       res.writeHead(400).end();
       return true;
     }
-    const routes = ["/status", "/adopt", "/kick", "/shutdown", "/export", "/takeover", "/play"];
+    const routes = ["/status", "/adopt", "/kick", "/shutdown", "/export", "/takeover", "/play", "/unsynced"];
     if (!routes.includes(url.pathname)) return false;
     const send = (status: number, body: unknown) => {
       if (res.headersSent || res.destroyed) return;
@@ -122,6 +124,10 @@ export class HubLink {
     }
     if (url.pathname === "/play" && req.method === "GET") {
       send(200, { play: this.handlers.playState?.() ?? null });
+      return true;
+    }
+    if (url.pathname === "/unsynced" && req.method === "GET") {
+      send(200, { files: this.handlers.unsynced?.(false) ?? [] });
       return true;
     }
     if (req.method !== "POST") {
@@ -188,6 +194,8 @@ export class HubLink {
           (result) => send(200, { play: result }),
           (error: Error) => send(409, { error: error.message }),
         );
+      } else if (url.pathname === "/unsynced") {
+        send(200, { files: this.handlers.unsynced?.(true) ?? [] });
       } else if (url.pathname === "/kick") {
         this.handlers.kick(typeof parsed?.why === "string" ? parsed.why.slice(0, 300) : "another Studio took this place over.");
         send(200, { ok: true });

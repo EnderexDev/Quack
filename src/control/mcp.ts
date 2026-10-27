@@ -57,17 +57,18 @@ export const TOOLS: Tool[] = [
   },
   {
     name: "wait",
-    description: "Returns once the place's Studio is connected and nothing has synced for a moment (default 1.5 s). Call it after editing synced files and before starting a playtest or reading scripts in Studio.",
+    description: "Returns once the place's Studio is connected and nothing has synced for a moment (default 1.5 s). Call it after editing synced files or a git merge there, and before starting a playtest or reading scripts in Studio. It lists script files on disk that have no instance in Studio.",
     inputSchema: {
       type: "object",
       properties: {
         ...placeProp,
         connectedOnly: { type: "boolean", description: "Only until Studio is connected, not until the sync is quiet" },
+        fix: { type: "boolean", description: "Send the create of each listed script file again; Studio reuses a script already there, so nothing is duplicated" },
         idleMs: { type: "number", description: "How long the sync must be quiet (default 1500)" },
         timeoutSeconds: { type: "number", description: "Give up after this long (default 120)" },
       },
     },
-    argv: (args) => ["wait", ...text(args, "place"), ...(args.connectedOnly === true ? ["--connected"] : []), ...number(args, "idleMs", "--idle"), ...number(args, "timeoutSeconds", "--timeout")],
+    argv: (args) => ["wait", ...text(args, "place"), ...(args.connectedOnly === true ? ["--connected"] : []), ...(args.fix === true ? ["--fix"] : []), ...number(args, "idleMs", "--idle"), ...number(args, "timeoutSeconds", "--timeout")],
   },
   {
     name: "log",
@@ -119,7 +120,7 @@ Editing in the synced folder:
 - A script edited in Studio and on disk at once is merged; a disk version the merge did not keep goes to \`conflicts\`. Check it after a batch of edits. Which side wins is the user's call.
 - Do not use Studio's Undo (Ctrl+Z, ChangeHistoryService:Undo) with the sync on: it also undoes the sync's own steps, and a created file gets deleted from disk too.
 
-Git in the synced folder: every file git writes goes to Studio. A merge or fast-forward is fine. Never switch branches, checkout or stash there: the moment the tree rewinds becomes deletions in Studio, and pausing the sync does not protect it. After any git operation there: \`wait\`, then \`log\` for a deleted script the operation did not mean to delete; one lost that way comes back by writing it from git (git show HEAD:<path> > <path>).
+Git in the synced folder: every file git writes goes to Studio. A merge or fast-forward is fine. Never switch branches, checkout or stash there: the moment the tree rewinds becomes deletions in Studio, and pausing the sync does not protect it. After any git operation there: \`wait\`, then \`log\` for a deleted script the operation did not mean to delete. A deleted one comes back by writing it from git (git show HEAD:<path> > <path>). \`wait\` also lists script files on disk with no instance in Studio (a merge's new script the sync missed): \`wait\` with fix sends their creates again; saving such a file again does nothing.
 
 Work on another branch in a git worktree:
 - Its edits never reach Studio. Do not change scripts in Studio for that work (that writes to the synced folder's branch).

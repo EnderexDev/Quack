@@ -157,6 +157,29 @@ test("a lost-events rescan reports only what changed, without reading every scri
   });
 });
 
+test("a lost-events rescan finds new scripts in folders it already knew", async () => {
+  await withNativeWatcher(async (root, events, settle, watcher) => {
+    // The OS dropped these: write them with the watch closed, then rescan as an overflow does
+    const native = watcher as unknown as {
+      nativeWatcher: fs.FSWatcher;
+      rescanNative(root: string): void;
+    };
+    native.nativeWatcher.close();
+    fs.writeFileSync(path.join(root, "Existing", "Inner", "Lost.luau"), "return 1");
+    fs.writeFileSync(path.join(root, "Existing", "Top.luau"), "return 2");
+    fs.mkdirSync(path.join(root, "Existing", "Fresh"));
+    fs.writeFileSync(path.join(root, "Existing", "Fresh", "F.luau"), "return 3");
+    native.rescanNative(root);
+    await settle();
+    assert.deepEqual([...events].sort(), [
+      "add Existing/Fresh/F.luau =return 3",
+      "add Existing/Inner/Lost.luau =return 1",
+      "add Existing/Top.luau =return 2",
+      "addDir Existing/Fresh",
+    ]);
+  });
+});
+
 test("overflows ~120 ms apart in one burst cost one rescan", async () => {
   await withNativeWatcher(async (root, events, settle, watcher) => {
     const { log } = await import("../util/log.js");

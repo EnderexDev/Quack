@@ -175,6 +175,56 @@ test("wait --idle returns only once Studio stopped sending, and pings do not cou
   });
 });
 
+test("wait lists script files on disk that have no instance in Studio", { timeout: 60000 }, async () => {
+  await withHub(async ({ port, folders }) => {
+    const studio = fakeStudio(port, 111, "AlphaScript");
+    const run = control(port);
+    const clean = await run("wait", "111", "--idle", "300", "--timeout", "15");
+    assert.equal(clean.code, 0, clean.err);
+    assert.match(clean.out, /is connected and in sync/);
+
+    // A merge's new script the Studio never created (this fake Studio does not answer creates)
+    fs.mkdirSync(path.join(folders["111"], "sync", "ServerStorage", "Config"), { recursive: true });
+    fs.writeFileSync(path.join(folders["111"], "sync", "ServerStorage", "Config", "Lost.luau"), "return 1\n");
+    await waitFor(() => studio.received.some((m) => m.type === "createInstance" && m.name === "Lost"));
+    const missing = await run("wait", "111", "--idle", "300", "--timeout", "15");
+    assert.equal(missing.code, 0, "the exit code stays: scripts read it as synced");
+    assert.match(missing.out, /1 script file\(s\) on disk have no instance in Studio/);
+    assert.match(missing.out, /^  ServerStorage\/Config\/Lost\.luau$/m);
+    assert.doesNotMatch(missing.out, /AlphaScript/);
+    const json = (await run("wait", "111", "--idle", "300", "--timeout", "15", "--json")).json();
+    assert.deepEqual(json.unsynced, ["ServerStorage/Config/Lost.luau"]);
+
+    // Saving the file again is an edit of a file nobody maps: no create
+    const lost = path.join(folders["111"], "sync", "ServerStorage", "Config", "Lost.luau");
+    const creates = () => studio.received.filter((m) => m.type === "createInstance" && m.name === "Lost").length;
+    // The daemon's own tries first (3, 3 s apart), so none lands in the middle of what follows
+    await waitFor(() => creates() === 3, 20000);
+    await wait(3500);
+    const before = creates();
+    assert.equal(before, 3, "three tries, then it gives up");
+    fs.writeFileSync(lost, "return 1\r\n");
+    await wait(800);
+    assert.equal(creates(), before, "an overwrite sends no create");
+    assert.match(missing.out, /wait --fix/);
+
+    // --fix sends the create again; this Studio answers now, as one past a play swap does
+    studio.ws.on("message", (raw) => {
+      const msg = JSON.parse(raw.toString());
+      if (msg.type !== "createInstance") return;
+      studio.ws.send(JSON.stringify({ type: "instanceUpdated", data: { guid: `made-${msg.name}`, className: msg.className, name: msg.name, path: [...msg.parentPath, msg.name], source: msg.source } }));
+    });
+    const fixed = await run("wait", "111", "--fix", "--idle", "300", "--timeout", "15");
+    assert.equal(fixed.code, 0, fixed.err);
+    assert.match(fixed.out, /Sending the create of 1 script file\(s\) again/);
+    assert.match(fixed.out, /1 script file\(s\) now have their instance in Studio/);
+    assert.match(fixed.out, /is connected and in sync/);
+    assert.equal(fs.readFileSync(lost, "utf8"), "return 1\r\n", "the answer leaves the file as it was");
+    assert.deepEqual((await run("wait", "111", "--idle", "300", "--json")).json().unsynced, []);
+    studio.ws.terminate();
+  });
+});
+
 test("wait is not done while the plugin is still building its first snapshot", { timeout: 60000 }, async () => {
   await withHub(async ({ port }) => {
     // Seconds of silence after the handshake, as a 261k-instance place gives

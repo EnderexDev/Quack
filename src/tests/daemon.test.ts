@@ -468,6 +468,82 @@ test("filesystem live sync triggers createInstance and deleteInstance IPC messag
   }
 });
 
+test("a script create Studio never answered is sent again until its answer maps the file", async () => {
+  const tmp = makeTempDir();
+  const prevSyncDir = config.syncDir;
+  const prevSourcemapPath = config.sourcemapPath;
+  const prevPort = config.port;
+  const prevLiveFsSync = config.liveFsSync;
+  const prevAnswerMs = SyncDaemon.createAnswerMs;
+  let daemon: SyncDaemon | undefined;
+
+  try {
+    config.syncDir = tmp;
+    config.sourcemapPath = path.join(tmp, "sourcemap.json");
+    config.port = 0;
+    config.liveFsSync = { ...prevLiveFsSync, enabled: true };
+    SyncDaemon.createAnswerMs = 100;
+
+    daemon = new SyncDaemon();
+    const d = daemon as any;
+    d.ipc.isConnected = () => true;
+    // A Studio that makes the script every time but answers only the second create: the
+    // first lands while a play swap holds the plugin's sending off
+    const creates: any[] = [];
+    d.ipc.send = (msg: any) => {
+      if (msg.type !== "createInstance") return true;
+      creates.push(msg);
+      if (creates.length === 2) {
+        setTimeout(() => d.handleStudioMessage({
+          type: "instanceUpdated",
+          data: { guid: "gen1", className: "ModuleScript", name: msg.name, path: [...msg.parentPath, msg.name], source: msg.source },
+        }), 10);
+      }
+      return true;
+    };
+
+    const file = path.join(tmp, "ServerScriptService", "CmdrCommands", "generations.luau");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "return 1\r\n");
+    d.handleFileAdd(file, "return 1\n");
+
+    await wait(600);
+    assert.equal(creates.length, 2, "sent again once, then answered");
+    assert.ok(creates.every((m) => m.name === "generations" && m.className === "ModuleScript"));
+    assert.equal(d.fileWriter.getGuidByPath(file), "gen1");
+    assert.equal(fs.readFileSync(file, "utf8"), "return 1\r\n", "the answer leaves git's CRLF file as it was");
+
+    // One Studio never answers: it gives up after three tries and says so
+    const errors: string[] = [];
+    const { log } = await import("../util/log.js");
+    const error = log.error;
+    log.error = (message: string) => void errors.push(message);
+    try {
+      creates.length = 0;
+      d.ipc.send = (msg: any) => {
+        if (msg.type === "createInstance") creates.push(msg);
+        return true;
+      };
+      const lost = path.join(tmp, "ServerScriptService", "CmdrCommands", "lost.luau");
+      fs.writeFileSync(lost, "return 2\n");
+      d.handleFileAdd(lost, "return 2\n");
+      await wait(800);
+      assert.equal(creates.length, 3);
+      assert.match(errors.join("\n"), /never answered the create of .*lost\.luau \(3 tries\)/);
+    } finally {
+      log.error = error;
+    }
+  } finally {
+    await daemon?.stop();
+    SyncDaemon.createAnswerMs = prevAnswerMs;
+    config.syncDir = prevSyncDir;
+    config.sourcemapPath = prevSourcemapPath;
+    config.port = prevPort;
+    config.liveFsSync = prevLiveFsSync;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("renaming a folder on disk moves the instance and preserves non-script descendants", async () => {
   const tmp = makeTempDir();
   const prevSyncDir = config.syncDir;

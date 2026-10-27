@@ -50,6 +50,8 @@ interface Options {
   yes: boolean;
   follow: boolean;
   connected: boolean;
+  /** wait: send the create of each script file with no instance in Studio again */
+  fix: boolean;
   idle?: number;
   timeout?: number;
   name?: string;
@@ -74,6 +76,7 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       yes: { type: "boolean", short: "y" },
       follow: { type: "boolean", short: "f" },
       connected: { type: "boolean" },
+      fix: { type: "boolean" },
       idle: { type: "string" },
       timeout: { type: "string" },
       name: { type: "string" },
@@ -101,6 +104,7 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       yes: values.yes === true,
       follow: values.follow === true,
       connected: values.connected === true,
+      fix: values.fix === true,
       idle: number("idle"),
       timeout: number("timeout"),
       name: values.name,
@@ -137,6 +141,7 @@ See
 Wait
   wait [place]              Until Studio is connected and nothing has synced for a while
       --connected             only until Studio is connected
+      --fix                   send the create of each script file with no instance in Studio again
       --idle <ms>             quiet this long (default 1500), counted from the call too
       --timeout <s>           give up after this long (default 120), exit ${EXIT.timeout}
 
@@ -529,18 +534,52 @@ async function wait(ctx: ControlContext, options: Options, query: string | undef
   const idle = options.idle ?? 1500;
   const timeoutMs = (options.timeout ?? 120) * 1000;
   const started = Date.now();
+  let quietFrom = started;
+  let fixed: string[] | undefined;
   let said = false;
   for (;;) {
     const { sessions } = await ctx.client.get("/api/sessions");
     const session = sessions.find((s: any) => s.placeId === place.placeId);
     const now = Date.now();
     if (session?.studioConnected) {
-      const quietSince = Math.max(started, session.lastActivity ?? 0, session.studioSince ?? 0);
+      const quietSince = Math.max(quietFrom, session.lastActivity ?? 0, session.studioSince ?? 0);
       // A hub from before syncedAt sends none (undefined): there only the quiet counts
       const synced = session.syncedAt === undefined || (session.syncedAt !== null && session.syncedAt >= (session.studioSince ?? 0));
-      if (options.connected || (synced && now - quietSince >= idle)) {
+      if (options.connected) {
         const result = { ok: true, placeId: place.placeId, instances: session.instances, scripts: session.scripts, waitedMs: now - started };
-        ctx.out(options.json ? JSON.stringify(result) : options.connected ? `${placeLabel(place)} is connected.` : `${placeLabel(place)} is connected and in sync.`);
+        ctx.out(options.json ? JSON.stringify(result) : `${placeLabel(place)} is connected.`);
+        return EXIT.ok;
+      }
+      if (synced && now - quietSince >= idle) {
+        // Script files with no instance in Studio: a new file the sync never created (a merge
+        // whose watcher events were lost) shows here instead of at the next play. A hub from
+        // before the check answers 404: nothing to list
+        const unsynced: string[] | undefined = await ctx.client
+          .get("/api/unsynced", { placeId: place.placeId })
+          .then((answer: any) => answer.files, () => undefined);
+        // --fix: the daemon sends their creates again, once; then the quiet is waited for anew
+        if (options.fix && fixed === undefined && unsynced?.length) {
+          await ctx.client.post("/api/unsynced", { placeId: place.placeId });
+          fixed = unsynced;
+          quietFrom = Date.now();
+          if (!options.json) ctx.out(`Sending the create of ${unsynced.length} script file(s) again...`);
+          await sleep(ctx.pollMs ?? 250);
+          continue;
+        }
+        const repaired = fixed?.filter((file) => !unsynced?.includes(file));
+        const result = { ok: true, placeId: place.placeId, instances: session.instances, scripts: session.scripts, waitedMs: now - started, unsynced, ...(fixed ? { repaired } : {}) };
+        if (options.json) {
+          ctx.out(JSON.stringify(result));
+        } else if (unsynced?.length) {
+          if (repaired?.length) ctx.out(`${repaired.length} script file(s) now have their instance in Studio.`);
+          ctx.out(`${placeLabel(place)} is connected, but ${unsynced.length} script file(s) on disk have no instance in Studio the sync knows:`);
+          for (const file of unsynced) ctx.out(`  ${file}`);
+          // Saving it again is an edit of a file nothing maps: only a create maps it
+          if (!options.fix) ctx.out(`Run \`${ctx.info.command} wait --fix\` to send their creates again (Studio reuses a script already there, no duplicate).`);
+        } else {
+          if (repaired?.length) ctx.out(`${repaired.length} script file(s) now have their instance in Studio.`);
+          ctx.out(`${placeLabel(place)} is connected and in sync.`);
+        }
         return EXIT.ok;
       }
     } else if (!said && !options.json) {

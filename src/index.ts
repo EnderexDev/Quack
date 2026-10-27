@@ -178,6 +178,14 @@ export class SyncDaemon {
     { guid: string; oldSegments: string[]; timer: NodeJS.Timeout }
   >();
   private guidToInode = new Map<string, string>();
+  // A script file sent to Studio as a create, until Studio's answer maps it. The file is mapped
+  // only from that answer: a create answered while the plugin held its sending off (a play swap
+  // of another session) made the script in Studio and never mapped it (Astral, 27/10/26). The
+  // plugin reuses a same-named script of the same class, so sending the create again makes
+  // no second instance.
+  private unansweredCreates = new Map<string, { attempt: number; timer?: NodeJS.Timeout }>();
+  static createAnswerMs = 3000;
+  private static readonly CREATE_ATTEMPTS = 3;
   private readonly moveWindowMs = Math.max(500, config.fileWatchDebounce * 5);
 
   constructor() {
@@ -218,6 +226,11 @@ export class SyncDaemon {
           takeOver: async (request) => this.takeOver(request),
           play: (request) => this.startPlay(request.worktree),
           playState: () => this.play,
+          unsynced: (fix) => {
+            const files = this.unsyncedScripts();
+            if (fix) this.createAgain(files);
+            return files;
+          },
         }, (line) => log.info(line))
       : undefined;
 
@@ -1294,16 +1307,47 @@ export class SyncDaemon {
       stripDisambiguationSuffix: true,
     });
 
-    log.debug(
-      `Created file: ${path.relative(this.fileWriter.getBaseDir(), filePath)} (external)`,
+    // In the log at info, like an edit: which new files the daemon saw is the first question
+    // when a script is missing in Studio after a merge
+    log.script(
+      `${path.relative(this.fileWriter.getBaseDir(), filePath)} (external)`,
+      "created",
     );
 
-    this.ipc.createInstance(
+    const sent = this.ipc.createInstance(
       classified.className,
       classified.scriptName,
       dirSegments,
       source,
     );
+    if (sent) this.awaitCreateAnswer(filePath);
+  }
+
+  /** Sends a script's create again while Studio has not answered it, up to CREATE_ATTEMPTS */
+  private awaitCreateAnswer(filePath: string): void {
+    const key = path.resolve(filePath);
+    const previous = this.unansweredCreates.get(key);
+    if (previous?.timer) clearTimeout(previous.timer);
+    const attempt = (previous?.attempt ?? 0) + 1;
+    const timer = setTimeout(() => {
+      const entry = this.unansweredCreates.get(key);
+      if (entry?.timer !== timer) return;
+      this.unansweredCreates.delete(key);
+      if (this.fileWriter.getGuidByPath(key) || !this.ipc.isConnected()) return;
+      const text = readFileIfExists(key);
+      if (text === undefined) return;
+      const relative = path.relative(this.fileWriter.getBaseDir(), key);
+      if (attempt >= SyncDaemon.CREATE_ATTEMPTS) {
+        log.error(`Studio never answered the create of ${relative} (${attempt} tries): it has no instance the sync knows`);
+        return;
+      }
+      log.warn(`Studio did not answer the create of ${relative}; sending it again`);
+      // Kept without a timer so the add below counts this as the next try
+      this.unansweredCreates.set(key, { attempt });
+      this.handleFileAdd(key, text);
+      if (!this.unansweredCreates.get(key)?.timer) this.unansweredCreates.delete(key);
+    }, SyncDaemon.createAnswerMs);
+    this.unansweredCreates.set(key, { attempt, timer });
   }
 
   /**
@@ -1347,8 +1391,9 @@ export class SyncDaemon {
         timer,
       });
     } else {
-      log.debug(
-        `Deleted: ${path.relative(this.fileWriter.getBaseDir(), filePath)} (external)`,
+      log.script(
+        `${path.relative(this.fileWriter.getBaseDir(), filePath)} (external)`,
+        "deleted",
       );
 
       const segments = this.getRelativeSegments(filePath);
@@ -1584,6 +1629,53 @@ export class SyncDaemon {
   }
 
   /** The inode of a path as a string key, or null if it can't be stat'd. */
+  /**
+   * Script files on disk that no instance in Studio answers to: a file is mapped only once the
+   * plugin created its instance and sent it back, so a create the watcher never reported, or
+   * one the plugin never answered, stays here. Paths relative to the sync folder, sorted.
+   */
+  private unsyncedScripts(): string[] {
+    const base = path.resolve(this.fileWriter.getBaseDir());
+    const found: string[] = [];
+    const walk = (dir: string) => {
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+        } else if (/\.luau?$/.test(entry.name) && !this.fileWriter.getGuidByPath(full)) {
+          found.push(path.relative(base, full).split(path.sep).join("/"));
+        }
+      }
+    };
+    walk(base);
+    return found.sort();
+  }
+
+  /**
+   * Sends the create of each listed script again (paths relative to the sync folder). Studio
+   * reuses a script of that name and class already there, so one it made without answering is
+   * mapped, not duplicated; one it never made is made now.
+   */
+  private createAgain(files: string[]): void {
+    const base = this.fileWriter.getBaseDir();
+    for (const file of files) {
+      const full = path.resolve(base, file);
+      const text = readFileIfExists(full);
+      if (text === undefined || this.fileWriter.getGuidByPath(full)) continue;
+      const previous = this.unansweredCreates.get(full);
+      if (previous?.timer) clearTimeout(previous.timer);
+      this.unansweredCreates.delete(full);
+      log.info(`Sending the create of ${file} again (quack wait --fix)`);
+      this.handleFileAdd(full, text);
+    }
+  }
+
   private statInode(absPath: string): string | null {
     try {
       const { ino } = fs.statSync(absPath);
@@ -1691,7 +1783,7 @@ export class SyncDaemon {
     }
 
     this.guidToInode.delete(guid);
-    log.debug(`Deleted instance: ${oldSegments.join("/")} (external)`);
+    log.script(`${oldSegments.join("/")} (external)`, "deleted");
 
     // Only prune local state once Studio actually received the delete.
     if (this.ipc.deleteInstance(guid)) {
@@ -2038,6 +2130,8 @@ export class SyncDaemon {
         clearTimeout(entry.timer);
       }
       this.pendingInstanceDeletes.clear();
+      for (const entry of this.unansweredCreates.values()) clearTimeout(entry.timer);
+      this.unansweredCreates.clear();
       // Flush queued work so the last changes aren't lost
       if (this.sourcemapTimer) {
         this.regenerateSourcemap();
