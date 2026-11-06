@@ -202,6 +202,10 @@ export class SyncDaemon {
     this.fileWriter.setEventSuppressor((filePath, event) => {
       this.fileWatcher.suppressNextEvent(filePath, event);
     });
+    this.fileWriter.setLiveDirCheck((dirPath) => {
+      const segments = this.getRelativeSegments(dirPath);
+      return segments.length > 0 && this.nodesAtDiskPath(segments).some((n) => !this.isScriptClass(n.className));
+    });
 
     // Started by a hub: it answers the hub's /status, /adopt, /kick and /shutdown, and lets in
     // only what carries the hub's token
@@ -1231,6 +1235,7 @@ export class SyncDaemon {
    */
   private handleFileAdd(filePath: string, source: string): void {
     if (!config.liveFsSync.enabled) return;
+    this.fileWriter.forgetRemoved(filePath);
 
     const existingGuid = this.fileWriter.getGuidByPath(filePath);
     if (existingGuid) {
@@ -1391,10 +1396,12 @@ export class SyncDaemon {
         timer,
       });
     } else {
-      log.script(
-        `${path.relative(this.fileWriter.getBaseDir(), filePath)} (external)`,
-        "deleted",
-      );
+      // Quack: a file this daemon removed itself (a script renamed or moved): the echo came late,
+      // after a lost-events rescan. Sending it as a delete destroyed a same-named sibling
+      if (this.fileWriter.removedByDaemon(filePath)) {
+        log.info(`Late echo of a file the daemon removed itself, ignored: ${path.relative(this.fileWriter.getBaseDir(), filePath)}`);
+        return;
+      }
 
       const segments = this.getRelativeSegments(filePath);
       if (segments.length === 0) return;
@@ -1404,6 +1411,17 @@ export class SyncDaemon {
       const classified = classifyScriptFileName(fileName, {
         stripDisambiguationSuffix: true,
       });
+      // Quack: Name__<suffix> is one of several same-named scripts; a delete by path reaches
+      // whichever Studio finds first, so it is not sent
+      if (classified.scriptName !== classifyScriptFileName(fileName).scriptName) {
+        log.warn(`${path.relative(this.fileWriter.getBaseDir(), filePath)} left the disk but no script is synced from it; it names one of several same-named scripts, so Studio keeps them all`);
+        return;
+      }
+
+      log.script(
+        `${path.relative(this.fileWriter.getBaseDir(), filePath)} (external)`,
+        "deleted",
+      );
       const instancePath = [...dirSegments, classified.scriptName];
 
       this.ipc.deleteInstance(undefined, instancePath);
@@ -1447,6 +1465,7 @@ export class SyncDaemon {
 
     const segments = this.getRelativeSegments(dirPath);
     if (segments.length === 0) return;
+    this.fileWriter.forgetRemoved(dirPath);
 
     const parentPath = segments.slice(0, -1);
     const folderName = segments[segments.length - 1];
@@ -1476,15 +1495,23 @@ export class SyncDaemon {
     // Quack: the tree already has an instance here. Renaming a folder emits "added" for every
     // subfolder too, after the parent's move already brought them along; creating a Folder
     // here duplicated each Model/Part that holds scripts (9 in the Anime Astral copy).
-    const existing = this.findNodeAtDiskPath(segments);
+    const existing = this.nodesAtDiskPath(segments)[0];
     if (existing) {
       if (inode) this.guidToInode.set(existing.guid, inode);
       log.debug(`Directory '${folderName}' is already tracked; not creating an instance`);
       return;
     }
 
-    log.debug(
-      `Directory created: ${path.relative(this.fileWriter.getBaseDir(), dirPath)} (external)`,
+    // Quack: a folder holding a script this daemon wrote is the daemon's own, whose addDir came
+    // after its suppression ran out (a stalled event loop): a Folder made from it was an empty
+    // twin of the Model next to it (Mihawk, AuraCirculo, Naruto... in the Anime Astral copy)
+    if (this.mappedUnder(dirPath)) {
+      log.info(`Directory ${path.relative(this.fileWriter.getBaseDir(), dirPath)} holds a synced script; not creating a Folder for it`);
+      return;
+    }
+
+    log.info(
+      `Directory created on disk: ${path.relative(this.fileWriter.getBaseDir(), dirPath)}; Studio gets a Folder`,
     );
 
     this.ipc.createInstance("Folder", folderName, parentPath);
@@ -1519,6 +1546,41 @@ export class SyncDaemon {
   }
 
   /**
+   * Quack: every tracked node a disk path stands for: the path index first (one lookup), then
+   * the walk that matches sanitized names
+   */
+  private nodesAtDiskPath(segments: string[]): TreeNode[] {
+    const indexed = this.tree.nodesAtPath(segments);
+    if (indexed.length > 0) return indexed;
+    const walked = this.findNodeAtDiskPath(segments);
+    return walked ? [walked] : [];
+  }
+
+  /** Quack: a script file this daemon maps lives somewhere under the folder */
+  private mappedUnder(dirPath: string): boolean {
+    const prefix = path.resolve(dirPath) + path.sep;
+    for (const mapping of this.fileWriter.getAllMappings().values()) {
+      if (path.resolve(mapping.filePath).startsWith(prefix)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Quack: how many instances in this subtree have no file or folder on disk (Parts, Models,
+   * GUIs...). A folder going away cannot have meant them: they were never on disk to remove.
+   */
+  private unfiledInstances(node: TreeNode): number {
+    let count = 0;
+    const stack: TreeNode[] = [node];
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      if (current.className !== "Folder" && !this.isScriptClass(current.className)) count++;
+      for (const child of current.children.values()) stack.push(child);
+    }
+    return count;
+  }
+
+  /**
    * Handle directory deletion on filesystem
    */
   private handleDirDelete(dirPath: string): void {
@@ -1537,7 +1599,9 @@ export class SyncDaemon {
       return;
     }
 
-    const node = this.findTrackedFolderNode(segments);
+    const node =
+      this.findTrackedFolderNode(segments) ??
+      this.nodesAtDiskPath(segments).find((n) => !this.isScriptClass(n.className));
     // Quack: a service, or a locked child of StarterPlayer, stands for a directory that git
     // removes once its last tracked file goes (a merge, a reset). The plugin refuses to delete it,
     // but dropping it from the tree here made the directory's return create a Folder with the
@@ -1548,10 +1612,14 @@ export class SyncDaemon {
       return;
     }
     if (!node) {
+      if (this.fileWriter.removedByDaemon(dirPath)) {
+        log.info(`Late echo of a folder the daemon removed itself, ignored: ${path.relative(this.fileWriter.getBaseDir(), dirPath)}`);
+        return;
+      }
       // Untracked folder (created and removed purely on disk): nothing in Studio
       // to lose, delete immediately.
-      log.debug(
-        `Deleted directory: ${path.relative(this.fileWriter.getBaseDir(), dirPath)} (external)`,
+      log.info(
+        `Directory removed on disk with no instance in the tree: ${path.relative(this.fileWriter.getBaseDir(), dirPath)}; Studio deletes what sits at that path`,
       );
       this.ipc.deleteInstance(undefined, segments);
       return;
@@ -1768,6 +1836,18 @@ export class SyncDaemon {
     // a rename/move handled elsewhere — never delete an instance that relocated.
     const node = this.tree.getNode(guid);
     if (node && !this.pathsEqualSegments(node.path, oldSegments)) return;
+
+    // Quack: a folder gone from disk only ever held scripts there. A container that also holds
+    // Parts, Models or GUIs stays: its scripts went with their own unlink events, and the rest
+    // was never on disk to be removed (Workspace.Worlds.0 of the Anime Astral copy, 06/11/26)
+    if (node && !this.isScriptClass(node.className)) {
+      const unfiled = this.unfiledInstances(node);
+      if (unfiled > 0) {
+        this.guidToInode.delete(guid);
+        log.warn(`Kept ${oldSegments.join("/")} in Studio: its folder left the disk, but it holds ${unfiled} instance(s) with no file (Parts, Models...). Delete it in Studio if that was meant.`);
+        return;
+      }
+    }
 
     // Quack: the file is back at its path (a rewrite whose add event was missed or came first):
     // what is on disk is the script's new text, never a deletion

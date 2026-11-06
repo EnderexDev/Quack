@@ -85,6 +85,45 @@ export class FileWriter {
     this.eventSuppressor?.(filePath, event);
   }
 
+  // Quack: whether a folder on disk stands for an instance Studio still has
+  private liveDir: ((dirPath: string) => boolean) | null = null;
+
+  /**
+   * A folder of a live instance is left on disk when its last script moves out. Removing it
+   * raised an unlinkDir the watcher, behind a stalled event loop, delivered after its 1 s
+   * suppression, and the daemon took it for a deletion: Workspace.Worlds.0 of the Anime
+   * Astral copy (82 instances, no script) was destroyed twice on 06/11/26
+   */
+  public setLiveDirCheck(fn: (dirPath: string) => boolean): void {
+    this.liveDir = fn;
+  }
+
+  // Quack: files and folders this writer removed, by path, with when. The watcher's suppression
+  // lasts 1 s, but the OS can drop the event and a rescan delivers it later: in the Anime Astral
+  // copy (06/11/26) a renamed script's old file came back 1.8 s after its removal, was read as
+  // deleted by someone, and the path delete it sent destroyed a same-named sibling in Studio
+  private removed: Map<string, number> = new Map();
+  private static readonly REMOVED_MEMORY_MS = 60_000;
+
+  private noteRemoved(filePath: string): void {
+    const now = Date.now();
+    if (this.removed.size > 10_000) {
+      for (const [p, at] of this.removed) if (now - at > FileWriter.REMOVED_MEMORY_MS) this.removed.delete(p);
+    }
+    this.removed.set(path.resolve(filePath), now);
+  }
+
+  /** This writer removed the path itself, lately: its unlink is an echo, never a user's delete */
+  public removedByDaemon(filePath: string): boolean {
+    const at = this.removed.get(path.resolve(filePath));
+    return at !== undefined && Date.now() - at <= FileWriter.REMOVED_MEMORY_MS;
+  }
+
+  /** The path exists again (created on disk): a later removal of it is someone's */
+  public forgetRemoved(filePath: string): void {
+    this.removed.delete(path.resolve(filePath));
+  }
+
   /**
    * Write all script nodes to the filesystem
    */
@@ -235,6 +274,7 @@ export class FileWriter {
         // Suppress the watcher echo for our own delete so it isn't mistaken
         // for a user-initiated removal (which would delete the instance in Studio).
         this.suppressEvent(previousPath, "unlink");
+        this.noteRemoved(previousPath);
         fs.unlinkSync(previousPath);
         this.pathToGuid.delete(path.resolve(previousPath));
         this.cleanupParentsIfEmpty(path.dirname(previousPath));
@@ -504,6 +544,7 @@ export class FileWriter {
     if (fs.existsSync(normalized)) {
       try {
         this.suppressEvent(normalized, "unlink");
+        this.noteRemoved(normalized);
         fs.unlinkSync(normalized);
         log.script(this.getRelativePath(normalized), "deleted");
       } catch (error) {
@@ -615,6 +656,7 @@ export class FileWriter {
 
         try {
           this.suppressEvent(dirPath, "unlinkDir");
+          this.noteRemoved(dirPath);
           fs.rmdirSync(dirPath);
           return true;
         } catch {
@@ -646,7 +688,9 @@ export class FileWriter {
           : [];
 
         if (entries.length === 0) {
+          if (this.liveDir?.(current)) break;
           this.suppressEvent(current, "unlinkDir");
+          this.noteRemoved(current);
           fs.rmdirSync(current);
           current = path.dirname(current);
         } else {

@@ -1309,7 +1309,33 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 				if resolvedFully and current ~= game then targetInst = current end
 			end
 
-			if targetInst and not QuackService.isProtectedRobloxContainer(targetInst) then
+			-- A delete by path (no guid) comes from a folder or file gone from disk that the daemon's
+			-- tree did not know. A container holding Parts, Models or GUIs was never on disk, so a
+			-- folder going away cannot mean it (Workspace.Worlds.0 of the Anime Astral copy, 06/11/26)
+			-- Breadth first with GetChildren, stopping at the first one: a world holds tens of
+			-- thousands of Parts, and GetDescendants would list them all before the first check
+			local unfiled: Instance? = nil
+			if targetInst and not self.guidMap[message.guid or ""] and not targetInst:IsA("LuaSourceContainer") then
+				local queue = { targetInst }
+				local head = 1
+				while head <= #queue and not unfiled do
+					local current = queue[head]
+					head += 1
+					if not current:IsA("Folder") and not current:IsA("LuaSourceContainer") then
+						unfiled = current
+					else
+						for _, child in ipairs(current:GetChildren()) do
+							table.insert(queue, child)
+						end
+					end
+				end
+			end
+
+			if unfiled and targetInst then
+				warn(
+					`[Quack]: Kept {targetInst:GetFullName()}: its folder left the disk, but it holds instances with no file ({unfiled:GetFullName()}). Delete it in Studio if that was meant.`
+				)
+			elseif targetInst and not QuackService.isProtectedRobloxContainer(targetInst) then
 				local name = targetInst.Name
 
 				-- Clear tracking state for the whole subtree before destroying it.

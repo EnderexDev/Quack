@@ -376,8 +376,9 @@ export class FileWatcher {
         return;
       }
 
-      log.debug(
-        `Discarding expired suppression, processing normally: ${event} ${normalizedPath}`,
+      // Quack: visible, since this is the daemon's own change read as someone else's
+      log.info(
+        `The echo of the daemon's own ${event} arrived after its suppression ran out; handled as a disk change: ${normalizedPath}`,
       );
     }
 
@@ -533,7 +534,18 @@ export class FileWatcher {
       eventMap = new Map();
       this.suppressedEvents.set(normalizedPath, eventMap);
     }
-    eventMap.set(event, Date.now() + FileWatcher.SUPPRESSION_TTL_MS);
+    // Quack: the window opens when the event loop is free, not now. The work that registers it
+    // can hold the loop past 1 s in a big place (a Map moved in the Anime Astral copy), and every
+    // echo queued behind it came back as a user's change: Workspace.Worlds.0 destroyed, empty
+    // Folders created next to Models (06/11/26). setImmediate runs before the echo is processed:
+    // the echo's own processing is queued by the watcher's callback after this one
+    eventMap.set(event, Number.POSITIVE_INFINITY);
+    const armed = eventMap;
+    setImmediate(() => {
+      if (armed.get(event) === Number.POSITIVE_INFINITY) {
+        armed.set(event, Date.now() + FileWatcher.SUPPRESSION_TTL_MS);
+      }
+    });
   }
 
   /**

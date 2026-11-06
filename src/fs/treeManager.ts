@@ -385,6 +385,12 @@ export class TreeManager {
     return this.nodes.get(guid);
   }
 
+  /** Every node at this DataModel path (same-name siblings share one), from the path index */
+  public nodesAtPath(path: string[]): TreeNode[] {
+    const bucket = this.pathIndex.get(this.pathKey(path));
+    return bucket ? [...bucket] : [];
+  }
+
   /**
    * Get all nodes
    */
