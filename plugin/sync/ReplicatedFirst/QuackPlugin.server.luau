@@ -102,6 +102,8 @@ const uiCallbacks: quackApp.CallbackFunctions = {
 
 	onRequestSetup = function() session:requestSetup() end,
 
+	onRestoreDeleted = function(id: number) session:restoreDeleted(id) end,
+
 	onSourcemapReload = function()
 		session:infoPrint("Reloading sourcemap...")
 		session:reloadSourcemap()

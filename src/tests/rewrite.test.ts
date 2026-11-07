@@ -8,6 +8,7 @@ import { SyncDaemon } from "../index.js";
 import { config } from "../config.js";
 import { FileWatcher } from "../fs/watcher.js";
 import { diskText } from "../util/scriptFile.js";
+import { deleteLog } from "../util/deleteLog.js";
 
 // git on Windows rewrites a file by replacing it (reset, checkout, merge) and writes CRLF. With
 // Quack running, a `git reset --hard` deleted the script it rewrote, from Studio and disk, and
@@ -171,11 +172,77 @@ test("a script created, edited or deleted in Studio is one line in the log, with
       // An instance without a file still gets its line
       daemon.handleStudioMessage({ type: "instanceUpdated", data: { guid: "fo", className: "Folder", name: "Fo", path: ["ReplicatedStorage", "Fo"], parentGuid: "rs" } });
       daemon.handleStudioMessage({ type: "deleted", data: { guid: "fo" } });
-      assert.deepEqual(take(), ["+ Created instance: ReplicatedStorage/Fo", "− Deleted instance: ReplicatedStorage/Fo"]);
+      deleteLog.flush();
+      assert.deepEqual(take(), ["+ Created instance: ReplicatedStorage/Fo", "− Deleted in Studio: ReplicatedStorage/Fo"]);
     } finally {
       console.log = original;
     }
   });
+});
+
+test("a tree deleted in Studio is one line with its count, even with the root arriving last", async () => {
+  // Anime Astral, 07/11/26: Workspace.Worlds.0 (82 instances) was 82 red lines, its own the last,
+  // and nothing said whether Studio or Quack had deleted it
+  await withDaemon(async (daemon, _file, sent) => {
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (...args: any[]) => {
+      lines.push(args.join(" ").replace(/\x1b\[[0-9;]*m/g, ""));
+    };
+    const deletes = () => lines.splice(0).filter((line) => /\] − /.test(line)).map((line) => line.replace(/^.*?\] /, ""));
+    try {
+      const add = (guid: string, className: string, name: string, parentGuid: string, at: string[]) =>
+        daemon.handleStudioMessage({ type: "instanceUpdated", data: { guid, className, name, path: at, parentGuid } });
+      add("w0", "Folder", "Lobby", "rs", ["ReplicatedStorage", "Lobby"]);
+      add("sy", "Folder", "Systems", "w0", ["ReplicatedStorage", "Lobby", "Systems"]);
+      add("st", "Model", "Station", "sy", ["ReplicatedStorage", "Lobby", "Systems", "Station"]);
+      add("pa", "Part", "Base", "st", ["ReplicatedStorage", "Lobby", "Systems", "Station", "Base"]);
+      add("sp", "Part", "Spawn", "w0", ["ReplicatedStorage", "Lobby", "Spawn"]);
+      lines.length = 0;
+
+      // The plugin's order: two descendants first (one batch), the root and the rest later
+      daemon.handleStudioMessage({ type: "deleted", data: { guid: "pa" } });
+      daemon.handleStudioMessage({ type: "deleted", data: { guid: "sp" } });
+      await wait(50);
+      daemon.handleStudioMessage({ type: "deleted", data: { guid: "w0" } });
+      daemon.handleStudioMessage({ type: "deleted", data: { guid: "sy" } });
+      daemon.handleStudioMessage({ type: "deleted", data: { guid: "st" } });
+      assert.deepEqual(deletes(), [], "held until the tree's deletes stop coming");
+      await wait(500);
+      assert.deepEqual(deletes(), ["− Deleted in Studio: ReplicatedStorage/Lobby (5 instances)"]);
+
+      // One the daemon orders because its folder left the disk says so
+      add("gf", "Folder", "Gone", "rs", ["ReplicatedStorage", "Gone"]);
+      lines.length = 0;
+      daemon.handleDeleted({ guid: "gf" }, "disk");
+      deleteLog.flush();
+      assert.deepEqual(deletes(), ["− Deleted by Quack (its file or folder left the disk): ReplicatedStorage/Gone"]);
+      assert.equal(sent.filter((m) => m.type === "deleteInstance").length, 0);
+    } finally {
+      console.log = original;
+    }
+  });
+});
+
+test("thousands of deletes with no common root are grouped in linear time", () => {
+  const lines: string[] = [];
+  const original = console.log;
+  console.log = (...args: any[]) => {
+    lines.push(args.join(" "));
+  };
+  try {
+    for (let i = 0; i < 20000; i++) deleteLog.note(["Workspace", `Part${i}`], 1, "studio");
+    deleteLog.note(["Workspace", "Part7", "Decal"], 1, "studio");
+    const started = performance.now();
+    deleteLog.flush();
+    const elapsed = performance.now() - started;
+    assert.equal(lines.length, 20000, "one line per loose part, the Decal counted under its Part");
+    assert.ok(lines.some((line) => line.includes("Workspace/Part7 (2 instances)")));
+    // Comparing every entry with every group took seconds here
+    assert.ok(elapsed < 1000, `grouping took ${elapsed.toFixed(0)} ms`);
+  } finally {
+    console.log = original;
+  }
 });
 
 test("a service's directory that git removes and brings back is never deleted nor made a Folder", async () => {

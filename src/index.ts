@@ -17,6 +17,7 @@ import {
   normalizeLuaLikeFileName,
 } from "./util/scriptFile.js";
 import { log } from "./util/log.js";
+import { deleteLog, type DeleteOrigin } from "./util/deleteLog.js";
 import { config, initializeConfig } from "./config.js";
 import {
   mergeScripts,
@@ -1068,7 +1069,7 @@ export class SyncDaemon {
   /**
    * Handle instance deletion
    */
-  private handleDeleted(message: { guid: string }): void {
+  private handleDeleted(message: { guid: string }, origin: DeleteOrigin = "studio"): void {
     const { guid } = message;
     const node = this.tree.getNode(guid);
 
@@ -1095,7 +1096,7 @@ export class SyncDaemon {
     }
 
     // Delete from tree (removes node and descendants)
-    this.tree.deleteInstance(guid);
+    this.tree.deleteInstance(guid, origin);
 
     // Delete files for all affected scripts
     for (const entry of scriptsToDelete) {
@@ -1867,7 +1868,7 @@ export class SyncDaemon {
 
     // Only prune local state once Studio actually received the delete.
     if (this.ipc.deleteInstance(guid)) {
-      this.handleDeleted({ guid });
+      this.handleDeleted({ guid }, "disk");
     } else {
       log.warn(
         `Studio did not receive the delete for ${guid}; keeping local state`,
@@ -2204,6 +2205,7 @@ export class SyncDaemon {
     }
 
     this.stopPromise = (async () => {
+      deleteLog.flush();
       log.info("Stopping daemon...");
       if (this.afterTakeoverTimer) clearTimeout(this.afterTakeoverTimer);
       for (const entry of this.pendingInstanceDeletes.values()) {

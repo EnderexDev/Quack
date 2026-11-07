@@ -4,6 +4,18 @@ All notable changes to Quack are listed here, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions are the tags of this repo; each one
 has release notes with the details and the source commits.
 
+## [1.0.5] - 2026-11-06
+
+### Changed
+- A folder that leaves the disk no longer deletes, in Studio, a container that holds Parts, Models or GUIs: only its scripts go, and the log says the container was kept. The plugin refuses the same for a delete by path.
+- The folder of an instance still in Studio stays on disk, empty, when its last script moves out.
+- A late echo of the daemon's own change, an untracked folder deleted and a Folder created from disk are logged at info.
+
+### Fixed
+- Moving a Model that holds a script into a container with no script of its own, then back out, deleted the container in Studio (a world of stations and spawns, 82 instances). The echo of the daemon's own folder removal came after its 1 s suppression while a big place held the event loop; the window now opens when the loop is free.
+- The same echo of a folder creation made an empty Folder next to each Model holding a script. A new folder that holds a synced script is no longer turned into a Folder.
+- A script renamed on disk by a move (same-named siblings) had its old file's removal delivered late by a lost-events rescan and sent as a delete by path, which destroyed a same-named sibling in Studio. The daemon remembers for 60 s what it removed itself, and a `Name__suffix` file with no script is never deleted by path.
+
 ## [1.0.4] - 2026-10-27
 
 ### Added

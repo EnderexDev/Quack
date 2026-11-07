@@ -62,7 +62,11 @@ export type CallbackFunctions = {
 	onSourcemapReload: () -> (),
 	onPlaceIgnoredChanged: (boolean) -> (),
 	onRequestSetup: () -> (),
+	onRestoreDeleted: ((number) -> ())?,
 }
+
+--- A copy of something deleted in Studio, as the window lists it
+export type TrashRow = { id: number, title: string, detail: string }
 
 type QuackUI = {
 	plugin: Plugin,
@@ -111,8 +115,10 @@ type QuackUI = {
 	ignoredClasses: fusion.Value<{ string }>,
 	excludedParentsRef: fusion.Value<TextBox?>,
 	ignoredClassesRef: fusion.Value<TextBox?>,
+	trashRows: fusion.Value<{ TrashRow }>,
 
 	GetSyncState: (QuackUI) -> boolean,
+	UpdateTrash: (QuackUI, { TrashRow }) -> (),
 	UpdateSyncState: (QuackUI, boolean) -> (),
 	UpdateHandshakeState: (QuackUI, boolean) -> (),
 	UpdateConfig: (QuackUI) -> (),
@@ -569,6 +575,80 @@ local function listEditor(self, scope: Scope, options: ListEditorOptions)
 end
 
 
+--[[
+	What Studio deleted that the folder on disk cannot bring back (Parts, Models, maps), each with
+	a Restore button. Hidden while there is none. Kept by the plugin for 30 minutes (Trash.luau).
+]]
+local function trashSection(self, scope: Scope)
+	local rows = scope:ForPairs(self.trashRows, function(_, innerScope, index, row: TrashRow)
+		return index, innerScope:Container {
+			LayoutOrder = index,
+			Size = UDim2.fromScale(1, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			[Children] = {
+				innerScope:New "UIPadding" {
+					PaddingTop = UDim.new(0, 8),
+					PaddingBottom = UDim.new(0, 8),
+					PaddingLeft = UDim.new(0, 12),
+					PaddingRight = UDim.new(0, 8),
+				},
+				innerScope:Container {
+					Size = UDim2.new(1, -86, 0, 0),
+					AutomaticSize = Enum.AutomaticSize.Y,
+					[Children] = {
+						innerScope:List { Spacing = 2 },
+						innerScope:Text {
+							Text = row.title,
+							Font = Theme.Fonts.Bold,
+							TextSize = Theme.TextSize.Medium,
+							Size = UDim2.fromScale(1, 0),
+							AutomaticSize = Enum.AutomaticSize.Y,
+							TextWrapped = true,
+						},
+						innerScope:Text {
+							Text = row.detail,
+							Font = Theme.Fonts.Mono,
+							TextSize = Theme.TextSize.Small,
+							Color = Theme.Colors.TextDimmed,
+							Size = UDim2.fromScale(1, 0),
+							AutomaticSize = Enum.AutomaticSize.Y,
+							TextWrapped = true,
+						},
+					},
+				},
+				innerScope:TextButton {
+					AnchorPoint = Vector2.new(1, 0.5),
+					Position = UDim2.fromScale(1, 0.5),
+					Size = UDim2.fromOffset(78, Theme.CompSizeY.Medium + 2),
+					Text = "Restore",
+					Solid = true,
+					Activated = function()
+						if self.callbacks.onRestoreDeleted then self.callbacks.onRestoreDeleted(row.id) end
+					end,
+				},
+			},
+		}
+	end)
+
+	return scope:Container {
+		Size = UDim2.fromScale(1, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		Visible = scope:Computed(function(use) return #use(self.trashRows) > 0 end),
+		[Children] = {
+			scope:List { Spacing = 6 },
+			smallLabel(scope, "Recently deleted in Studio"),
+			scope:Box {
+				Size = UDim2.fromScale(1, 0),
+				AutomaticSize = Enum.AutomaticSize.Y,
+				[Children] = {
+					scope:List { Spacing = 0 },
+					rows,
+				},
+			},
+		},
+	}
+end
+
 local function buildContent(self, scope: Scope, helpers)
 	-- off: not trying; waiting: trying, the hub has not accepted yet; synced: handshake done
 	local status = scope:Computed(function(use)
@@ -887,6 +967,7 @@ local function buildContent(self, scope: Scope, helpers)
 			},
 		},
 		statusCard,
+		trashSection(self, scope),
 		smallLabel(scope, "Quick settings"),
 		quick,
 		scope:Collapsible {
@@ -959,6 +1040,7 @@ function UI.new(plugin, callbacks, settingsScope, helpers): QuackUI
 	self.ignoredClasses = scope:Value(table.clone(Config.IGNORED_CLASSES))
 	self.excludedParentsRef = scope:Value(nil)
 	self.ignoredClassesRef = scope:Value(nil)
+	self.trashRows = scope:Value({})
 
 	self.connectButton = scope:ToolbarButton {
 		Toolbar = scope:Toolbar {
@@ -1009,6 +1091,8 @@ function UI.new(plugin, callbacks, settingsScope, helpers): QuackUI
 end
 
 function UI:GetSyncState() return self.isSyncEnabled end
+
+function UI:UpdateTrash(rows: { TrashRow }) self.trashRows:set(rows) end
 
 function UI:UpdateSyncState(enabled: boolean)
 	self.isSyncEnabled = enabled

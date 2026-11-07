@@ -2,6 +2,7 @@ import { InstanceData } from "../ipc/messages.js";
 import { log } from "../util/log.js";
 import { config } from "../config.js";
 import { isScriptClassName } from "../util/scriptFile.js";
+import { deleteLog, type DeleteOrigin } from "../util/deleteLog.js";
 
 /**
  * Represents a node in the virtual DataModel tree
@@ -327,7 +328,7 @@ export class TreeManager {
   /**
    * Delete an instance by GUID
    */
-  public deleteInstance(guid: string): TreeNode | null {
+  public deleteInstance(guid: string, origin: DeleteOrigin = "studio"): TreeNode | null {
     this.noteChange(guid);
     const node = this.nodes.get(guid);
     if (!node) {
@@ -342,8 +343,10 @@ export class TreeManager {
 
     // Iterative delete to avoid repeated recursion work on large subtrees
     const stack: TreeNode[] = [node];
+    let count = 0;
     while (stack.length > 0) {
       const current = stack.pop()!;
+      count++;
       for (const child of current.children.values()) {
         stack.push(child);
       }
@@ -357,9 +360,10 @@ export class TreeManager {
       current.parent = undefined;
     }
 
-    // Quack: a script gets its line from the file writer, with the path on disk
+    // Quack: a script gets its line from the file writer, with the path on disk. The rest is
+    // one line per deleted tree, with who deleted it (util/deleteLog.ts)
     if (!isScriptClassName(node.className)) {
-      log.script(`Deleted instance: ${node.path.join("/")}`, "deleted");
+      deleteLog.note(node.path, count, origin);
     }
     return node;
   }

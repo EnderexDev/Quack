@@ -21,6 +21,7 @@ local Logger = require("./Logger")
 local SettingsStore = require("./SettingsStore")
 local WebSocketClient = require("./WebSocketClient")
 local PlayOverlay = require("./PlayOverlay")
+local Trash = require("./Trash")
 
 export type SyncSession = {
 	-- Constructor fields
@@ -52,6 +53,8 @@ export type SyncSession = {
 	serviceSet: { [string]: boolean },
 	listenerAttachedInstances: { [Instance]: boolean },
 	handshakeComplete: boolean,
+	-- Copies of what Studio deleted with no file on disk, to restore (Trash.luau)
+	trash: Trash.Trash,
 
 	-- Methods
 	startSync: (self: SyncSession, suppressInfo: boolean?) -> (),
@@ -70,6 +73,8 @@ export type SyncSession = {
 	setPlaceIgnored: (self: SyncSession, ignored: boolean) -> (),
 	requestSetup: (self: SyncSession) -> (),
 	markPlaceSynced: (self: SyncSession) -> (),
+	restoreDeleted: (self: SyncSession, id: number) -> (),
+	refreshTrash: (self: SyncSession) -> (),
 
 	-- Auto-connect helpers
 	_autoConnectThread: thread?,
@@ -182,7 +187,37 @@ end
 
 function SyncSession:rebuildServiceSet() QuackService.rebuildServiceSet(self.serviceSet) end
 
-function SyncSession:setUI(ui) self.ui = ui end
+function SyncSession:setUI(ui)
+	self.ui = ui
+	self:refreshTrash()
+end
+
+--- The list of kept copies in the window, the newest first
+function SyncSession:refreshTrash()
+	if not self.ui or not self.ui.UpdateTrash then return end
+	local rows = {}
+	for _, entry in self.trash:list() do
+		local where = table.concat(entry.parentPath, ".")
+		table.insert(rows, {
+			id = entry.id,
+			title = `{entry.name} · {entry.count} instances`,
+			detail = `from {where} at {entry.clock}`,
+		})
+	end
+	self.ui:UpdateTrash(rows)
+end
+
+--- Puts a kept copy back (from the window or a pop-up's button)
+function SyncSession:restoreDeleted(id: number)
+	local ok, message = self.trash:restore(id)
+	if ok then
+		self:infoPrint(message)
+	else
+		warn(`[Quack]: {message}`)
+	end
+	self._lastNotice = nil
+	self:notify(message, 6)
+end
 
 function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsStore, config: any): SyncSession
 	local self = (setmetatable({}, SyncSession) :: any) :: SyncSession
@@ -227,6 +262,17 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 	self.serviceSet = {}
 	self.listenerAttachedInstances = {}
 	self.handshakeComplete = false
+	self.trash = Trash.new(function(kept)
+		self:refreshTrash()
+		if not kept then return end
+		local where = table.concat(kept.parentPath, ".")
+		local text = `{kept.name} ({kept.count} instances) was deleted from {where}. Quack kept a copy for 30 minutes.`
+		self:infoPrint(text)
+		local id = kept.id
+		self:notify(text, 60, {
+			{ Text = "Restore", Activated = function() self:restoreDeleted(id) end },
+		})
+	end)
 
 	-- Auto-connect helpers
 	self._autoConnectThread = nil
@@ -679,6 +725,7 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 	]=]
 	local function onParentChanged(instance: Instance)
 		if instance.Parent == nil then return end
+		self.trash:noteParent(instance)
 		if not shouldIncludeInSnapshot(instance) then
 			if self.trackedInstances[instance] then leaveSyncedArea(instance) end
 			return
@@ -693,6 +740,8 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 
 	local function attachListeners(instance)
 		if not shouldIncludeInSnapshot(instance) then return end
+		-- Where it is, for a copy rebuilt after a Destroy tore its tree apart (Trash.luau)
+		self.trash:noteParent(instance)
 		if self.listenerAttachedInstances[instance] then return end
 		self.listenerAttachedInstances[instance] = true
 
@@ -1723,12 +1772,18 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 		table.insert(self.connections, itemParentConnection)
 
 		local descendantAddedConnection = game.DescendantAdded:Connect(function(instance)
-			if self.syncEnabled then onInstanceAdded(instance) end
+			if not self.syncEnabled then return end
+			self.trash:noteAdded(instance)
+			onInstanceAdded(instance)
 		end)
 		table.insert(self.connections, descendantAddedConnection)
 
 		local descendantRemovingConnection = game.DescendantRemoving:Connect(function(instance)
-			if self.syncEnabled then onInstanceRemoved(instance) end
+			if not self.syncEnabled then return end
+			-- Before onInstanceRemoved drops its tracking. The plugin's own deletes clear tracking
+			-- before they destroy, so only what Studio removed is kept
+			if self.trackedInstances[instance] then self.trash:noteRemoved(instance) end
+			onInstanceRemoved(instance)
 		end)
 		table.insert(self.connections, descendantRemovingConnection)
 

@@ -983,6 +983,13 @@
               ]
             },
             {
+              "name": "Trash",
+              "className": "ModuleScript",
+              "filePaths": [
+                "sync/ReplicatedFirst/QuackPlugin/Trash.luau"
+              ]
+            },
+            {
               "name": "SettingsStore",
               "className": "ModuleScript",
               "guid": "4807433",
