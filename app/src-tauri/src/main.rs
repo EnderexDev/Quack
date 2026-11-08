@@ -560,6 +560,10 @@ fn install_cli(app: &AppHandle) {
         eprintln!("Could not install the {} command: {error}", flavor::COMMAND);
         return;
     }
+    // Git Bash (and every AI session's shell): cmd and PowerShell skip a file with no extension
+    if let Err(error) = write_if_changed(sh_shim(&node, flavor::CLI_FLAVOR).as_bytes(), &dir.join(flavor::COMMAND)) {
+        eprintln!("Could not install the {} command for Git Bash: {error}", flavor::COMMAND);
+    }
     // Both apps start at login: one at a time, or the second write would drop the first's entry
     let Some(_lock) = PathLock::take(&appdata().join("quack").join("path.lock")) else {
         return eprintln!("Could not take the PATH lock");
@@ -607,6 +611,17 @@ impl PathLock {
 fn cli_shim(node: &str, flavor: &str) -> String {
     let node = node.replace('"', "");
     format!("@\"{node}\" \"%~dp0..\\resources\\hub\\cli.mjs\" --flavor {flavor} %*\r\n")
+}
+
+/**
+ * The same command for Git Bash, which runs a .cmd only by its full name, through `cmd /c`: with
+ * a space in the path ("Quack Dev") and a quoted argument, cmd strips the outer quotes and looks
+ * for `...\Local\Quack` (07/11/26). Single quotes keep the node path literal; MSYS turns the
+ * script's own path into a Windows one for node.
+ */
+fn sh_shim(node: &str, flavor: &str) -> String {
+    let node = node.replace('"', "").replace('\\', "/").replace('\'', "'\\''");
+    format!("#!/bin/sh\nexec '{node}' \"$(dirname \"$0\")/../resources/hub/cli.mjs\" --flavor {flavor} \"$@\"\n")
 }
 
 /** The user PATH with `dir` added at the end; None when it is there already */
@@ -961,6 +976,15 @@ mod tests {
             cli_shim(r"C:\Program Files\nodejs\node.exe", "official"),
             "@\"C:\\Program Files\\nodejs\\node.exe\" \"%~dp0..\\resources\\hub\\cli.mjs\" --flavor official %*\r\n"
         );
+    }
+
+    #[test]
+    fn git_bash_gets_its_own_command_with_the_arguments_untouched() {
+        assert_eq!(
+            sh_shim(r"C:\Program Files\nodejs\node.exe", "dev"),
+            "#!/bin/sh\nexec 'C:/Program Files/nodejs/node.exe' \"$(dirname \"$0\")/../resources/hub/cli.mjs\" --flavor dev \"$@\"\n"
+        );
+        assert!(sh_shim(r"C:\it's\node.exe", "official").starts_with("#!/bin/sh\nexec 'C:/it'\\''s/node.exe' "));
     }
 
     #[test]

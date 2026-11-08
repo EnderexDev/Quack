@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { WebSocket } from "ws";
+import { removeDir } from "./removeDir.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.join(here, "..", "..");
@@ -41,7 +42,9 @@ test("the bundled hub the app ships syncs a Studio with one daemon, away from di
   const { bundleHub } = await import(pathToFileURL(path.join(repo, "scripts", "bundle-hub.mjs")).href);
   await bundleHub(bundleDir);
   // The bundle stands alone: nothing from dist/ or node_modules next to it
-  assert.deepEqual(fs.readdirSync(bundleDir).sort(), ["BUILD", "DAEMON_BUILD", "VERSION", "cli.mjs", "daemon.mjs", "hub.mjs"]);
+  // (watcher.node, the backstop watcher, only where the app ships: Windows x64)
+  const shipsWatcher = process.platform === "win32" && process.arch === "x64";
+  assert.deepEqual(fs.readdirSync(bundleDir).sort(), ["BUILD", "DAEMON_BUILD", "VERSION", "cli.mjs", "daemon.mjs", "hub.mjs", ...(shipsWatcher ? ["watcher.node"] : [])]);
   const buildId = fs.readFileSync(path.join(bundleDir, "BUILD"), "utf8").trim();
   assert.match(buildId, /^[0-9a-f]{12}$/);
   assert.match(fs.readFileSync(path.join(bundleDir, "DAEMON_BUILD"), "utf8").trim(), /^[0-9a-f]{12}$/);
@@ -51,7 +54,11 @@ test("the bundled hub the app ships syncs a Studio with one daemon, away from di
   }
 
   const port = await freePort();
-  const hub = spawn(process.execPath, [path.join(bundleDir, "hub.mjs"), "--port", String(port), "--registry", registry], { stdio: ["ignore", "pipe", "pipe"] });
+  const nativeDir = path.join(tmp, "native");
+  const hub = spawn(process.execPath, [path.join(bundleDir, "hub.mjs"), "--port", String(port), "--registry", registry], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, QUACK_NATIVE_DIR: nativeDir },
+  });
   const hubExited = new Promise<void>((resolve) => hub.once("exit", () => resolve()));
   let hubOut = "";
   hub.stdout.on("data", (d) => (hubOut += d));
@@ -86,6 +93,16 @@ test("the bundled hub the app ships syncs a Studio with one daemon, away from di
     // One daemon only: the bundled CLI must not also start index.ts's own daemon
     assert.equal(log.split("daemon starting").length - 1, 1, log);
     assert.equal(/EADDRINUSE|already in use/i.test(log), false, log);
+    if (shipsWatcher) {
+      // The bundled daemon runs the backstop watch from a copy of the binary, so an install
+      // overwrites the shipped one while the daemon runs (a loaded DLL cannot be overwritten)
+      const daemonLog = path.join(folder, ".quack", "daemon.log");
+      await waitFor(() => /Backstop watch live/.test(fs.readFileSync(daemonLog, "utf8")), 10000);
+      assert.doesNotMatch(fs.readFileSync(daemonLog, "utf8"), /did not load|did not start/);
+      assert.equal(fs.readdirSync(nativeDir).filter((f) => f.endsWith(".node")).length, 1);
+      fs.copyFileSync(path.join(bundleDir, "watcher.node"), path.join(tmp, "watcher.copy"));
+      fs.copyFileSync(path.join(tmp, "watcher.copy"), path.join(bundleDir, "watcher.node"));
+    }
     // Stopped the way the app stops it: kill() on Windows ends the hub without hub.stop(),
     // which would leave its daemon running
     const state = (await (await fetch(`http://127.0.0.1:${port}/api/state`)).json()) as any;
@@ -117,7 +134,7 @@ test("the bundled hub the app ships syncs a Studio with one daemon, away from di
       if (hub.exitCode === null && hub.signalCode === null) hub.kill();
     }
     await Promise.race([hubExited, wait(2000)]);
-    fs.rmSync(tmp, { recursive: true, force: true });
+    await removeDir(tmp);
   }
 });
 

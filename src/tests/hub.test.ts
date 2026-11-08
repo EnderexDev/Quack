@@ -9,6 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { QuackHub } from "../hub/hub.js";
+import { removeDir } from "./removeDir.js";
 import { saveRegistry } from "../hub/registry.js";
 import { readConflict, readLogChunk, readMerges, resolveConflict } from "../hub/api.js";
 
@@ -109,7 +110,7 @@ test("the hub routes each place to its own folder, refuses unknown places, reuse
     for (const ws of opened) ws.terminate();
     await hub.stop();
     await wait(500);
-    fs.rmSync(tmp, { recursive: true, force: true });
+    await removeDir(tmp);
   }
 });
 
@@ -138,7 +139,7 @@ async function withHub(
   } finally {
     await hub.stop();
     await wait(500);
-    fs.rmSync(tmp, { recursive: true, force: true });
+    await removeDir(tmp);
   }
 }
 

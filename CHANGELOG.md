@@ -4,6 +4,14 @@ All notable changes to Quack are listed here, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions are the tags of this repo; each one
 has release notes with the details and the source commits.
 
+## [1.0.6] - 2026-11-07
+
+### Added
+- The plugin keeps a copy, for 30 minutes, of a tree of 50 instances or more holding Parts, Models or GUIs that Studio deletes from the synced area (by a person, a plugin or a Team Create collaborator). A pop-up and the window's "Recently deleted in Studio" list restore it in one undo step. A tree destroyed with `Destroy()` is rebuilt from a clone of each instance, since its children are torn off before the plugin hears of it. A tree that comes back under another parent within 2 s raises no pop-up.
+
+### Changed
+- The daemon logs one line per deleted tree, with its count and who deleted it: "Deleted in Studio" or "Deleted by Quack (its file or folder left the disk)", instead of one line per instance in arrival order.
+
 ## [1.0.5] - 2026-11-06
 
 ### Changed

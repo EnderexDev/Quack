@@ -4,6 +4,7 @@ import * as path from "path";
 import { log } from "../util/log.js";
 import { config } from "../config.js";
 import { diskText } from "../util/scriptFile.js";
+import { loadBackstop, type BackstopSubscription } from "./backstopWatcher.js";
 
 export type FileChangeHandler = (filePath: string, source: string) => void;
 
@@ -47,6 +48,13 @@ export class FileWatcher {
   private knownDirs: Set<string> = new Set();
   private rescanTimer: NodeJS.Timeout | null = null;
   private static readonly RESCAN_DELAY_MS = 250;
+  /** Events a running rescan emitted (null outside one): what the OS dropped and the rescan found */
+  private rescanFound: number | null = null;
+  /** The backstop watch (backstopWatcher.ts); set once it is live, which is when it covers overflows */
+  private backstopSub: BackstopSubscription | null = null;
+  private backstopPending: Promise<unknown> | null = null;
+  /** Bumped on each start and stop: a callback or subscription of an older one is ignored */
+  private backstopGeneration = 0;
   // What Studio is believed to hold per script: the last content sent or written from Studio
   private lastKnownSource: Map<string, string> = new Map();
   private emptyRecheck: Set<string> = new Set();
@@ -134,6 +142,8 @@ export class FileWatcher {
       { recursive: true, persistent: true },
       (_type, relative) => {
         if (relative === null) {
+          // The backstop has the lost paths and reports them within 50 to 500 ms
+          if (this.backstopSub) return;
           this.requestRescan(root);
           return;
         }
@@ -145,7 +155,81 @@ export class FileWatcher {
       log.error("File watcher error:", error);
     });
 
+    this.startBackstop(root);
     log.success("File watcher ready (native)");
+  }
+
+  /**
+   * The backstop (backstopWatcher.ts), loaded once per process. Tests replace the loader to run
+   * without it.
+   */
+  static backstopLoader: () => ReturnType<typeof loadBackstop> = () => {
+    if (FileWatcher.loadedBackstop === undefined) {
+      try {
+        FileWatcher.loadedBackstop = loadBackstop();
+      } catch (error) {
+        log.warn(`The backstop watcher did not load (${(error as Error).message}); lost events cost a rescan`);
+        FileWatcher.loadedBackstop = null;
+      }
+    }
+    return FileWatcher.loadedBackstop;
+  };
+  private static loadedBackstop: ReturnType<typeof loadBackstop> | undefined;
+
+  /**
+   * Subscribe the backstop. Until it is live an overflow still rescans, which also covers what
+   * changed while it was starting. Its events go through classifyNative like fs.watch's, which
+   * compares with the known tree: a path both report is acted on once.
+   */
+  private startBackstop(root: string): void {
+    const started = performance.now();
+    const backstop = FileWatcher.backstopLoader();
+    if (!backstop) return;
+    const loadMs = performance.now() - started;
+    const generation = ++this.backstopGeneration;
+    const callback = (error: Error | null, events: { path: string }[]) => {
+      if (generation !== this.backstopGeneration) return;
+      if (error) {
+        // An overflow of its 1 MB buffer: parcel drops the watch after reporting it
+        log.warn(`Backstop watcher lost events (${error.message}), restarting it`);
+        this.backstopSub = null;
+        this.startBackstop(root);
+        this.requestRescan(root);
+        return;
+      }
+      for (const event of events) this.classifyNative(event.path);
+    };
+    this.backstopPending = backstop
+      .subscribe(root, callback, [])
+      .then((subscription) => {
+        // Stopped while it started: closeBackends awaits this unsubscribe
+        if (generation !== this.backstopGeneration) return subscription.unsubscribe().catch(() => {});
+        this.backstopSub = subscription;
+        log.info(
+          `Backstop watch live (load ${Math.round(loadMs)} ms, ready ${Math.round(performance.now() - started)} ms): ` +
+            "events the OS drops from the fast watch arrive through it",
+        );
+        return undefined;
+      })
+      .catch((error: Error) => {
+        if (generation === this.backstopGeneration) {
+          log.warn(`The backstop watcher did not start (${error.message}); lost events cost a rescan`);
+        }
+      });
+  }
+
+  /** Stops both OS watches (stop() and tests that fake events the OS lost) */
+  private async closeBackends(): Promise<void> {
+    this.nativeWatcher?.close();
+    this.nativeWatcher = null;
+    // Everything taken before the first await: watch() restarts without waiting for this
+    this.backstopGeneration++;
+    const pending = this.backstopPending;
+    const subscription = this.backstopSub;
+    this.backstopPending = null;
+    this.backstopSub = null;
+    await pending;
+    await subscription?.unsubscribe().catch(() => {});
   }
 
   private classifyNative(fullPath: string): void {
@@ -275,16 +359,29 @@ export class FileWatcher {
    * Reading every file here would touch every last-access time and overflow again.
    */
   private rescanNative(root: string): void {
-    log.warn("Native watcher lost events, rescanning the sync folder");
-    const before = [...this.knownFiles.keys(), ...this.knownDirs];
-    for (const p of before) this.classifyNative(p);
-    this.scanInto(root, true);
+    this.rescanFound = 0;
+    try {
+      const before = [...this.knownFiles.keys(), ...this.knownDirs];
+      for (const p of before) this.classifyNative(p);
+      this.scanInto(root, true);
+    } finally {
+      const found = this.rescanFound;
+      this.rescanFound = null;
+      // Most overflows are a burst already delivered or last-access updates: say so, so the
+      // log tells a harmless one from one that recovered changes
+      if (found === 0) {
+        log.info("Native watcher lost events; the rescan found nothing missed");
+      } else {
+        log.warn(`Native watcher lost events; the rescan found ${found} change(s) the OS did not report, now sent`);
+      }
+    }
   }
 
   /**
    * Handle a file event with debouncing
    */
   private handleFileEvent(event: FileEventType, filePath: string): void {
+    if (this.rescanFound !== null) this.rescanFound++;
     // A new file's write lands as "add" then "change"; the add reads the final content anyway
     if (event === "change" && this.debounceTimers.has(`add:${filePath}`)) {
       return;
@@ -557,9 +654,11 @@ export class FileWatcher {
       this.rescanTimer = null;
     }
 
+    // Awaited only after the clears below: watch() restarts without waiting for stop(), and
+    // clearing after an await would wipe what the new watch already queued
+    let closing: Promise<void> | null = null;
     if (this.nativeWatcher) {
-      this.nativeWatcher.close();
-      this.nativeWatcher = null;
+      closing = this.closeBackends();
       log.info("File watcher stopped");
     }
 
@@ -578,5 +677,6 @@ export class FileWatcher {
     this.suppressedUntil.clear();
     this.expectedContents.clear();
     this.suppressedEvents.clear();
+    await closing;
   }
 }

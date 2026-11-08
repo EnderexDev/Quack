@@ -12,6 +12,7 @@ import { runControl, type ControlContext } from "../control/commands.js";
 import { serveMcp } from "../control/mcp.js";
 import { flavorInfo, HubClient, type Flavor } from "../control/hubClient.js";
 import { QuackHub } from "../hub/hub.js";
+import { removeDir } from "./removeDir.js";
 import { saveRegistry } from "../hub/registry.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -101,7 +102,7 @@ async function withHub(body: (ctx: { port: number; tmp: string; folders: Record<
   } finally {
     await hub.stop();
     await wait(500);
-    fs.rmSync(tmp, { recursive: true, force: true });
+    await removeDir(tmp);
   }
 }
 
@@ -350,7 +351,7 @@ test("restart-hub stops the hub and returns once one answers again; a hub nobody
   } finally {
     for (const hub of hubs) await hub.stop().catch(() => {});
     await wait(300);
-    fs.rmSync(tmp, { recursive: true, force: true });
+    await removeDir(tmp);
   }
 });
 

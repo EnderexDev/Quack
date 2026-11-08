@@ -46,5 +46,8 @@
     "esbuild": "^0.27.1",
     "tsx": "^4.7.0",
     "typescript": "^7.0.2"
+  },
+  "optionalDependencies": {
+    "@parcel/watcher-win32-x64": "2.6.0"
   }
 }

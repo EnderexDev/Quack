@@ -5,6 +5,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { build } from "esbuild";
@@ -34,9 +35,16 @@ export async function bundleHub(outDir = path.join(root, "app", "src-tauri", "re
   await build({ ...common, entryPoints: [path.join(root, "dist", "cli.js")], outfile: path.join(outDir, "daemon.mjs") });
   // The terminal command (`quack` / `quackdev`); the app's bin\*.cmd names the flavor
   await build({ ...common, entryPoints: [path.join(root, "dist", "control", "main.js")], outfile: path.join(outDir, "cli.mjs") });
+  // The daemon's backstop watcher (src/fs/backstopWatcher.ts), a native binary esbuild cannot
+  // inline; the daemon loads a copy of it, so an install can overwrite this one. The app ships
+  // on Windows x64, where a bundle without it is an error; elsewhere there is no such binary
+  const shipsWatcher = process.platform === "win32" && process.arch === "x64";
+  const watcherBinary = shipsWatcher ? fs.readFileSync(createRequire(import.meta.url).resolve("@parcel/watcher-win32-x64")) : null;
+  if (watcherBinary) fs.writeFileSync(path.join(outDir, "watcher.node"), watcherBinary);
   // Content ids: a rebuild of the same code keeps its id, so an update that leaves the hub's
-  // bytes alone does not restart it, and a daemon is replaced only when daemon.mjs changed
-  const daemonBuild = stampBuildId(path.join(outDir, "daemon.mjs"));
+  // bytes alone does not restart it, and a daemon is replaced only when daemon.mjs or the
+  // binary it loads changed
+  const daemonBuild = stampBuildId(path.join(outDir, "daemon.mjs"), undefined, watcherBinary ? createHash("sha256").update(watcherBinary).digest("hex") : "");
   // The hub's id covers the daemon too: an update that changes only daemon.mjs still restarts
   // the hub, whose successor then replaces each daemon (handing its tree to the new one)
   const hubBuild = stampBuildId(path.join(outDir, "hub.mjs"), undefined, daemonBuild);
