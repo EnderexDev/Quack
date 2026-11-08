@@ -61,8 +61,8 @@ interface Options {
   wait: boolean;
   /** restart-hub: replace the daemons too (each hands its tree to its successor) */
   daemons: boolean;
-  /** play: the worktree to play (default: the folder you are in) */
-  worktree?: string;
+  /** play: the worktrees to play (default: the folder you are in); several share one play */
+  worktrees: string[];
   help: boolean;
 }
 
@@ -85,7 +85,7 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       refresh: { type: "boolean" },
       wait: { type: "boolean" },
       daemons: { type: "boolean" },
-      worktree: { type: "string", short: "w" },
+      worktree: { type: "string", short: "w", multiple: true },
       help: { type: "boolean", short: "h" },
     },
   });
@@ -113,7 +113,7 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       refresh: values.refresh === true,
       wait: values.wait === true,
       daemons: values.daemons === true,
-      worktree: values.worktree,
+      worktrees: values.worktree ?? [],
       help: values.help === true,
     },
   };
@@ -150,6 +150,8 @@ Play
                             it forked (default: the worktree you are in); every other script
                             runs as Studio has it. The place in edit mode keeps its own; Studio
                             holds the branch's only while it copies the place (~1 to 2 s)
+      -w <a> -w <b>           several worktrees in one play, when no two change the same
+                            script; the check answers for each one
 
 Change${info.flavor === "official" ? " (each asks first; --yes to skip, required without a terminal)" : ""}
   pause | resume            Stop every daemon and turn Studios away / allow them again
@@ -738,18 +740,37 @@ async function placeOfWorktree(ctx: ControlContext, worktree: string): Promise<P
   throw new UsageError(`More than one place syncs this repository; name one:\n${matches.map((p) => `  ${placeLabel(p)}`).join("\n")}`);
 }
 
+/** A hub or daemon from before 08/11/26 plays one worktree at a time: the executor reads this line */
+export const ONE_AT_A_TIME = "plays one worktree at a time";
+
 async function play(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
-  const worktree = path.resolve(ctx.cwd, options.worktree ?? ".");
+  const list = [...new Set((options.worktrees.length ? options.worktrees : ["."]).map((w) => path.resolve(ctx.cwd, w)))];
+  const worktree = list[0];
+  const several = list.length > 1;
   const place = query ? await resolvePlace(ctx, query) : await placeOfWorktree(ctx, worktree);
-  const { play: started } = await ctx.client.post("/api/play", { placeId: place.placeId, worktree }, 70_000);
+  let started: any;
+  try {
+    ({ play: started } = await ctx.client.post("/api/play", several ? { placeId: place.placeId, worktrees: list } : { placeId: place.placeId, worktree }, 70_000));
+  } catch (error) {
+    // A hub from before 08/11/26 reads only `worktree` and answers 400 to a list
+    if (several && error instanceof HubError && error.status === 400 && /worktree must be an absolute path/.test(error.message)) {
+      throw new Error(`The hub ${ONE_AT_A_TIME} (it is older than this command): restart the hub, or play each worktree on its own.`);
+    }
+    throw error;
+  }
+  if (several && !Array.isArray(started?.worktrees)) {
+    // A daemon from before 08/11/26 behind a newer hub: it played the first worktree only
+    ctx.err(`The place's daemon ${ONE_AT_A_TIME} (it is older than this command): only ${started?.worktree ?? worktree} is in this play.`);
+  }
   if (!started?.result?.ok) {
     const why = started?.result?.error ?? "the swap did not finish";
     if (options.json) ctx.out(JSON.stringify({ play: started }, null, 2));
     else {
-      ctx.err(`Play of ${worktree} in ${placeLabel(place)} failed: ${why}`);
+      ctx.err(`Play of ${list.join(", ")} in ${placeLabel(place)} failed: ${why}`);
       // Which scripts, as Studio said it (before 25/10/26 only "could not be swapped in" came out)
       for (const line of started?.result?.failed ?? []) ctx.err(`  ${line}`);
       for (const line of started?.conflicts ?? []) ctx.err(`  conflict: ${line}`);
+      if (several) for (const part of started?.worktrees ?? []) if (part.swapFailed?.length) ctx.err(`  refused for ${part.worktree}: ${part.swapFailed.length} script(s)`);
     }
     return EXIT.error;
   }
@@ -763,8 +784,26 @@ async function play(ctx: ControlContext, options: Options, query: string | undef
     if (latest && latest.id !== started.id) throw new Error("another play of this place started before this one's check came back");
     if (latest) state = latest;
   }
+  const parts: any[] = Array.isArray(state.worktrees) && state.worktrees.length > 1 ? state.worktrees : [];
   if (options.json) {
     ctx.out(JSON.stringify({ play: state }, null, 2));
+  } else if (parts.length) {
+    ctx.out(`Playing ${parts.length} worktrees in ${placeLabel(place)}: ${state.patches} changed, ${state.creates} new, ${state.disables} turned off.`);
+    ctx.out(`The place in edit mode held the branches for ${Math.round(state.result.windowMs ?? 0)} ms, and has its own scripts again.`);
+    if (!state.verify) ctx.err("The play session did not report its check (closed early, or a plugin without play support).");
+    for (const part of parts) {
+      ctx.out(`${part.worktree}: ${part.patches} changed, ${part.creates} new, ${part.disables} turned off.`);
+      if (part.checks === 0) ctx.out("  The branch brings no script change since it forked from the place's folder.");
+      for (const line of part.skipped ?? []) ctx.out(`  not carried: ${line}`);
+      for (const line of part.conflicts ?? []) ctx.out(`  conflict: ${line}`);
+      if (!part.verify) continue;
+      if (part.verify.ok) ctx.out(`  Checked inside the play: ${part.verify.passed} of ${part.checks} have the branch.`);
+      else {
+        ctx.err(`  The play session does NOT have ${part.worktree}'s branch: ${part.verify.failed.slice(0, 10).join("; ")}`);
+        if (part.verify.failed.some((line: string) => line.includes("has the place's text"))) ctx.err(`  Likely cause: ${PLAY_TAB_HINT}.`);
+      }
+      if (part.verify.unverified?.length) ctx.out(`  ${part.verify.unverified.length} swapped script(s) were gone before the check (the game removed them), so not checked.`);
+    }
   } else {
     ctx.out(`Playing ${state.worktree} in ${placeLabel(place)}: ${state.patches} changed, ${state.creates} new, ${state.disables} turned off.`);
     if (state.checks === 0) ctx.out("The branch brings no script change since it forked from the place's folder: this play runs the place as Studio has it.");
@@ -782,5 +821,7 @@ async function play(ctx: ControlContext, options: Options, query: string | undef
     if (state.verify?.unverified?.length) ctx.out(`  ${state.verify.unverified.length} swapped script(s) were gone before the check (the game removed them), so not checked.`);
   }
   if (!state.verify) return EXIT.timeout;
+  // Several worktrees: ok only when every one of them is in the play
+  if (several && !(Array.isArray(state.worktrees) && state.worktrees.length === list.length)) return EXIT.error;
   return state.verify.ok ? EXIT.ok : EXIT.error;
 }

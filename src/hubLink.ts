@@ -63,8 +63,8 @@ export interface HubLinkHandlers {
   export: (request: { phase?: string; successorUrl?: string }) => Promise<{ file: string; session?: string }>;
   /** A successor on standby applies its predecessor's last changes and takes the Studio */
   takeOver: (request: { file?: string }) => Promise<{ applied: number }>;
-  /** Quack: `quackdev play`: swap a worktree's scripts into a playtest (POST), or read the last (GET) */
-  play?: (request: { worktree: unknown }) => Promise<unknown>;
+  /** Quack: `quackdev play`: swap one worktree's scripts (or several worktrees', `worktrees`) into a playtest (POST), or read the last (GET) */
+  play?: (request: { worktree: unknown; worktrees?: unknown }) => Promise<unknown>;
   playState?: () => unknown;
   /** Script files on disk with no instance in Studio (`quack wait` lists them); fix sends their creates again */
   unsynced?: (fix: boolean) => string[];
@@ -190,7 +190,7 @@ export class HubLink {
           send(404, { error: "this daemon cannot play a worktree" });
           return;
         }
-        this.handlers.play({ worktree: parsed?.worktree }).then(
+        this.handlers.play({ worktree: parsed?.worktree, ...(parsed?.worktrees !== undefined ? { worktrees: parsed.worktrees } : {}) }).then(
           (result) => send(200, { play: result }),
           (error: Error) => send(409, { error: error.message }),
         );

@@ -816,9 +816,13 @@ export class QuackHub {
           if (url.pathname === "/api/play") {
             // Quack: `quackdev play`. The daemon answers once the swap is over (~2 s)
             const session = this.playSession(typeof body.placeId === "string" ? body.placeId : null);
-            if (typeof body.worktree !== "string" || !path.isAbsolute(body.worktree)) throw new ApiError(400, "worktree must be an absolute path");
-            this.log(`${session.name ?? session.placeId}: play of ${body.worktree}`);
-            daemonRequest<{ play: unknown }>(session.childPort, session.token, "POST", "/play", { worktree: path.resolve(body.worktree) }, 60_000).then(
+            // One worktree (`worktree`), or several in one play (`worktrees`, 08/11/26)
+            const list: unknown[] = Array.isArray(body.worktrees) ? body.worktrees : [body.worktree];
+            if (list.length === 0 || list.some((w) => typeof w !== "string" || !path.isAbsolute(w))) throw new ApiError(400, "worktree must be an absolute path");
+            const worktrees = (list as string[]).map((w) => path.resolve(w));
+            this.log(`${session.name ?? session.placeId}: play of ${worktrees.join(", ")}`);
+            const request = Array.isArray(body.worktrees) ? { worktree: worktrees[0], worktrees } : { worktree: worktrees[0] };
+            daemonRequest<{ play: unknown }>(session.childPort, session.token, "POST", "/play", request, 60_000).then(
               (answer) => send(200, answer),
               fail,
             );

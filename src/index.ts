@@ -25,7 +25,7 @@ import {
   type MergeTools,
 } from "./merge/merge.js";
 import type { InstanceData, StudioMessage, PlayOverlayResultMessage, PlayCheck } from "./ipc/messages.js";
-import { computePlayOverlay, worktreeOf, type PlayOverlay } from "./play/overlay.js";
+import { computePlayOverlay, mergeOverlays, splitSwapFailures, splitVerify, worktreeOf, type MergedPlay, type PlayPart } from "./play/overlay.js";
 import {
   StudioOutputFormatter,
   isStudioOutputMessage,
@@ -51,6 +51,24 @@ export interface PlayState {
   checks: number;
   result?: { ok: boolean; error?: string; windowMs?: number; applied?: number; failed?: string[] };
   verify?: { ok: boolean; passed: number; failed: string[]; unverified: string[]; at: number };
+  /** Each worktree of the play (one for a plain play), with its own share of the check */
+  worktrees: PlayWorktreeState[];
+}
+
+/** One worktree's share of a play of several: what it swapped, and whether the play session has it */
+export interface PlayWorktreeState {
+  worktree: string;
+  patches: number;
+  creates: number;
+  disables: number;
+  skipped: string[];
+  conflicts: string[];
+  checks: number;
+  /** The script files the branch changed since it forked (relative to the sync folder) */
+  files: string[];
+  /** Lines of a swap Studio refused that name this worktree's scripts */
+  swapFailed?: string[];
+  verify?: { ok: boolean; passed: number; failed: string[]; unverified: string[] };
 }
 
 // Window for coalescing sourcemap writes and empty-directory cleanup
@@ -161,6 +179,8 @@ export class SyncDaemon {
   private afterTakeoverTimer: NodeJS.Timeout | null = null;
   /** Quack: the last `quackdev play`, read by the hub's /api/play */
   private play: PlayState | null = null;
+  /** The swap behind `play`: which worktree each check answers for */
+  private playMerged: MergedPlay | null = null;
   private playResolve: ((result: PlayOverlayResultMessage) => void) | null = null;
   /** Handed its place to a successor: disk events are no longer this daemon's */
   private handedOff = false;
@@ -229,7 +249,7 @@ export class SyncDaemon {
           shutdown: () => void this.shutdownForHub(),
           export: (request) => this.exportForSuccessor(request),
           takeOver: async (request) => this.takeOver(request),
-          play: (request) => this.startPlay(request.worktree),
+          play: (request) => this.startPlay(request.worktrees ?? request.worktree),
           playState: () => this.play,
           unsynced: (fix) => {
             const files = this.unsyncedScripts();
@@ -711,7 +731,21 @@ export class SyncDaemon {
         if (this.play && message.id === this.play.id) {
           const unverified = Array.isArray(message.unverified) ? message.unverified.slice(0, 50).map(String) : [];
           this.play.verify = { ok: message.ok, passed: message.passed, failed: message.failed.slice(0, 50).map(String), unverified, at: Date.now() };
-          if (message.ok) log.success(`Play of ${this.play.worktree}: the play session has the branch (${message.passed} checked${unverified.length ? `, ${message.unverified!.length} removed by the game before the check` : ""})`);
+          // Split on the whole answer, before the cut to 50 lines
+          if (this.playMerged) {
+            const parts = splitVerify(this.playMerged, this.play.worktrees.length, {
+              failed: message.failed.map(String),
+              unverified: Array.isArray(message.unverified) ? message.unverified.map(String) : [],
+            });
+            this.play.worktrees.forEach((part, i) => {
+              const p = parts[i];
+              part.verify = { ok: p.ok, passed: p.passed, failed: p.failed.slice(0, 50), unverified: p.unverified.slice(0, 50) };
+            });
+          }
+          for (const part of this.play.worktrees.length > 1 ? this.play.worktrees : []) {
+            if (part.verify && !part.verify.ok) log.error(`Play: the play session does NOT have ${part.worktree}'s branch: ${part.verify.failed.slice(0, 5).join("; ")}`);
+          }
+          if (message.ok) log.success(`Play of ${this.play.worktree}${this.play.worktrees.length > 1 ? ` and ${this.play.worktrees.length - 1} other worktree(s)` : ""}: the play session has the branch (${message.passed} checked${unverified.length ? `, ${message.unverified!.length} removed by the game before the check` : ""})`);
           else log.error(`Play of ${this.play.worktree}: the play session does NOT have the branch: ${message.failed.slice(0, 5).join("; ")}`);
         }
         break;
@@ -2112,44 +2146,62 @@ export class SyncDaemon {
    * restores them (measured 22/10/26: ~1.4 s in the Anime Astral copy, ~2 s in PA). The play
    * session checks it got them and reports through the output relay.
    */
-  public async startPlay(worktree: unknown): Promise<PlayState> {
-    if (typeof worktree !== "string" || !path.isAbsolute(worktree)) throw new Error("worktree must be an absolute path");
+  public async startPlay(worktreeOrList: unknown): Promise<PlayState> {
+    const requested = Array.isArray(worktreeOrList) ? worktreeOrList : [worktreeOrList];
+    if (requested.length === 0) throw new Error("name at least one worktree");
+    if (requested.some((w) => typeof w !== "string" || !path.isAbsolute(w))) throw new Error("worktree must be an absolute path");
     if (this.play && !this.play.done) throw new Error("a play is already being started");
     if (this.standby) throw new Error("this daemon is on standby for a hub switch");
     if (!this.ipc.isConnected() || this.lastSync === undefined) throw new Error("no Studio is synced with this place");
     // The project root, as for .quack/: the folder of the sourcemap (the hub's cwd for its daemons)
     const registered = path.dirname(path.resolve(config.sourcemapPath));
-    const root = worktreeOf(worktree, registered);
-    const overlay: PlayOverlay = computePlayOverlay(registered, root, {
+    const roots: string[] = [];
+    for (const worktree of requested as string[]) {
+      const root = worktreeOf(worktree, registered);
+      const key = process.platform === "win32" ? root.toLowerCase() : root;
+      if (!roots.some((r) => (process.platform === "win32" ? r.toLowerCase() : r) === key)) roots.push(root);
+    }
+    const view = {
       syncDir: this.fileWriter.getBaseDir(),
-      guidByFile: (file) => this.fileWriter.getGuidByPath(file),
-      node: (guid) => {
+      guidByFile: (file: string) => this.fileWriter.getGuidByPath(file),
+      node: (guid: string) => {
         const node = this.tree.getNode(guid);
         return node && { source: node.source, path: node.path, className: node.className };
       },
-    });
+    };
+    const parts: PlayPart[] = roots.map((root) => ({ worktree: root, overlay: computePlayOverlay(registered, root, view) }));
+    // Throws PlayOverlapError when two of them change the same script
+    const merged = mergeOverlays(parts);
     const id = randomBytes(6).toString("hex");
-    const checks: PlayCheck[] = [
-      ...overlay.patches.map((p) => ({ path: p.path, hash: p.hash })),
-      ...overlay.creates.map((c) => ({ path: [...c.parentPath, c.name], hash: c.hash })),
-      ...overlay.disables.map((d) => ({ path: d.path, disabled: true })),
-    ];
+    const checks: PlayCheck[] = merged.checks;
     const state: PlayState = {
       id,
-      worktree: root,
+      worktree: roots[0],
       startedAt: Date.now(),
       done: false,
-      patches: overlay.patches.length,
-      creates: overlay.creates.length,
-      disables: overlay.disables.length,
-      skipped: overlay.skipped,
-      conflicts: overlay.conflicts,
+      patches: merged.patches.length,
+      creates: merged.creates.length,
+      disables: merged.disables.length,
+      skipped: parts.flatMap((p) => p.overlay.skipped),
+      conflicts: parts.flatMap((p) => p.overlay.conflicts),
       checks: checks.length,
+      worktrees: parts.map((part, i) => ({
+        worktree: part.worktree,
+        patches: part.overlay.patches.length,
+        creates: part.overlay.creates.length,
+        disables: part.overlay.disables.length,
+        skipped: part.overlay.skipped,
+        conflicts: part.overlay.conflicts,
+        checks: merged.owners.filter((o) => o === i).length,
+        files: part.overlay.files,
+      })),
     };
     this.play = state;
-    log.info(`Play of ${root}: ${state.patches} changed, ${state.creates} new, ${state.disables} turned off${overlay.skipped.length ? `, ${overlay.skipped.length} the play cannot carry` : ""}`);
-    for (const line of overlay.skipped) log.warn(`Play: ${line}`);
-    for (const line of overlay.conflicts) log.warn(`Play conflict: ${line}`);
+    this.playMerged = merged;
+    const label = roots.length === 1 ? roots[0] : `${roots.length} worktrees (${roots.join(", ")})`;
+    log.info(`Play of ${label}: ${state.patches} changed, ${state.creates} new, ${state.disables} turned off${state.skipped.length ? `, ${state.skipped.length} the play cannot carry` : ""}`);
+    for (const line of state.skipped) log.warn(`Play: ${line}`);
+    for (const line of state.conflicts) log.warn(`Play conflict: ${line}`);
     const result = await new Promise<PlayOverlayResultMessage>((resolve) => {
       const timer = setTimeout(
         () => resolve({ type: "playOverlayResult", id, ok: false, error: "Studio did not answer in 40 s (a plugin without play support, or the place closed)" }),
@@ -2162,9 +2214,9 @@ export class SyncDaemon {
       const sent = this.ipc.send({
         type: "playOverlay",
         id,
-        patches: overlay.patches.map(({ guid, source }) => ({ guid, source })),
-        creates: overlay.creates.map(({ className, name, parentPath, source }) => ({ className, name, parentPath, source })),
-        disables: overlay.disables.map(({ guid }) => ({ guid })),
+        patches: merged.patches.map(({ guid, source }) => ({ guid, source })),
+        creates: merged.creates.map(({ className, name, parentPath, source }) => ({ className, name, parentPath, source })),
+        disables: merged.disables.map(({ guid }) => ({ guid })),
         checks,
       });
       if (!sent) {
@@ -2181,9 +2233,16 @@ export class SyncDaemon {
       ...(typeof result.applied === "number" ? { applied: result.applied } : {}),
       ...(Array.isArray(result.failed) ? { failed: result.failed.slice(0, 50).map(String) } : {}),
     };
+    // Which worktree's scripts Studio refused: the others can play without it
+    if (!state.result.ok && Array.isArray(result.failed) && result.failed.length) {
+      const split = splitSwapFailures(parts, result.failed.map(String));
+      state.worktrees.forEach((part, i) => {
+        if (split[i].length) part.swapFailed = split[i].slice(0, 50);
+      });
+    }
     if (Array.isArray(result.stalls)) log.info(`Play: stalls in edit mode: ${result.stalls.slice(0, 20).map(String).join(", ") || "none"}`);
-    if (state.result.ok) log.success(`Play of ${root} started; the place in edit mode held it ${Math.round(state.result.windowMs ?? 0)} ms`);
-    else log.error(`Play of ${root} failed: ${state.result.error ?? "unknown"}`);
+    if (state.result.ok) log.success(`Play of ${label} started; the place in edit mode held it ${Math.round(state.result.windowMs ?? 0)} ms`);
+    else log.error(`Play of ${label} failed: ${state.result.error ?? "unknown"}`);
     return state;
   }
 

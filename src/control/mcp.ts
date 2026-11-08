@@ -48,6 +48,15 @@ function number(args: Record<string, unknown>, key: string, flag: string): strin
 
 class ToolInputError extends Error {}
 
+function worktreeList(args: Record<string, unknown>): string[] {
+  const value = args.worktrees;
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value) || value.some((w) => typeof w !== "string" || w === "" || w.startsWith("-"))) {
+    throw new ToolInputError("worktrees must be a list of paths, none starting with \"-\"");
+  }
+  return value as string[];
+}
+
 export const TOOLS: Tool[] = [
   {
     name: "status",
@@ -97,16 +106,23 @@ export const TOOLS: Tool[] = [
   },
   {
     name: "play",
-    description: "Starts a playtest in Studio with the scripts a git worktree's branch changed since it forked from the synced folder; every other script runs as Studio has it. Waits for the play's own check and answers 'N of M have the branch' or what did not arrive. One play at a time: stop the running one first.",
+    description: "Starts a playtest in Studio with the scripts a git worktree's branch changed since it forked from the synced folder; every other script runs as Studio has it. Waits for the play's own check and answers 'N of M have the branch' or what did not arrive. Several worktrees share one play when no two change the same script, and the check answers for each. One play at a time: stop the running one first.",
     inputSchema: {
       type: "object",
       properties: {
         worktree: { type: "string", description: "Absolute path of the worktree (default: the folder the AI runs in)" },
+        worktrees: { type: "array", items: { type: "string" }, description: "Several worktrees in one play (absolute paths), instead of worktree" },
         ...placeProp,
         timeoutSeconds: { type: "number", description: "How long to wait for the play's check (default 60)" },
       },
     },
-    argv: (args) => ["play", ...text(args, "place"), ...(text(args, "worktree").length ? ["-w", String(args.worktree)] : []), ...number(args, "timeoutSeconds", "--timeout")],
+    argv: (args) => [
+      "play",
+      ...text(args, "place"),
+      ...(text(args, "worktree").length ? ["-w", String(args.worktree)] : []),
+      ...worktreeList(args).flatMap((w) => ["-w", w]),
+      ...number(args, "timeoutSeconds", "--timeout"),
+    ],
   },
 ];
 

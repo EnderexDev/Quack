@@ -41,6 +41,9 @@ export interface PlayOverlay {
   skipped: string[];
   /** Scripts the branch changed that Studio holds changed by someone else, said in the report */
   conflicts: string[];
+  /** Every script file the branch changed since it forked (relative to the sync folder): what a
+   *  play of several worktrees compares to keep them apart */
+  files: string[];
 }
 
 /** What the overlay needs from the daemon's view of the place */
@@ -167,12 +170,13 @@ export function computePlayOverlay(registeredRoot: string, worktreeRoot: string,
   if (syncRel === ".." || syncRel.startsWith(`..${path.sep}`) || path.isAbsolute(syncRel)) {
     throw new Error("the sync folder is outside the place's folder");
   }
-  const overlay: PlayOverlay = { patches: [], creates: [], disables: [], skipped: [], conflicts: [] };
+  const overlay: PlayOverlay = { patches: [], creates: [], disables: [], skipped: [], conflicts: [], files: [] };
   const { base, registeredHead, changes } = branchChanges(registeredRoot, worktreeRoot, syncRel);
 
   for (const repoRel of changes) {
     if (!SCRIPT_FILE.test(repoRel)) continue;
     const rel = path.relative(syncRel, repoRel);
+    overlay.files.push(rel);
     const file = path.join(worktreeRoot, repoRel);
     const guid = place.guidByFile(path.join(place.syncDir, rel));
     const node = guid ? place.node(guid) : undefined;
@@ -239,4 +243,131 @@ export function computePlayOverlay(registeredRoot: string, worktreeRoot: string,
     });
   }
   return overlay;
+}
+
+/**
+ * A play of several worktrees at once (08/11/26: on Anime Astral 346 of 355 branch plays carried
+ * one test job, each play ~13 s to start and the job ~3 s, so the queue lived on starts). The
+ * branches go into one swap when none of them changes a script another one changes: each check
+ * then answers for one worktree, and a failing worktree is not blamed on its neighbour's file.
+ */
+export interface PlayPart {
+  worktree: string;
+  overlay: PlayOverlay;
+}
+
+export interface MergedPlay {
+  patches: PlayPatch[];
+  creates: PlayCreate[];
+  disables: PlayDisable[];
+  /** In the plugin's order: every patch, then every create, then every disable (PlayOverlay.luau numbers its marks that way) */
+  checks: { path: string[]; hash?: string; disabled?: boolean }[];
+  /** For each check, the index of the part it answers for */
+  owners: number[];
+}
+
+/** Two worktrees that change the same script cannot share a play: which one ran would be a guess */
+export class PlayOverlapError extends Error {}
+
+const fileKey = (rel: string) => {
+  const unified = rel.split(/[/\\]/).filter(Boolean).join("/");
+  return process.platform === "win32" ? unified.toLowerCase() : unified;
+};
+
+export function mergeOverlays(parts: PlayPart[]): MergedPlay {
+  // The same script reached two ways: by its file, and by the instance path it lands on
+  // (Foo.luau in one branch and a new Foo.server.luau in another are one instance in the place)
+  const byFile = new Map<string, number>();
+  const byInstance = new Map<string, number>();
+  const claim = (map: Map<string, number>, key: string, index: number, what: string) => {
+    const other = map.get(key);
+    if (other !== undefined && other !== index) {
+      throw new PlayOverlapError(`${parts[other].worktree} and ${parts[index].worktree} both change ${what}: they cannot share a play`);
+    }
+    map.set(key, index);
+  };
+  parts.forEach((part, index) => {
+    for (const rel of part.overlay.files) claim(byFile, fileKey(rel), index, rel);
+    for (const p of part.overlay.patches) claim(byInstance, p.path.join("."), index, p.path.join("."));
+    for (const c of part.overlay.creates) claim(byInstance, [...c.parentPath, c.name].join("."), index, [...c.parentPath, c.name].join("."));
+    for (const d of part.overlay.disables) claim(byInstance, d.path.join("."), index, d.path.join("."));
+  });
+
+  const merged: MergedPlay = { patches: [], creates: [], disables: [], checks: [], owners: [] };
+  parts.forEach((part, index) => {
+    for (const p of part.overlay.patches) {
+      merged.patches.push(p);
+      merged.checks.push({ path: p.path, hash: p.hash });
+      merged.owners.push(index);
+    }
+  });
+  parts.forEach((part, index) => {
+    for (const c of part.overlay.creates) {
+      merged.creates.push(c);
+      merged.checks.push({ path: [...c.parentPath, c.name], hash: c.hash });
+      merged.owners.push(index);
+    }
+  });
+  parts.forEach((part, index) => {
+    for (const d of part.overlay.disables) {
+      merged.disables.push(d);
+      merged.checks.push({ path: d.path, disabled: true });
+      merged.owners.push(index);
+    }
+  });
+  return merged;
+}
+
+export interface PartVerify {
+  ok: boolean;
+  passed: number;
+  failed: string[];
+  unverified: string[];
+}
+
+/**
+ * The play session's one answer, split by worktree. Its lines name the check's path
+ * (`<path> has the place's text...`, `<path> still runs`; unverified ones are the bare path).
+ * A line no check of a part names goes to every part: nobody is cleared by a line nobody owns.
+ */
+export function splitVerify(merged: MergedPlay, partCount: number, verify: { failed: string[]; unverified?: string[] }): PartVerify[] {
+  const out: PartVerify[] = Array.from({ length: partCount }, () => ({ ok: true, passed: 0, failed: [], unverified: [] }));
+  const ownerOf = (line: string, bare: boolean): number[] => {
+    const owners = new Set<number>();
+    merged.checks.forEach((check, i) => {
+      const where = check.path.join(".");
+      if (bare ? line === where : line.startsWith(`${where} `)) owners.add(merged.owners[i]);
+    });
+    return owners.size ? [...owners] : out.map((_, i) => i);
+  };
+  for (const line of verify.failed) for (const i of ownerOf(line, false)) out[i].failed.push(line);
+  for (const line of verify.unverified ?? []) for (const i of ownerOf(line, true)) out[i].unverified.push(line);
+  merged.owners.forEach((owner) => out[owner].passed++);
+  for (const part of out) {
+    part.passed = Math.max(0, part.passed - part.failed.length - part.unverified.length);
+    part.ok = part.failed.length === 0;
+  }
+  return out;
+}
+
+/**
+ * The swap Studio refused, split by worktree: `<full name>: <error>` for a patch,
+ * `script <guid> is not in the place any more`, `new <Class> <parent path>.<name>: <error>`
+ * (PlayOverlay.luau). What names no part goes to every part.
+ */
+export function splitSwapFailures(parts: PlayPart[], failed: string[]): string[][] {
+  const out: string[][] = parts.map(() => []);
+  for (const line of failed) {
+    const owners = new Set<number>();
+    parts.forEach((part, index) => {
+      for (const p of part.overlay.patches) {
+        if (line.startsWith(`${p.path.join(".")}: `) || line === `script ${p.guid} is not in the place any more`) owners.add(index);
+      }
+      for (const c of part.overlay.creates) {
+        if (line.startsWith(`new ${c.className} ${c.parentPath.join(".")}.${c.name}: `)) owners.add(index);
+      }
+    });
+    for (const i of owners.size ? owners : parts.map((_, i) => i)) out[i].push(line);
+  }
+  return out;
 }

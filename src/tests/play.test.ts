@@ -419,3 +419,226 @@ test("quackdev play: says the branch is there only when the check passed, and ke
   assert.equal(replaced.code, 1);
   assert.match(replaced.err, /another play of this place started/);
 });
+
+// 08/11/26: several worktrees in one play (Anime Astral: 346 of 355 branch plays carried one job)
+test("play of several worktrees: one swap in the plugin's order, each check owned by its worktree, the answer split", async () => {
+  const { root, repo, worktree } = fixture();
+  const other = path.join(root, "Game-other");
+  const prev = { syncDir: config.syncDir, sourcemapPath: config.sourcemapPath, port: config.port };
+  let daemon: SyncDaemon | undefined;
+  try {
+    config.syncDir = path.join(repo, "sync");
+    config.sourcemapPath = path.join(repo, "sourcemap.json");
+    config.port = 0;
+    daemon = new SyncDaemon();
+    const sent: any[] = [];
+    (daemon as any).ipc.send = (message: any) => {
+      sent.push(message);
+      return true;
+    };
+    (daemon as any).ipc.isConnected = () => true;
+    (daemon as any).handleStudioMessage({ type: "fullSnapshot", data: placeData, placeId: 5 });
+    git(repo, "add", "-A");
+    git(repo, "commit", "-q", "-m", "place");
+
+    // A: Config changed and a new Guilds. B: Same changed, a new Shop, OldSystem deleted
+    git(repo, "worktree", "add", "-q", "-b", "feature", worktree);
+    write(path.join(worktree, "sync", "ReplicatedStorage", "Config.luau"), "return { damage = 25 }");
+    write(path.join(worktree, "sync", "ServerScriptService", "Guilds.server.luau"), "print('guilds')");
+    git(worktree, "add", "-A");
+    git(worktree, "commit", "-q", "-m", "a");
+    git(repo, "worktree", "add", "-q", "-b", "other", other);
+    write(path.join(other, "sync", "ReplicatedStorage", "Same.luau"), "local a = 9\nreturn a");
+    write(path.join(other, "sync", "ServerScriptService", "Shop.server.luau"), "print('shop')");
+    fs.rmSync(path.join(other, "sync", "ServerScriptService", "OldSystem.server.luau"));
+    git(other, "add", "-A");
+    git(other, "commit", "-q", "-m", "b");
+
+    const playing = daemon.startPlay([worktree, other]);
+    await new Promise((r) => setTimeout(r, 50));
+    const swaps = sent.filter((m) => m.type === "playOverlay");
+    assert.equal(swaps.length, 1, "one swap for both");
+    const swap = swaps[0];
+    // PlayOverlay.luau numbers its marks patches first, then creates, then disables: the merged
+    // checks must keep that order, or every mark lands on another check's path
+    assert.deepEqual(swap.patches.map((p: any) => p.guid), ["cfg", "same"]);
+    assert.deepEqual(swap.creates.map((c: any) => c.name), ["Guilds", "Shop"]);
+    assert.deepEqual(swap.disables, [{ guid: "old" }]);
+    assert.deepEqual(
+      swap.checks.map((c: any) => c.path.join(".")),
+      ["ReplicatedStorage.Config", "ReplicatedStorage.Same", "ServerScriptService.Guilds", "ServerScriptService.Shop", "ServerScriptService.OldSystem"],
+    );
+
+    (daemon as any).handleStudioMessage({ type: "playOverlayResult", id: swap.id, ok: true, windowMs: 900, applied: 5 });
+    const state = await playing;
+    assert.equal(state.worktrees.length, 2);
+    assert.deepEqual(state.worktrees.map((w) => [path.basename(w.worktree), w.patches, w.creates, w.disables, w.checks]), [
+      ["Game-feature", 1, 1, 0, 2],
+      ["Game-other", 1, 1, 1, 3],
+    ]);
+    assert.deepEqual(state.worktrees[0].files.map((f) => f.split(path.sep).join("/")).sort(), ["ReplicatedStorage/Config.luau", "ServerScriptService/Guilds.server.luau"]);
+
+    // B's Same did not arrive: only B fails, A is in the play
+    (daemon as any).handleStudioMessage({
+      type: "playVerify",
+      id: swap.id,
+      ok: false,
+      passed: 4,
+      failed: ["ReplicatedStorage.Same has the place's text, not the branch's"],
+      unverified: ["ServerScriptService.Guilds"],
+    });
+    const [a, b] = state.worktrees;
+    assert.deepEqual(a.verify, { ok: true, passed: 1, failed: [], unverified: ["ServerScriptService.Guilds"] });
+    assert.deepEqual(b.verify, { ok: false, passed: 2, failed: ["ReplicatedStorage.Same has the place's text, not the branch's"], unverified: [] });
+  } finally {
+    await daemon?.stop();
+    Object.assign(config, prev);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("play of several worktrees: two that change the same script are refused, by file and by instance", async () => {
+  const { root, repo, worktree } = fixture();
+  const other = path.join(root, "Game-other");
+  const prev = { syncDir: config.syncDir, sourcemapPath: config.sourcemapPath, port: config.port };
+  let daemon: SyncDaemon | undefined;
+  try {
+    config.syncDir = path.join(repo, "sync");
+    config.sourcemapPath = path.join(repo, "sourcemap.json");
+    config.port = 0;
+    daemon = new SyncDaemon();
+    const sent: any[] = [];
+    (daemon as any).ipc.send = (message: any) => {
+      sent.push(message);
+      return true;
+    };
+    (daemon as any).ipc.isConnected = () => true;
+    (daemon as any).handleStudioMessage({ type: "fullSnapshot", data: placeData, placeId: 5 });
+    git(repo, "add", "-A");
+    git(repo, "commit", "-q", "-m", "place");
+    git(repo, "worktree", "add", "-q", "-b", "feature", worktree);
+    git(repo, "worktree", "add", "-q", "-b", "other", other);
+    write(path.join(worktree, "sync", "ReplicatedStorage", "Config.luau"), "return { damage = 25 }");
+    write(path.join(other, "sync", "ReplicatedStorage", "Config.luau"), "return { damage = 30 }");
+    await assert.rejects(daemon.startPlay([worktree, other]), /both change ReplicatedStorage[\\/]Config\.luau/);
+    assert.equal(sent.filter((m) => m.type === "playOverlay").length, 0, "nothing goes to Studio");
+
+    // Another file, the same instance: Shop.luau in one, Shop.server.luau in the other
+    git(other, "checkout", "-q", "--", ".");
+    write(path.join(worktree, "sync", "ServerScriptService", "Shop.luau"), "return 1");
+    write(path.join(other, "sync", "ServerScriptService", "Shop.server.luau"), "print(1)");
+    git(worktree, "add", "-A");
+    git(other, "add", "-A");
+    git(worktree, "checkout", "-q", "--", "sync/ReplicatedStorage/Config.luau");
+    await assert.rejects(daemon.startPlay([worktree, other]), /both change ServerScriptService\.Shop/);
+
+    // The same worktree named twice is one worktree
+    const once = daemon.startPlay([worktree, worktree + path.sep]);
+    await new Promise((r) => setTimeout(r, 50));
+    const swap = sent.find((m) => m.type === "playOverlay");
+    (daemon as any).handleStudioMessage({ type: "playOverlayResult", id: swap.id, ok: true, windowMs: 1 });
+    assert.equal((await once).worktrees.length, 1);
+  } finally {
+    await daemon?.stop();
+    Object.assign(config, prev);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("play of several worktrees: a swap Studio refused names the worktree whose script it was", async () => {
+  const { splitSwapFailures } = await import("../play/overlay.js");
+  const part = (worktree: string, patches: any[], creates: any[] = []) => ({
+    worktree,
+    overlay: { patches, creates, disables: [], skipped: [], conflicts: [], files: [] },
+  });
+  const parts = [
+    part("A", [{ guid: "g1", source: "", path: ["ReplicatedStorage", "Big"], hash: "" }]),
+    part("B", [{ guid: "g2", source: "", path: ["ReplicatedStorage", "Small"], hash: "" }], [
+      { className: "Script", name: "Shop", parentPath: ["ServerScriptService"], source: "", hash: "" },
+    ]),
+  ];
+  assert.deepEqual(
+    splitSwapFailures(parts, [
+      "ReplicatedStorage.Big: Source too long",
+      "script g2 is not in the place any more",
+      "new Script ServerScriptService.Shop: no",
+      "something nobody owns",
+    ]),
+    [
+      ["ReplicatedStorage.Big: Source too long", "something nobody owns"],
+      ["script g2 is not in the place any more", "new Script ServerScriptService.Shop: no", "something nobody owns"],
+    ],
+  );
+});
+
+test("quackdev play -w a -w b: one line per worktree, ok only when both are in the play, and an old hub is named", async () => {
+  const { runControl } = await import("../control/commands.js");
+  const { HubError } = await import("../control/hubClient.js");
+  const A = path.join(os.tmpdir(), "A");
+  const B = path.join(os.tmpdir(), "B");
+  const run = async (answer: any, verify: any, post?: () => Promise<any>) => {
+    const out: string[] = [];
+    const err: string[] = [];
+    const bodies: any[] = [];
+    const client = {
+      get: async (pathname: string) => pathname === "/api/state" ? { places: [{ placeId: "5", name: "Game", folder: os.tmpdir() }] } : ({ play: { ...answer, verify, worktrees: answer.worktrees?.map((w: any, i: number) => ({ ...w, verify: verify?.parts?.[i] })) } }),
+      post: post ?? (async (_: string, body: any) => (bodies.push(body), { play: answer })),
+    };
+    const code = await runControl(["play", "5", "-w", A, "-w", B], {
+      info: { flavor: "dev", command: "quackdev", appName: "Quack Dev", port: 0 } as any,
+      client: client as any,
+      out: (l) => out.push(l),
+      err: (l) => err.push(l),
+      confirm: async () => false,
+      interactive: false,
+      color: false,
+      cwd: os.tmpdir(),
+      openUri: async () => {},
+      pollMs: 1,
+    });
+    return { code, out: out.join("\n"), err: err.join("\n"), bodies };
+  };
+  const answer = {
+    id: "p1",
+    worktree: A,
+    done: true,
+    patches: 2,
+    creates: 0,
+    disables: 0,
+    skipped: [],
+    conflicts: [],
+    checks: 2,
+    result: { ok: true, windowMs: 900 },
+    worktrees: [
+      { worktree: A, patches: 1, creates: 0, disables: 0, skipped: [], conflicts: [], checks: 1, files: [] },
+      { worktree: B, patches: 1, creates: 0, disables: 0, skipped: [], conflicts: [], checks: 1, files: [] },
+    ],
+  };
+  const both = await run(answer, { ok: true, passed: 2, failed: [], parts: [{ ok: true, passed: 1, failed: [], unverified: [] }, { ok: true, passed: 1, failed: [], unverified: [] }] });
+  assert.equal(both.code, 0);
+  assert.deepEqual(both.bodies, [{ placeId: "5", worktrees: [A, B] }]);
+  assert.match(both.out, /Playing 2 worktrees/);
+  assert.equal((both.out.match(/1 of 1 have the branch/g) ?? []).length, 2);
+
+  const oneBad = await run(answer, {
+    ok: false,
+    passed: 1,
+    failed: ["ReplicatedStorage.B has the place's text, not the branch's"],
+    parts: [{ ok: true, passed: 1, failed: [], unverified: [] }, { ok: false, passed: 0, failed: ["ReplicatedStorage.B has the place's text, not the branch's"], unverified: [] }],
+  });
+  assert.equal(oneBad.code, 1);
+  assert.match(oneBad.err, new RegExp(`does NOT have ${B.replace(/\\/g, "\\\\")}'s branch`));
+
+  // A hub from before 08/11/26 answers 400 to a list
+  const old = await run(answer, undefined, async () => {
+    throw new HubError(400, "worktree must be an absolute path");
+  });
+  assert.equal(old.code, 1);
+  assert.match(old.err, /plays one worktree at a time/);
+
+  // A daemon from before 08/11/26 behind a newer hub played the first only
+  const { worktrees: _, ...single } = answer;
+  const firstOnly = await run(single, { ok: true, passed: 1, failed: [] });
+  assert.equal(firstOnly.code, 1, "not every worktree is in the play");
+  assert.match(firstOnly.err, /plays one worktree at a time.*only .*A is in this play/);
+});
