@@ -72,7 +72,7 @@ export class IPCServer {
   private requestSnapshotOnConnect: boolean;
   private pingIntervals = new Map<WebSocket, NodeJS.Timeout>();
   /** Each play peer's /studio-output socket; `role` once its peerHello came */
-  private outputClients = new Map<WebSocket, { role?: PlayRole; log: boolean }>();
+  private outputClients = new Map<WebSocket, { role?: PlayRole; log: boolean; player?: string }>();
   private toolResultHandler: ((message: ToolResultMessage) => void) | null = null;
   private runtimeLogHandler: ((message: StudioOutputMessage) => void) | null = null;
   private peersHandler: (() => void) | null = null;
@@ -340,7 +340,7 @@ export class IPCServer {
     if (this.outputClients.size === 0) {
       log.playtest("started");
     }
-    const peer: { role?: PlayRole; log: boolean } = { log: true };
+    const peer: { role?: PlayRole; log: boolean; player?: string } = { log: true };
     this.outputClients.set(ws, peer);
 
     ws.once("close", () => {
@@ -358,10 +358,21 @@ export class IPCServer {
       try {
         const message: any = JSON.parse(data.toString());
         if (message?.type === "peerHello" && (message.source === "server" || message.source === "client")) {
-          // Quack: a plugin that answers tools; a newer socket of the same peer replaces the older
-          for (const [other, otherPeer] of this.outputClients) if (other !== ws && otherPeer.role === message.source) otherPeer.role = undefined;
+          // Quack: a plugin that answers tools; a newer socket of the same peer replaces the older.
+          // A client names its player (a multiplayer test has several): only that player's older
+          // socket is replaced
+          const player = typeof message.player === "string" && message.player ? message.player : undefined;
+          for (const [other, otherPeer] of this.outputClients) {
+            if (other !== ws && otherPeer.role === message.source && (message.source === "server" || otherPeer.player === player)) otherPeer.role = undefined;
+          }
           peer.role = message.source;
           peer.log = message.log === true;
+          peer.player = player;
+          this.peersHandler?.();
+        } else if (message?.type === "peerPlayer" && typeof message.player === "string" && message.player && peer.role === "client") {
+          // A client whose LocalPlayer came after its hello
+          for (const [other, otherPeer] of this.outputClients) if (other !== ws && otherPeer.role === "client" && otherPeer.player === message.player) otherPeer.role = undefined;
+          peer.player = message.player;
           this.peersHandler?.();
         } else if (isToolResultMessage(message)) {
           this.toolResultHandler?.(message);
@@ -405,11 +416,14 @@ export class IPCServer {
    * The play's peers: "ready" answers tools, "old" is a socket that never said which peer it is
    * (a plugin from before 08/11/26), absent is no socket at all
    */
-  public playPeers(): { server?: "ready" | "old"; client?: "ready" | "old" } {
-    const roles = [...this.outputClients.values()].map((p) => p.role);
+  public playPeers(): { server?: "ready" | "old"; client?: "ready" | "old"; players?: string[] } {
+    const peers = [...this.outputClients.values()];
+    const roles = peers.map((p) => p.role);
     const unknown = roles.some((r) => r === undefined);
     const state = (role: PlayRole) => (roles.includes(role) ? "ready" : unknown ? "old" : undefined);
-    return { server: state("server"), client: state("client") };
+    // The players of the clients that answer tools (a multiplayer test has several)
+    const players = peers.filter((p) => p.role === "client" && p.player).map((p) => p.player!).sort();
+    return { server: state("server"), client: state("client"), ...(players.length ? { players } : {}) };
   }
 
   /** Any play socket open, old or new */
@@ -418,7 +432,7 @@ export class IPCServer {
   }
 
   /** Sends a tool call to one peer; false when that peer has no socket that answers tools */
-  public sendToPeer(role: PeerRole, message: ToolRequestMessage): boolean {
+  public sendToPeer(role: PeerRole, message: ToolRequestMessage, player?: string): boolean {
     if (role === "edit") {
       if (!this.client || this.client.readyState !== WebSocket.OPEN || !this.handshakeComplete) return false;
       this.client.send(JSON.stringify(message));
@@ -427,6 +441,7 @@ export class IPCServer {
     }
     for (const [ws, peer] of [...this.outputClients].reverse()) {
       if (peer.role !== role || ws.readyState !== WebSocket.OPEN) continue;
+      if (player !== undefined && peer.player !== player) continue;
       ws.send(JSON.stringify(message));
       return true;
     }

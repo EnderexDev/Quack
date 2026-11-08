@@ -25,14 +25,14 @@ async function waitFor(check: () => boolean, ms = 5000): Promise<void> {
 }
 
 /** A daemon's IPC server with its Studio tools, as index.ts wires them */
-async function daemon() {
+async function daemon(options: { preludeDir?: string } = {}) {
   const httpServer: Server = createServer();
   await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
   const port = (httpServer.address() as { port: number }).port;
   const ipc = new IPCServer(undefined, httpServer, { requestSnapshotOnConnect: false });
   const shots = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shots-"));
   const recordings = path.join(shots, "recordings");
-  const tools = StudioTools.attach(ipc, shots, recordings);
+  const tools = StudioTools.attach(ipc, shots, recordings, options.preludeDir);
   const printed: string[] = [];
   ipc.onMessage((message) => {
     if (message.type === "studioOutput") printed.push(message.message);
@@ -654,4 +654,441 @@ test("gif: LZW decodes back to the same indices across table resets, and frames 
   assert.deepEqual([...tiled.rgba.subarray(0, 4)], [1, 1, 1, 1]);
   assert.deepEqual([...tiled.rgba.subarray(8, 12)], [2, 2, 2, 2]);
   assert.deepEqual([...tiled.rgba.subarray(24, 28)], [3, 3, 3, 3]);
+});
+
+test("gui: the play client reads PlayerGui, edit mode StarterGui; a PlayerGui path with no client says why; the text shows what is hidden and what is clickable", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    const seen: any[] = [];
+    const tree = (peer: string) => ({
+      root: peer === "edit" ? "StarterGui" : "Players.Ender.PlayerGui",
+      nodes: [
+        { d: 0, n: "Shop", c: "ScreenGui" },
+        { d: 1, n: "Main", c: "Frame", r: [100, 50, 400, 300], m: "UICorner,UIStroke" },
+        { d: 2, n: "Buy", c: "TextButton", t: "Buy 100", r: [120, 300, 80, 30], btn: true },
+        { d: 2, n: "Close", c: "ImageButton", img: "123", r: [480, 50, 20, 20], btn: "covered by Players.Ender.PlayerGui.Modal.Back" },
+        { d: 2, n: "Guild", c: "Frame", r: [0, 0, 10, 10], off: "Visible = false", more: 42 },
+      ],
+      truncated: false,
+      screen: peer === "edit" ? undefined : { width: 1380, height: 850 },
+    });
+    const edit = await editStudio(d.url, (tool, args) => {
+      seen.push({ peer: "edit", tool, args });
+      return tree("edit");
+    });
+    const fromEdit: any = await d.tools.call("gui", {});
+    assert.equal(fromEdit.peer, "edit");
+    await assert.rejects(d.tools.call("gui", { path: "PlayerGui.Shop" }), /no play is running/);
+    await assert.rejects(d.tools.call("gui", { depth: 50 }), /depth must be a whole number from 0 to 20/);
+    const client = await playPeer(d.url, "client", (tool, args) => {
+      seen.push({ peer: "client", tool, args });
+      return tree("client");
+    });
+    await waitFor(() => d.ipc.playPeers().client === "ready");
+    const fromClient: any = await d.tools.call("gui", { path: "PlayerGui.Shop", depth: 2, hidden: true });
+    assert.equal(fromClient.peer, "client");
+    assert.deepEqual(seen.at(-1), { peer: "client", tool: "gui", args: { path: "PlayerGui.Shop", depth: 2, hidden: true } });
+    const { guiText } = await import("../control/commands.js");
+    const textOut = guiText(fromClient);
+    assert.match(textOut, /^Players\.Ender\.PlayerGui \(the play client, screen 1380x850/);
+    assert.match(textOut, /\n    Buy \[TextButton\]  "Buy 100"  at 120,300 80x30  clickable/);
+    assert.match(textOut, /Close \[ImageButton\]  img 123  at 480,50 20x20  not clickable: covered by/);
+    assert.match(textOut, /Guild \[Frame\]  at 0,0 10x10  hidden \(Visible = false\)  \+42 inside/);
+    assert.match(textOut, /Main \[Frame\]  at 100,50 400x300  \{UICorner,UIStroke\}/);
+    assert.equal(seen.length, 2, "the refused ones never reached Studio");
+    client.close();
+    edit.close();
+  } finally {
+    await d.close();
+  }
+});
+
+test("mouse: a point on the last client screenshot is sent with that image's size, a cropped one is put back on the whole screen, and refusals come before Studio", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    const rgba = Buffer.alloc(4 * 3 * 4, 255);
+    const edit = await editStudio(d.url, (tool) => {
+      if (tool === "captureRead") return { width: 4, height: 3, data: rgba.toString("base64") };
+      throw new Error(tool);
+    });
+    const seen: any[] = [];
+    const client = await playPeer(d.url, "client", (tool, args) => {
+      if (tool === "captureBegin") return { contentId: "rbxtemp://1" };
+      seen.push({ tool, args });
+      return { x: 1, y: 1, gui: { x: 1, y: -57 }, screen: { width: 1380, height: 850 }, action: args.action, button: args.button };
+    });
+    await waitFor(() => d.ipc.playPeers().client === "ready");
+    await assert.rejects(d.tools.call("mouse", { x: 1, y: 1 }), /no screenshot taken/);
+    await d.tools.call("screenshot", {});
+    await assert.rejects(d.tools.call("mouse", { x: 4, y: 1 }), /outside the last screenshot \(4x3\)/);
+    await assert.rejects(d.tools.call("mouse", { x: 1, y: 1, action: "drag" }), /action must be click, double, down or up/);
+    await assert.rejects(d.tools.call("mouse", { x: 1, y: 1, path: "PlayerGui.A" }), /a path or x and y, not both/);
+    await d.tools.call("mouse", { x: 2, y: 1 });
+    assert.deepEqual(seen.at(-1).args, { action: "click", button: "left", x: 2, y: 1, imageWidth: 4, imageHeight: 3 });
+    await d.tools.call("mouse", { x: 300, y: 200, space: "screen", button: "right", action: "double" });
+    assert.deepEqual(seen.at(-1).args, { action: "double", button: "right", x: 300, y: 200 });
+    await d.tools.call("mouse", { path: "Workspace.Door" });
+    assert.equal(seen.at(-1).args.path, "Workspace.Door");
+    // A screenshot cropped to the right half: its x 1 is the whole screen's x 3 of 4
+    (d.tools as any).lastShot = { width: 2, height: 3, crop: { x: 0.5, y: 0, w: 0.5, h: 1 } };
+    await d.tools.call("mouse", { x: 1, y: 2 });
+    assert.deepEqual(seen.at(-1).args, { action: "click", button: "left", x: 3, y: 2, imageWidth: 4, imageHeight: 3 });
+    assert.equal(seen.length, 4, "the refused ones never reached Studio");
+    client.close();
+    edit.close();
+  } finally {
+    await d.close();
+  }
+});
+
+test("prelude: quack-prelude/<peer>.luau goes with every eval, exec and wait_for try of that peer, unless prelude is false", { timeout: 20000 }, async () => {
+  const preludeDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-prelude-"));
+  fs.writeFileSync(path.join(preludeDir, "server.luau"), "local player = game:GetService(\"Players\"):GetPlayers()[1]\r\n\r\n");
+  fs.writeFileSync(path.join(preludeDir, "edit.luau"), "local sel = game:GetService(\"Selection\")\n");
+  const d = await daemon({ preludeDir });
+  try {
+    const seen: any[] = [];
+    const edit = await editStudio(d.url, (_tool, args) => {
+      seen.push({ peer: "edit", args });
+      return { ok: true, values: [], output: [] };
+    });
+    const server = await playPeer(d.url, "server", (_tool, args) => {
+      seen.push({ peer: "server", args });
+      return { ok: true, values: ["true"], output: [] };
+    });
+    const client = await playPeer(d.url, "client", (_tool, args) => {
+      seen.push({ peer: "client", args });
+      return { ok: true, values: [], output: [] };
+    });
+    await waitFor(() => d.ipc.playPeers().client === "ready" && d.ipc.playPeers().server === "ready");
+    const evaluated: any = await d.tools.call("eval", { code: "return player.Name" });
+    assert.equal(seen.at(-1).args.prelude, "local player = game:GetService(\"Players\"):GetPlayers()[1]", "CRLF and trailing blank lines dropped");
+    assert.equal(evaluated.prelude, "quack-prelude/server.luau");
+    await d.tools.call("eval", { code: "return 1", prelude: false });
+    assert.equal(seen.at(-1).args.prelude, undefined);
+    const fromClient: any = await d.tools.call("eval", { code: "return 1", peer: "client" });
+    assert.equal(seen.at(-1).args.prelude, undefined, "no client.luau: nothing goes");
+    assert.equal(fromClient.prelude, undefined);
+    await d.tools.call("exec", { code: "return 1" });
+    assert.equal(seen.at(-1).args.prelude, "local sel = game:GetService(\"Selection\")");
+    await d.tools.call("waitFor", { code: "player" });
+    assert.equal(seen.at(-1).peer, "server");
+    assert.match(seen.at(-1).args.prelude, /GetPlayers/);
+    for (const ws of [client, server, edit]) ws.close();
+  } finally {
+    await d.close();
+    fs.rmSync(preludeDir, { recursive: true, force: true });
+  }
+});
+
+test("new errors: each caller's next answer carries the play errors since its own previous call, grouped, with where they were thrown", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    const edit = await editStudio(d.url, () => ({ ok: true, values: [], output: [] }));
+    const server = await playPeer(d.url, "server", () => ({ ok: true, values: ["1"], output: [] }));
+    await waitFor(() => d.ipc.playPeers().server === "ready");
+    server.send(output("server", "ServerScriptService.Old:1: before the first call", "MessageError"));
+    await waitFor(() => d.tools.logs({}).entries.some((e: any) => e.message.includes("before the first call")));
+    // A caller's first call reads from the start of the play
+    const first: any = await d.tools.call("eval", { code: "return 1", caller: "a" });
+    assert.deepEqual(first.newErrors.map((e: any) => e.message), ["ServerScriptService.Old:1: before the first call"]);
+    for (let i = 0; i < 3; i++) server.send(output("server", "ServerScriptService.Loop:5: attempt to index nil with 'X'", "MessageError"));
+    server.send(output("server", "Stack Begin", "MessageInfo"));
+    server.send(output("server", "Script 'ServerScriptService.Loop', Line 5", "MessageInfo"));
+    server.send(output("server", "just a print"));
+    server.send(output("server", "Players.Ender.PlayerScripts.Main:9: boom", "MessageError"));
+    await waitFor(() => d.tools.logs({}).entries.some((e: any) => e.message.includes("boom")));
+    const second: any = await d.tools.call("eval", { code: "return 1", caller: "a" });
+    assert.deepEqual(second.newErrors, [
+      { source: "server", message: "ServerScriptService.Loop:5: attempt to index nil with 'X'", count: 3 },
+      { source: "server", message: "Players.Ender.PlayerScripts.Main:9: boom", count: 1 },
+    ]);
+    const third: any = await d.tools.call("eval", { code: "return 1", caller: "a" });
+    assert.equal(third.newErrors, undefined, "seen once");
+    // Another caller has its own cursor; reading the log moves it
+    const other: any = await d.tools.call("logs", { caller: "b" });
+    assert.equal(other.newErrors, undefined);
+    assert.equal(((await d.tools.call("eval", { code: "return 1", caller: "b" })) as any).newErrors, undefined);
+    server.send(output("server", "Workspace.Thing:1: once", "MessageError"));
+    server.send(output("server", "Stack Begin", "MessageInfo"));
+    server.send(output("server", "Script 'Workspace.Thing.Inner', Line 12", "MessageInfo"));
+    await waitFor(() => d.tools.logs({}).entries.some((e: any) => e.message.includes("Inner")));
+    const located: any = await d.tools.call("eval", { code: "return 1", caller: "b" });
+    assert.deepEqual(located.newErrors, [{ source: "server", message: "Workspace.Thing:1: once", count: 1, at: "Workspace.Thing.Inner:12" }]);
+    // An error already shown to this caller comes back only as a count (a game retrying every second)
+    server.send(output("server", "Workspace.Thing:1: once", "MessageError"));
+    server.send(output("server", "Workspace.Thing:1: once", "MessageError"));
+    server.send(output("server", "Workspace.Other:2: fresh", "MessageError"));
+    await waitFor(() => d.tools.logs({}).entries.some((e: any) => e.message.includes("fresh")));
+    const again: any = await d.tools.call("eval", { code: "return 1", caller: "b" });
+    assert.deepEqual(again.newErrors.map((e: any) => e.message), ["Workspace.Other:2: fresh"]);
+    assert.equal(again.repeatedErrors, 2);
+    server.send(output("server", "Workspace.Thing:1: once", "MessageError"));
+    await waitFor(() => d.tools.logs({}).entries.filter((e: any) => e.message.includes(": once")).length === 4);
+    const onlyRepeats: any = await d.tools.call("eval", { code: "return 1", caller: "b" });
+    assert.equal(onlyRepeats.newErrors, undefined);
+    assert.equal(onlyRepeats.repeatedErrors, 1);
+    const { newErrorsText } = await import("../control/commands.js");
+    assert.equal(newErrorsText([], 1), "The play logged 1 more of errors shown before since the last call.");
+    assert.match(newErrorsText(again.newErrors, 2), /fresh\n  \(and 2 more of errors shown before\)$/);
+    assert.equal(newErrorsText(second.newErrors), "New errors in the play since the last call (get_runtime_logs has the rest of each):\n  [server] ServerScriptService.Loop:5: attempt to index nil with 'X' (x3)\n  [server] Players.Ender.PlayerScripts.Main:9: boom");
+    server.close();
+    edit.close();
+  } finally {
+    await d.close();
+  }
+});
+
+test("screenshot focus and width: a GUI focus comes back as a crop of the client capture, read at the size the crop needs; a part's focus goes to edit mode with no play", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    // A 4x2 capture: each pixel's red is its index
+    const rgba = Buffer.alloc(4 * 2 * 4);
+    for (let i = 0; i < 8; i++) rgba.set([i, 0, 0, 255], i * 4);
+    const seen: any[] = [];
+    const edit = await editStudio(d.url, (tool, args) => {
+      seen.push({ tool, args });
+      return { width: 4, height: 2, data: rgba.toString("base64") };
+    });
+    // No play: a part focus and the width go to edit's own capture; a GUI focus needs the client
+    const own: any = await d.tools.call("screenshot", { focus: "Workspace.Tower", width: 800 });
+    assert.deepEqual(seen.at(-1), { tool: "capture", args: { focus: "Workspace.Tower", maxWidth: 800 } });
+    assert.equal(own.focus, "Workspace.Tower");
+    await assert.rejects(d.tools.call("screenshot", { focus: "PlayerGui.Shop" }), /a GUI focus needs the play client/);
+    await assert.rejects(d.tools.call("screenshot", { width: 10 }), /width must be a whole number from 64 to 4096/);
+    const client = await playPeer(d.url, "client", (_tool, args) => ({ contentId: "rbxtemp://9", ...(args.focus ? { rect: { x: 0.5, y: 0.5, w: 0.5, h: 0.5 } } : {}) }));
+    await waitFor(() => d.ipc.playPeers().client === "ready");
+    const shot: any = await d.tools.call("screenshot", { focus: "PlayerGui.Shop", width: 100 });
+    assert.deepEqual(seen.at(-1).args, { contentId: "rbxtemp://9", maxWidth: 200 }, "half the screen kept: read at twice the width");
+    assert.equal(shot.width, 2);
+    assert.equal(shot.height, 1);
+    assert.deepEqual(shot.crop, { x: 0.5, y: 0.5, w: 0.5, h: 0.5 });
+    const kept = StudioTools.crop({ rgba, width: 4, height: 2 }, shot.crop);
+    assert.deepEqual([...kept.rgba].filter((_, i) => i % 4 === 0), [6, 7], "the bottom-right quarter");
+    // The mouse reads x and y on this cropped shot
+    assert.deepEqual((d.tools as any).lastShot, { width: 2, height: 1, crop: { x: 0.5, y: 0.5, w: 0.5, h: 0.5 } });
+    client.close();
+    edit.close();
+  } finally {
+    await d.close();
+  }
+});
+
+test("verify: each mapped script's disk length and hash go to edit mode, and what differs comes back by file; find reads the synced tree with wildcards", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    const { fnv1a } = await import("../studioTools.js");
+    // The plugin's FNV-1a (h * 2^24 + h * 403 mod 2^32) is the same function
+    const luauStyle = (text: string) => {
+      let h = 2166136261;
+      for (const byte of Buffer.from(text, "utf8")) {
+        h = (h ^ byte) >>> 0;
+        h = ((h * 2 ** 24) % 2 ** 32 + h * 403) % 2 ** 32;
+      }
+      return h;
+    };
+    for (const sample of ["", "print('olá')", "x".repeat(1000)]) assert.equal(fnv1a(sample), luauStyle(sample));
+    d.tools.setPlace({
+      scripts: () => [
+        { guid: "g1", file: "ServerScriptService/Main.server.luau", text: "print(1)" },
+        { guid: "g2", file: "ReplicatedStorage/Shop.luau", text: "return {}" },
+        { guid: "g3", file: "ReplicatedStorage/Gone.luau", text: undefined },
+      ],
+      unmapped: () => ["ReplicatedStorage/New.luau"],
+      nodes: () => [
+        { guid: "a", name: "Workspace", className: "Workspace", path: ["Workspace"] },
+        { guid: "b", name: "BossDoor", className: "Part", path: ["Workspace", "Map", "BossDoor"] },
+        { guid: "c", name: "bossroom", className: "Model", path: ["Workspace", "Map", "bossroom"] },
+        { guid: "g2", name: "Shop", className: "ModuleScript", path: ["ReplicatedStorage", "Shop"] },
+      ],
+      fileOf: (guid) => (guid === "g2" ? "ReplicatedStorage/Shop.luau" : undefined),
+    });
+    await assert.rejects(d.tools.call("verify", {}), /Studio is not connected/);
+    const seen: any[] = [];
+    const edit = await editStudio(d.url, (tool, args) => {
+      seen.push({ tool, args });
+      return { checked: args.items.length, differ: args.items.filter((i: any) => i.guid === "g2").map(() => ({ guid: "g2", path: "ReplicatedStorage.Shop", state: "tab", len: 9, tabLen: 20 })) };
+    });
+    const all: any = await d.tools.call("verify", {});
+    assert.deepEqual(seen.at(-1).args.items, [
+      { guid: "g1", len: 8, hash: fnv1a("print(1)") },
+      { guid: "g2", len: 9, hash: fnv1a("return {}") },
+    ]);
+    assert.equal(all.same, 1);
+    assert.deepEqual(all.differ, [{ file: "ReplicatedStorage/Shop.luau", path: "ReplicatedStorage.Shop", state: "tab", diskLen: 9, studioLen: 9, tabLen: 20 }]);
+    assert.deepEqual(all.unmapped, ["ReplicatedStorage/New.luau"]);
+    assert.deepEqual(all.unreadable, ["ReplicatedStorage/Gone.luau"]);
+    const { verifyText } = await import("../control/commands.js");
+    assert.match(verifyText(all), /ReplicatedStorage\/Shop\.luau: the \.Source matches, but an open tab in Studio holds other text/);
+    assert.match(verifyText(all), /1 of 2 scripts match the disk; 3 do not/);
+    const one: any = await d.tools.call("verify", { files: ["Main.server.luau"] });
+    assert.deepEqual(seen.at(-1).args.items.map((i: any) => i.guid), ["g1"]);
+    assert.deepEqual(one.unmapped, []);
+    await assert.rejects(d.tools.call("verify", { files: ["Nope.luau"] }), /not a synced script file: Nope\.luau/);
+
+    const bosses: any = await d.tools.call("find", { name: "boss*" });
+    assert.deepEqual(bosses.found.map((f: any) => f.path), ["Workspace.Map.BossDoor", "Workspace.Map.bossroom"]);
+    const parts: any = await d.tools.call("find", { className: "Part,Model", under: "Workspace.Map", limit: 1 });
+    assert.equal(parts.total, 2);
+    assert.equal(parts.found.length, 1);
+    const shop: any = await d.tools.call("find", { name: "Shop" });
+    assert.deepEqual(shop.found, [{ path: "ReplicatedStorage.Shop", className: "ModuleScript", file: "ReplicatedStorage/Shop.luau" }]);
+    assert.equal((await d.tools.call("find", { under: "Workspace" }) as any).total, 2, "under counts what is below the path, not the path");
+    await assert.rejects(d.tools.call("find", {}), /give a name/);
+    edit.close();
+  } finally {
+    await d.close();
+  }
+});
+
+test("perf: both peers sample at once and the answer keeps each; one peer when named; seconds bounded", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    const edit = await editStudio(d.url, () => ({}));
+    await assert.rejects(d.tools.call("perf", {}), /no play is running/);
+    const asked: { peer: string; at: number }[] = [];
+    const sample = (peer: string) => async (_tool: string, args: any) => {
+      asked.push({ peer, at: Date.now() });
+      await wait(300);
+      return { seconds: args.seconds, signal: peer === "client" ? "RenderStepped" : "Heartbeat", fps: 60, frameMs: { p50: 16.6, p90: 17, p99: 20, max: 40 }, hitches: 0, memoryMb: 900, memoryChangeMb: 1, memoryTags: [{ tag: "Script", mb: 120 }], stats: { InstanceCount: 5000 } };
+    };
+    const server = await playPeer(d.url, "server", sample("server"));
+    const client = await playPeer(d.url, "client", sample("client"));
+    await waitFor(() => d.ipc.playPeers().client === "ready" && d.ipc.playPeers().server === "ready");
+    const both: any = await d.tools.call("perf", { seconds: 1 });
+    assert.equal(both.server.signal, "Heartbeat");
+    assert.equal(both.client.signal, "RenderStepped");
+    assert.ok(Math.abs(asked[0].at - asked[1].at) < 200, "sampled together, not one after the other");
+    assert.match(both.note, /one Studio process/);
+    const one: any = await d.tools.call("perf", { peer: "client" });
+    assert.equal(one.server, undefined);
+    assert.equal(one.client.fps, 60);
+    await assert.rejects(d.tools.call("perf", { seconds: 60 }), /seconds must be from 0.5 to 30/);
+    const { perfText } = await import("../control/commands.js");
+    assert.match(perfText(both), /^server: 60 heartbeats a second over 1 s; frame ms p50 16\.6, p90 17, p99 20, max 40; 0 over 50 ms\n  memory 900 MB \(\+1 during\): Script 120; 5000 instances/);
+    for (const ws of [client, server, edit]) ws.close();
+  } finally {
+    await d.close();
+  }
+});
+
+test("logpoint: a file becomes the script's guid, a path goes as it is; export writes Studio's bytes to a file and import sends a file's bytes", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    d.tools.setPlace({
+      scripts: () => [
+        { guid: "g1", file: "ServerScriptService/Main.server.luau", text: "" },
+        { guid: "g2", file: "ReplicatedStorage/A/Util.luau", text: "" },
+        { guid: "g3", file: "ReplicatedStorage/B/Util.luau", text: "" },
+      ],
+      unmapped: () => [],
+      nodes: () => [],
+      fileOf: () => undefined,
+    });
+    const seen: any[] = [];
+    const model = Buffer.from("<roblox!fake model bytes>");
+    const edit = await editStudio(d.url, (tool, args) => {
+      seen.push({ tool, args });
+      if (tool === "exportRbxm") return { data: model.toString("base64"), bytes: model.length, instances: ["Workspace.Tower"] };
+      if (tool === "importRbxm") return { placed: ["Workspace.Tower (Model)"], scripts: 2 };
+      return { path: "ServerScriptService.Main", line: args.line };
+    });
+    await d.tools.call("logpoint", { file: "Main.server.luau", line: 12, message: "hp, os.clock()" });
+    assert.deepEqual(seen.at(-1), { tool: "logpoint", args: { action: "add", line: 12, guid: "g1", message: "hp, os.clock()" } });
+    await d.tools.call("logpoint", { action: "remove", path: "ServerScriptService.Main", line: 12 });
+    assert.deepEqual(seen.at(-1).args, { action: "remove", line: 12, path: "ServerScriptService.Main" });
+    await d.tools.call("logpoint", { action: "list" });
+    assert.deepEqual(seen.at(-1).args, { action: "list" });
+    await assert.rejects(d.tools.call("logpoint", { file: "Util.luau", line: 1 }), /names 2 scripts/);
+    await assert.rejects(d.tools.call("logpoint", { file: "Nope.luau", line: 1 }), /not a synced script file/);
+    await assert.rejects(d.tools.call("logpoint", { file: "Main.server.luau", line: 0 }), /line must be/);
+    await assert.rejects(d.tools.call("logpoint", { action: "toggle" }), /action must be add, remove, list or clear/);
+    assert.equal(seen.length, 3, "the refused ones never reached Studio");
+
+    const out = path.join(d.shots, "tower.rbxm");
+    const saved: any = await d.tools.call("exportRbxm", { paths: ["Workspace.Tower"], out });
+    assert.equal(saved.file, out);
+    assert.deepEqual(fs.readFileSync(out), model);
+    const defaulted: any = await d.tools.call("exportRbxm", { paths: ["Workspace.Tower"] });
+    assert.match(defaulted.file.split(path.sep).join("/"), /\/exports\/Tower-.*\.rbxm$/);
+    await assert.rejects(d.tools.call("exportRbxm", { paths: [] }), /paths must be a list/);
+    const placed: any = await d.tools.call("importRbxm", { file: out, parent: "ServerStorage" });
+    assert.deepEqual(seen.at(-1).args, { data: model.toString("base64"), parent: "ServerStorage" });
+    assert.equal(placed.scripts, 2);
+    await assert.rejects(d.tools.call("importRbxm", { file: "relative.rbxm" }), /absolute path/);
+    await assert.rejects(d.tools.call("importRbxm", { file: path.join(d.shots, "missing.rbxm") }), /cannot read/);
+    edit.close();
+  } finally {
+    await d.close();
+  }
+});
+
+test("multiplayer: each client says its player, a call with player goes to that one, a missing player says who is there, and captures are refused", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    const editSeen: any[] = [];
+    const edit = await editStudio(d.url, (tool, args) => {
+      editSeen.push({ tool, args });
+      return tool === "playStart" ? { mode: "multiplayer" } : {};
+    });
+    const server = await playPeer(d.url, "server", () => ({ ok: true, values: ["server"], output: [] }));
+    const client = async (name: string | undefined) => {
+      const ws = new WebSocket(`${d.url}/studio-output`);
+      answer(ws, () => ({ ok: true, values: [name ?? "nameless"], output: [] }));
+      await new Promise<void>((resolve) => ws.once("open", () => resolve()));
+      ws.send(JSON.stringify({ type: "peerHello", source: "client", log: false, ...(name ? { player: name } : {}) }));
+      return ws;
+    };
+    const starting = d.tools.call("playtest", { action: "start", players: 2 });
+    await waitFor(() => editSeen.some((m) => m.tool === "playStart"));
+    assert.deepEqual(editSeen.find((m) => m.tool === "playStart").args, { mode: "play", players: 2 });
+    const one = await client("Player1");
+    // A client whose LocalPlayer came late names itself after its hello
+    const two = await client(undefined);
+    await wait(100);
+    assert.deepEqual(d.ipc.playPeers().players, ["Player1"], "the nameless one is not a second player yet, and did not replace Player1");
+    two.send(JSON.stringify({ type: "peerPlayer", player: "Player2" }));
+    const started: any = await starting;
+    assert.deepEqual(started.players, ["Player1", "Player2"]);
+    const fromOne: any = await d.tools.call("eval", { code: "return 1", peer: "client", player: "Player1" });
+    assert.deepEqual(fromOne.values, ["Player1"]);
+    const fromTwo: any = await d.tools.call("eval", { code: "return 1", peer: "client", player: "Player2" });
+    assert.deepEqual(fromTwo.values, ["nameless"]);
+    await assert.rejects(d.tools.call("eval", { code: "return 1", peer: "client", player: "Player3" }), /no play client of Player3 is connected \(clients: Player1, Player2\)/);
+    await assert.rejects(d.tools.call("screenshot", {}), /needs a solo play/);
+    await assert.rejects(d.tools.call("record", {}), /needs a solo play/);
+    await assert.rejects(d.tools.call("eval", { code: "return 1", player: 3 }), /player must be a player's name/);
+    await assert.rejects(d.tools.call("playtest", { action: "start", players: 9 }), /players must be a whole number from 1 to 8/);
+    // A newer socket of the same player replaces only that player's
+    const oneAgain = await client("Player1");
+    await waitFor(() => d.ipc.playPeers().players?.length === 2);
+    assert.deepEqual(d.ipc.playPeers().players, ["Player1", "Player2"]);
+    for (const ws of [one, two, oneAgain, server, edit]) ws.close();
+  } finally {
+    await d.close();
+  }
+});
+
+test("new errors: a caller's first call during a long play still sees the errors the log kept after the play's start marker was dropped", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    const edit = await editStudio(d.url, () => ({ ok: true, values: [], output: [] }));
+    const server = await playPeer(d.url, "server", () => ({ ok: true, values: ["1"], output: [] }));
+    await waitFor(() => d.ipc.playPeers().server === "ready");
+    const line = (message: string, messageType = "MessageOutput") => ({ type: "studioOutput", message, messageType, source: "server", timestamp: Date.now() }) as any;
+    // More lines than the log keeps (10,000): the "--- play started ---" marker goes
+    for (let i = 0; i < 10_050; i++) d.tools.runtimeLog(line(`print ${i}`));
+    d.tools.runtimeLog(line("ServerScriptService.Late:3: kept", "MessageError"));
+    assert.ok(!d.tools.logs({ tail: 10_000 }).entries.some((e: any) => e.message === "--- play started ---"));
+    const first: any = await d.tools.call("eval", { code: "return 1", caller: "late" });
+    assert.deepEqual(first.newErrors?.map((e: any) => e.message), ["ServerScriptService.Late:3: kept"]);
+    // The same once that play has ended: as with a marker, the last play's errors
+    server.close();
+    await waitFor(() => d.ipc.playPeers().server === undefined);
+    const after: any = await d.tools.call("exec", { code: "return 1", caller: "after the play" });
+    assert.deepEqual(after.newErrors?.map((e: any) => e.message), ["ServerScriptService.Late:3: kept"]);
+    edit.close();
+  } finally {
+    await d.close();
+  }
 });

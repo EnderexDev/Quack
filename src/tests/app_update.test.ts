@@ -28,3 +28,18 @@ test("every language has the update check's texts", async () => {
   }
   assert.equal([...i18n.matchAll(/upToDate: "[^"]*\{version\}/g)].length, 2, "upToDate names the version");
 });
+
+// 08/11/26: a Dev update after a one-line change took 116 s, nearly all of it fat LTO over the
+// whole program. Dev builds skip it (21 s); Official keeps Cargo.toml's release profile.
+test("Dev updates build without LTO, Official keeps the release profile", () => {
+  const publish = read("scripts/publish-dev-update.mjs");
+  assert.match(publish, /CARGO_PROFILE_RELEASE_LTO: "false"/);
+  assert.match(publish, /CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"/);
+  const env = publish.slice(publish.indexOf("const env = {"), publish.indexOf("};", publish.indexOf("const env = {")));
+  assert.match(env, /\.\.\.DEV_PROFILE_ENV,/, "the build's env carries the Dev profile");
+
+  const cargo = read("src-tauri/Cargo.toml");
+  const release = cargo.slice(cargo.indexOf("[profile.release]"));
+  assert.match(release, /^lto = true$/m, "Official still builds with LTO");
+  assert.match(release, /^codegen-units = 1$/m);
+});

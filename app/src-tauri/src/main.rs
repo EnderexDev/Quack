@@ -843,6 +843,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_running_session_is_not_ending_so_the_hub_still_restarts() {
+        // The shutdown side only shows on a real shutdown; this keeps the check from ever
+        // blocking the restart after a crash or `quack restart-hub`
+        assert!(!session_ending());
+    }
+
+    #[test]
     fn tray_panel_sits_above_a_bottom_taskbar_and_stays_on_screen() {
         // 2560x1440 with a 48 px taskbar; icon near the right edge
         let (x, y) = tray_position((2400.0, 1400.0, 24.0, 24.0), (400.0, 500.0), (0.0, 0.0, 2560.0, 1392.0));
@@ -1023,8 +1030,31 @@ fn toggle_tray(app: &AppHandle, rect: (f64, f64, f64, f64)) {
     let _ = app.emit_to("tray", "tray-shown", ());
 }
 
+/** The poll's start of a hub: at launch, and again after its own hub exits or stops answering */
 fn spawn_hub(app: &AppHandle) {
+    // Windows ends the hub with the session; a node started now cannot initialise
+    // (0xc0000142) and shows an error popup on every shutdown (08/11/26). Only the poll's
+    // restarts wait on this: the "Restart hub" click and an update's takeover never fire then.
+    if session_ending() {
+        return;
+    }
     spawn_hub_with(app, false);
+}
+
+/** True while Windows is logging off or shutting down this session (SM_SHUTTINGDOWN) */
+#[cfg(windows)]
+fn session_ending() -> bool {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetSystemMetrics(index: i32) -> i32;
+    }
+    const SM_SHUTTINGDOWN: i32 = 0x2000;
+    unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
+}
+
+#[cfg(not(windows))]
+fn session_ending() -> bool {
+    false
 }
 
 /**

@@ -2,9 +2,11 @@
 --[[
 	Quack: the Studio tools the daemon calls (src/studioTools.ts). Each DataModel's plugin
 	answers the ones that run there:
-	  edit    exec, playStart, playState, capture, captureRead, captureBurst, key, device
-	  server  eval, stop
-	  client  eval, captureBegin, captureBurst, key, click
+	  edit    exec, playStart (solo, Run mode, or a multiplayer test with players), playState,
+	          capture, captureRead, captureBurst, key, device, gui, sourceCheck, logpoint,
+	          exportRbxm, importRbxm
+	  server  eval, stop, perf
+	  client  eval, captureBegin, captureBurst, key, click, gui, mouse, perf
 
 	Evals run in the game VM with the game's require cache: a bridge Script (server) or
 	LocalScript (client) made at runtime in the play DataModel holds a BindableFunction that
@@ -100,8 +102,18 @@ local function countLines(code: string): number
 	return breaks + 1
 end
 
---- The payload's chunk name becomes "eval", and only the frames that are the user's own stay
-local function cleanError(message: string, userLines: number): string
+--- A line of the prelude is "prelude:N", one of the code "eval:N" counted from the code's own line 1
+local function relabel(line: string, offset: number): string
+	if offset <= 0 then return line end
+	return (string.gsub(line, "eval:(%d+)", function(raw)
+		local n = tonumber(raw) :: number
+		return if n <= offset then `prelude:{n}` else `eval:{n - offset}`
+	end))
+end
+
+--- The payload's chunk name becomes "eval", and only the frames that are the user's own stay.
+--- `offset`: the lines of a prelude before the code
+local function cleanError(message: string, userLines: number, offset: number?): string
 	local kept = {}
 	for line in string.gmatch(message, "[^\n]+") do
 		line = string.gsub(line, "Workspace%." .. CHUNK .. ":", "eval:")
@@ -129,6 +141,9 @@ local function cleanError(message: string, userLines: number): string
 		end
 		if #kept >= 20 then break end
 	end
+	for i, line in kept do
+		kept[i] = relabel(line, offset or 0)
+	end
 	return table.concat(kept, "\n")
 end
 
@@ -148,12 +163,12 @@ local REQUIRE_FAILED = "Requested module experienced an error while loading"
 	REQUIRE_FAILED while Luau's own text goes to the output (measured 08/11/26 in PA), so it is
 	read back from LogService.
 ]=]
-local function compileError(code: string): string?
+local function compileError(code: string, offset: number?): string?
 	local source = "return function() " .. code .. "\nend"
 	local hasLoadstring, fn, loadError = pcall(loadstring :: any, source, "=eval")
 	if hasLoadstring then
 		if fn then return nil end
-		return cleanError(tostring(loadError), countLines(code))
+		return cleanError(tostring(loadError), countLines(code), offset)
 	end
 	local before = #LogService:GetLogHistory()
 	local check = newModule(source)
@@ -176,16 +191,26 @@ local function compileError(code: string): string?
 			end
 		until message ~= REQUIRE_FAILED or os.clock() > deadline
 	end
-	return cleanError(message, countLines(code))
+	return cleanError(message, countLines(code), offset)
 end
 
 type EvalResult = { ok: boolean, values: { string }?, error: string?, output: { string } }
 
-local function finish(raw: any, userLines: number): EvalResult
+local function finish(raw: any, userLines: number, offset: number?): EvalResult
 	if type(raw) ~= "table" then return { ok = false, error = `the payload returned {typeof(raw)}`, output = {} } end
 	local output = if type(raw.output) == "table" then raw.output else {}
 	if raw.ok then return { ok = true, values = raw.values or {}, output = output } end
-	return { ok = false, error = cleanError(tostring(raw.error), userLines), output = output }
+	return { ok = false, error = cleanError(tostring(raw.error), userLines, offset), output = output }
+end
+
+--[=[
+	The code with the place's prelude before it (the daemon reads quack-prelude/<peer>.luau): its
+	locals are the code's. The prelude's lines are counted so errors keep naming the code's own.
+]=]
+local function withPrelude(args: { [string]: any }, code: string): (string, number)
+	local prelude = args.prelude
+	if type(prelude) ~= "string" or prelude == "" then return code, 0 end
+	return prelude .. "\n" .. code, countLines(prelude)
 end
 
 --------------------------------------------------------------------------------------------
@@ -242,8 +267,8 @@ local function bridgeInvoke(): (BindableFunction?, string?)
 	return invoke, nil
 end
 
-local function evalInGame(code: string): EvalResult
-	local compile = compileError(code)
+local function evalInGame(code: string, offset: number?): EvalResult
+	local compile = compileError(code, offset)
 	if compile then return { ok = false, error = compile, output = {} } end
 	local invoke, why = bridgeInvoke()
 	if not invoke then error(why, 0) end
@@ -251,21 +276,21 @@ local function evalInGame(code: string): EvalResult
 	local ok, raw = pcall(function() return invoke:Invoke(payload) end)
 	payload:Destroy()
 	if not ok then error(`the eval bridge failed: {raw}`, 0) end
-	return finish(raw, countLines(code))
+	return finish(raw, countLines(code), offset)
 end
 
 --- execute_luau: in this plugin's own VM (edit mode), fresh module copies
-local function execInPlugin(code: string): EvalResult
-	local compile = compileError(code)
+local function execInPlugin(code: string, offset: number?): EvalResult
+	local compile = compileError(code, offset)
 	if compile then return { ok = false, error = compile, output = {} } end
 	local payload = newModule(PREFIX .. code .. SUFFIX)
 	local ok, raw = pcall(require, payload)
 	payload:Destroy()
 	if not ok then
 		-- Only a compile error gets here: the wrapper catches everything the code raises
-		return { ok = false, error = cleanError(tostring(raw), countLines(code)), output = {} }
+		return { ok = false, error = cleanError(tostring(raw), countLines(code), offset), output = {} }
 	end
-	return finish(raw, countLines(code))
+	return finish(raw, countLines(code), offset)
 end
 
 --------------------------------------------------------------------------------------------
@@ -309,22 +334,35 @@ local function base64(data: buffer): string
 	return buffer.tostring(out)
 end
 
-local function captureBegin(): { contentId: string }
+-- A screenshot's focus (set further down, where paths are resolved): a GUI object gives the part
+-- of the screen to keep, a part or model moves the camera onto it until the capture is back
+local captureFocus: ((focus: string) -> ({ [string]: number }?, (() -> ())?))? = nil
+
+local function captureBegin(args: { [string]: any }?): { [string]: any }
 	local why = notRendering()
 	if why then error(why, 0) end
-	local contentId: any = nil
-	CaptureService:CaptureScreenshot(function(id) contentId = id end)
-	local started = os.clock()
-	while contentId == nil do
-		if os.clock() - started > 10 then
-			error(
-				"the screenshot never came back in 10 s: the Studio window is likely minimized or covered (restore it so the viewport renders)",
-				0
-			)
-		end
-		task.wait(0.03)
+	local rect, restore = nil, nil
+	local focus = args and args.focus
+	if type(focus) == "string" and focus ~= "" and captureFocus then
+		rect, restore = (captureFocus :: any)(focus)
 	end
-	return { contentId = tostring(contentId) }
+	local contentId: any = nil
+	local ok, err = pcall(function()
+		CaptureService:CaptureScreenshot(function(id) contentId = id end)
+		local started = os.clock()
+		while contentId == nil do
+			if os.clock() - started > 10 then
+				error(
+					"the screenshot never came back in 10 s: the Studio window is likely minimized or covered (restore it so the viewport renders)",
+					0
+				)
+			end
+			task.wait(0.03)
+		end
+	end)
+	if restore then restore() end
+	if not ok then error(err, 0) end
+	return { contentId = tostring(contentId), rect = rect }
 end
 
 local TILE = 1024
@@ -460,11 +498,16 @@ local function resolvePath(raw: string): Instance
 	local parts = string.split(raw, ".")
 	if parts[1] == "game" then table.remove(parts, 1) end
 	if #parts == 0 or parts[1] == "" then error("the path is empty", 0) end
-	local player = Players.LocalPlayer
+	-- Studio sets LocalPlayer in edit mode too (measured 08/11/26 in PA): only a play has a PlayerGui
+	local player = if RunService:IsRunning() then Players.LocalPlayer else nil
 	local node: Instance? = nil
 	local i = 2
-	if parts[1] == "StarterGui" or parts[1] == "PlayerGui" then
-		node = player and player:FindFirstChildOfClass("PlayerGui")
+	if not player and parts[1] == "PlayerGui" then
+		error("there is no PlayerGui outside a play client: name StarterGui.<...> to read the place's own copy", 0)
+	elseif not player and parts[1] == "Players" and parts[2] == "LocalPlayer" then
+		error("there is no LocalPlayer outside a play client", 0)
+	elseif player and (parts[1] == "StarterGui" or parts[1] == "PlayerGui") then
+		node = player:FindFirstChildOfClass("PlayerGui")
 		if not node then error("the play client has no PlayerGui yet", 0) end
 	elseif parts[1] == "Players" and parts[2] == "LocalPlayer" then
 		node = player
@@ -710,6 +753,621 @@ local function click(args: { [string]: any }): { [string]: any }
 end
 
 --------------------------------------------------------------------------------------------
+-- Reading a GUI: the tree under a path as the player sees it. Sessions read PlayerGui in two of
+-- every three client evals (4732 of 6934, 05/10-07/11), each building its own table.concat.
+
+local function getVirtualInput(): any
+	if not virtualInput then
+		local ok, made = pcall(function() return (UserInputService :: any):CreateVirtualInput() end)
+		if not ok or not made then error(`UserInputService:CreateVirtualInput() is not available here: {made}`, 0) end
+		virtualInput = made
+	end
+	return virtualInput
+end
+
+local function isModifier(instance: Instance): boolean
+	return instance:IsA("UIComponent") or instance:IsA("UIStroke") or instance:IsA("UIGradient") or instance:IsA("UICorner")
+end
+
+--- The GUI children of `parent` in the order a player reads them: a layout's own order, else top to bottom
+local function guiChildren(parent: Instance): { Instance }
+	local kids: { Instance } = {}
+	local layout: Instance? = nil
+	for _, child in parent:GetChildren() do
+		if child:IsA("UIGridStyleLayout") then
+			layout = child
+		elseif child:IsA("GuiObject") or child:IsA("LayerCollector") or child:IsA("Folder") then
+			table.insert(kids, child)
+		end
+	end
+	local byLayoutOrder = layout ~= nil and (layout :: any).SortOrder == Enum.SortOrder.LayoutOrder
+	local byName = layout ~= nil and (layout :: any).SortOrder == Enum.SortOrder.Name
+	table.sort(kids, function(a: any, b: any)
+		if byLayoutOrder and a:IsA("GuiObject") and b:IsA("GuiObject") and a.LayoutOrder ~= b.LayoutOrder then
+			return a.LayoutOrder < b.LayoutOrder
+		end
+		if not byName and not byLayoutOrder and a:IsA("GuiObject") and b:IsA("GuiObject") then
+			local pa, pb = a.AbsolutePosition, b.AbsolutePosition
+			if math.abs(pa.Y - pb.Y) > 1 then return pa.Y < pb.Y end
+			if math.abs(pa.X - pb.X) > 1 then return pa.X < pb.X end
+		end
+		return a.Name < b.Name
+	end)
+	return kids
+end
+
+--- Why a GUI button could not take a player's click at its center, or nil (click's own checks)
+local function unclickable(button: GuiButton, playerGui: Instance?, origin: Vector2, screen: Vector2): string?
+	if not playerGui or not button:IsDescendantOf(playerGui) then return nil end
+	local layer = button:FindFirstAncestorWhichIsA("LayerCollector")
+	if not layer or not layer:IsA("ScreenGui") then return "not on the screen" end
+	local hidden = hiddenBecause(button, layer)
+	if hidden then return hidden end
+	local size = button.AbsoluteSize
+	if size.X <= 0 or size.Y <= 0 then return "zero size" end
+	local center = button.AbsolutePosition + size / 2
+	local point = center - origin
+	if point.X < 0 or point.Y < 0 or point.X >= screen.X or point.Y >= screen.Y then return "off-screen" end
+	for _, object in (playerGui :: any):GetGuiObjectsAtPosition(center.X, center.Y) do
+		if object == button then return nil end
+		if object:IsA("GuiButton") or object:IsA("TextBox") then return `covered by {object:GetFullName()}` end
+	end
+	return "clipped or scrolled out of view"
+end
+
+local function inspectGui(args: { [string]: any }): { [string]: any }
+	local player = if RunService:IsRunning() then Players.LocalPlayer else nil
+	local root: Instance
+	if type(args.path) == "string" and args.path ~= "" then
+		root = resolvePath(args.path)
+	elseif player then
+		root = player:FindFirstChildOfClass("PlayerGui") or error("the play client has no PlayerGui yet", 0)
+	else
+		root = game:GetService("StarterGui")
+	end
+	local maxDepth = math.clamp(math.floor(tonumber(args.depth) or 3), 0, 20)
+	local limit = math.clamp(math.floor(tonumber(args.limit) or 250), 1, 2000)
+	local showHidden = args.hidden == true
+	local playerGui = player and player:FindFirstChildOfClass("PlayerGui")
+	local origin, screen = Vector2.zero, Vector2.zero
+	if playerGui and root:IsDescendantOf(playerGui) or root == playerGui then
+		origin, screen = screenOrigin(playerGui :: Instance)
+	end
+	local nodes = {}
+	local truncated = false
+	local function visit(instance: Instance, depth: number, parentShown: boolean)
+		if #nodes >= limit then
+			truncated = true
+			return
+		end
+		local node: { [string]: any } = { d = depth, n = instance.Name, c = instance.ClassName }
+		local shown = parentShown
+		if instance:IsA("LayerCollector") then
+			if instance:IsA("ScreenGui") and not instance.Enabled then
+				shown = false
+				node.off = "Enabled = false"
+			end
+		elseif instance:IsA("GuiObject") then
+			if not instance.Visible then
+				shown = false
+				node.off = "Visible = false"
+			end
+			local p, s = instance.AbsolutePosition, instance.AbsoluteSize
+			node.r = { math.round(p.X), math.round(p.Y), math.round(s.X), math.round(s.Y) }
+			if instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox") then
+				local ok, text = pcall(function() return (instance :: any).ContentText end)
+				node.t = if ok and type(text) == "string" then text else (instance :: any).Text
+				if #node.t > 120 then node.t = string.sub(node.t, 1, 117) .. "..." end
+			end
+			if instance:IsA("ImageLabel") or instance:IsA("ImageButton") then
+				local image = (instance :: any).Image
+				if image ~= "" then node.img = string.match(image, "%d+$") or image end
+			end
+			if instance:IsA("GuiButton") and shown and playerGui then
+				local why = unclickable(instance :: any, playerGui, origin, screen)
+				node.btn = why or true
+			elseif instance:IsA("GuiButton") then
+				node.btn = if shown then true else "hidden"
+			end
+			if instance:IsA("ScrollingFrame") then
+				local cp = (instance :: any).CanvasPosition
+				node.scroll = { math.round(cp.X), math.round(cp.Y) }
+			end
+		end
+		if not parentShown then node.off = node.off or "an ancestor is hidden" end
+		local mods = {}
+		for _, child in instance:GetChildren() do
+			if isModifier(child) then table.insert(mods, child.ClassName) end
+		end
+		if #mods > 0 then
+			table.sort(mods)
+			node.m = table.concat(mods, ",")
+		end
+		table.insert(nodes, node)
+		local kids = guiChildren(instance)
+		if #kids == 0 then return end
+		if depth >= maxDepth or (not shown and not showHidden) then
+			local count = 0
+			for _, d in instance:GetDescendants() do
+				if d:IsA("GuiObject") then count += 1 end
+			end
+			node.more = count
+			return
+		end
+		for _, child in kids do
+			visit(child, depth + 1, shown)
+		end
+	end
+	visit(root, 0, true)
+	return {
+		root = root:GetFullName(),
+		nodes = nodes,
+		truncated = truncated,
+		screen = if screen.X > 0 then { width = math.round(screen.X), height = math.round(screen.Y) } else nil,
+		origin = if screen.X > 0 then { x = origin.X, y = origin.Y } else nil,
+	}
+end
+
+--------------------------------------------------------------------------------------------
+-- The mouse by pixel: a point on the last screenshot, a GUI object's center, or a world part's.
+-- UserInputService's VirtualInput has buttons only (no move, no wheel: chrrxs's plugin says the
+-- same), so a drag or a scroll cannot be sent.
+
+local MOUSE_BUTTONS = {
+	left = Enum.UserInputType.MouseButton1,
+	right = Enum.UserInputType.MouseButton2,
+	middle = Enum.UserInputType.MouseButton3,
+}
+
+local function mouse(args: { [string]: any }): { [string]: any }
+	local why = notRendering()
+	if why then error(why, 0) end
+	local player = Players.LocalPlayer
+	local playerGui = player and player:FindFirstChildOfClass("PlayerGui")
+	if not playerGui then error("the play client has no PlayerGui yet", 0) end
+	local origin, screen = screenOrigin(playerGui)
+	local button = MOUSE_BUTTONS[string.lower(tostring(args.button or "left"))]
+	if not button then error("button must be left, right or middle", 0) end
+	local action = args.action or "click"
+	if action ~= "click" and action ~= "double" and action ~= "down" and action ~= "up" then
+		error("action must be click, double, down or up", 0)
+	end
+	local point: Vector2
+	local result: { [string]: any } = { screen = { width = math.round(screen.X), height = math.round(screen.Y) } }
+	if type(args.path) == "string" and args.path ~= "" then
+		local target = resolvePath(args.path)
+		if target:IsA("GuiObject") then
+			point = target.AbsolutePosition + target.AbsoluteSize / 2 - origin
+			result.target = target:GetFullName()
+		else
+			local position: Vector3
+			if target:IsA("BasePart") then
+				position = target.Position
+			elseif target:IsA("Model") then
+				position = target:GetPivot().Position
+			elseif target:IsA("Attachment") then
+				position = target.WorldPosition
+			else
+				error(`{target:GetFullName()} is a {target.ClassName}: name a GuiObject, a BasePart, a Model or an Attachment`, 0)
+			end
+			local camera = workspace.CurrentCamera
+			local gui, inFront = camera:WorldToScreenPoint(position)
+			if not inFront then error(`{target:GetFullName()} is behind the camera`, 0) end
+			point = Vector2.new(gui.X, gui.Y) - origin
+			result.target = target:GetFullName()
+		end
+	elseif type(args.x) == "number" and type(args.y) == "number" then
+		local x, y = args.x, args.y
+		if type(args.imageWidth) == "number" and type(args.imageHeight) == "number" and args.imageWidth > 0 and args.imageHeight > 0 then
+			-- A point on a screenshot: the capture is the whole screen at the display's scale (1725x1063
+			-- for a 1380x850 screen at 125%); a different shape means the screen changed since
+			local imageAspect, screenAspect = args.imageWidth / args.imageHeight, screen.X / screen.Y
+			if math.abs(imageAspect / screenAspect - 1) > 0.03 then
+				error(
+					`the screen is {math.round(screen.X)}x{math.round(screen.Y)} now, not the shape of the {args.imageWidth}x{args.imageHeight} screenshot (the device simulator changed?): take a new screenshot`,
+					0
+				)
+			end
+			x, y = x * screen.X / args.imageWidth, y * screen.Y / args.imageHeight
+		end
+		point = Vector2.new(x, y)
+	else
+		error("give x and y (a point on the last screenshot), or the path of a GuiObject or a part", 0)
+	end
+	if point.X < 0 or point.Y < 0 or point.X >= screen.X or point.Y >= screen.Y then
+		error(`({math.round(point.X)}, {math.round(point.Y)}) is off the {math.round(screen.X)}x{math.round(screen.Y)} screen`, 0)
+	end
+	local guiPoint = point + origin
+	result.x, result.y = math.round(point.X), math.round(point.Y)
+	result.gui = { x = math.round(guiPoint.X), y = math.round(guiPoint.Y) }
+	-- What is there: the front GUI object, else the part a ray from the camera hits
+	local objects = playerGui:GetGuiObjectsAtPosition(guiPoint.X, guiPoint.Y)
+	-- The button or text box that takes the press, else the front object (a full-screen Frame such
+	-- as the simulator's TouchControlFrame comes first and says nothing)
+	local front: GuiObject? = objects[1]
+	for _, object in objects do
+		if object:IsA("GuiButton") or object:IsA("TextBox") then
+			front = object
+			break
+		end
+	end
+	if front then result.under = front:GetFullName() end
+	local camera = workspace.CurrentCamera
+	if camera then
+		local ray = camera:ScreenPointToRay(guiPoint.X, guiPoint.Y)
+		local hit = workspace:Raycast(ray.Origin, ray.Direction * 2000)
+		if hit then result.hit = hit.Instance:GetFullName() end
+	end
+	local input = getVirtualInput()
+	local ok, err = pcall(function()
+		if action == "down" then
+			input:SendMouseButton(point, button, true)
+		elseif action == "up" then
+			input:SendMouseButton(point, button, false)
+		else
+			for i = 1, if action == "double" then 2 else 1 do
+				input:SendMouseButton(point, button, true)
+				task.wait(0.05)
+				input:SendMouseButton(point, button, false)
+				if i == 1 and action == "double" then task.wait(0.08) end
+			end
+		end
+	end)
+	if not ok then error(`could not send the mouse button: {err}`, 0) end
+	result.action = action
+	result.button = string.lower(tostring(args.button or "left"))
+	return result
+end
+
+--------------------------------------------------------------------------------------------
+-- A screenshot's focus. A GUI object: the screen's part it covers (8 px around it), as fractions
+-- of the screen so the daemon crops the capture whatever the display scale. A part or a model:
+-- the camera keeps its angle and backs off until the object's bounding sphere fills the view,
+-- for two frames and the capture, then goes back where it was.
+
+captureFocus = function(focus: string): ({ [string]: number }?, (() -> ())?)
+	local target = resolvePath(focus)
+	if target:IsA("GuiObject") then
+		local player = Players.LocalPlayer
+		local playerGui = player and player:FindFirstChildOfClass("PlayerGui")
+		if not playerGui or not target:IsDescendantOf(playerGui) then
+			error(`{target:GetFullName()} is not on the player's screen: a GUI focus needs a Play-mode play and a PlayerGui path`, 0)
+		end
+		local origin, screen = screenOrigin(playerGui)
+		local pad = 8
+		local p = target.AbsolutePosition - origin
+		local s = target.AbsoluteSize
+		local x0, y0 = math.clamp(p.X - pad, 0, screen.X), math.clamp(p.Y - pad, 0, screen.Y)
+		local x1, y1 = math.clamp(p.X + s.X + pad, 0, screen.X), math.clamp(p.Y + s.Y + pad, 0, screen.Y)
+		if x1 - x0 < 2 or y1 - y0 < 2 then
+			error(`{target:GetFullName()} is off-screen or has no size ({math.round(s.X)}x{math.round(s.Y)} at {math.round(p.X)}, {math.round(p.Y)})`, 0)
+		end
+		return { x = x0 / screen.X, y = y0 / screen.Y, w = (x1 - x0) / screen.X, h = (y1 - y0) / screen.Y }, nil
+	end
+	local center: Vector3, size: Vector3
+	if target:IsA("Model") then
+		local cf, extents = target:GetBoundingBox()
+		center, size = cf.Position, extents
+	elseif target:IsA("BasePart") then
+		center, size = target.Position, target.Size
+	else
+		error(`{target:GetFullName()} is a {target.ClassName}: focus a GuiObject, a BasePart or a Model`, 0)
+	end
+	local camera = workspace.CurrentCamera
+	if not camera then error("there is no camera to move", 0) end
+	local saved = { cframe = camera.CFrame, kind = camera.CameraType, focus = camera.Focus }
+	local look = camera.CFrame.LookVector
+	-- FieldOfView is vertical; the bounding sphere fits the shorter side
+	local radius = math.max(size.Magnitude / 2, 0.5)
+	local half = math.rad(camera.FieldOfView) / 2
+	local aspect = camera.ViewportSize.X / math.max(camera.ViewportSize.Y, 1)
+	local fit = math.min(math.tan(half), math.tan(half) * aspect)
+	local distance = radius / fit * 1.1
+	camera.CameraType = Enum.CameraType.Scriptable
+	camera.CFrame = CFrame.lookAt(center - look * distance, center)
+	camera.Focus = CFrame.new(center)
+	RunService.RenderStepped:Wait()
+	RunService.RenderStepped:Wait()
+	return nil, function()
+		camera.CameraType = saved.kind
+		camera.CFrame = saved.cframe
+		camera.Focus = saved.focus
+	end
+end
+
+--------------------------------------------------------------------------------------------
+-- Does Studio hold the disk's text? The daemon sends each mapped script's guid, its disk text's
+-- length in bytes and FNV-1a hash; this answers the ones whose .Source, or whose open tab (the
+-- text a play copies), is not that. Sessions checked with `.Source:find("...")` in 676 of the
+-- month's 1001 execute_luau that read a Source.
+
+local guidResolver: ((guid: string) -> Instance?)? = nil
+
+--- The sync session's guid map, read at each call (it is replaced on a new snapshot)
+function StudioTools.setGuidResolver(resolve: (guid: string) -> Instance?)
+	guidResolver = resolve
+end
+
+--- FNV-1a, 32 bits, over the bytes: h * 16777619 is h * 2^24 + h * 403, kept below 2^53
+local function fnv(text: string): number
+	local data = buffer.fromstring(text)
+	local h = 2166136261
+	for i = 0, buffer.len(data) - 1 do
+		h = bit32.bxor(h, buffer.readu8(data, i))
+		h = (bit32.lshift(h, 24) + h * 403) % 4294967296
+	end
+	return h
+end
+
+--- The daemon reads files with CRLF as LF (the sync counts them the same): Studio's text too
+local function sameText(text: string, len: number, hash: number): boolean
+	if string.find(text, "\r", 1, true) then text = (string.gsub(text, "\r\n", "\n")) end
+	return #text == len and fnv(text) == hash
+end
+
+local function sourceCheck(args: { [string]: any }): { [string]: any }
+	if not guidResolver then error("the sync session has not started: connect the place first", 0) end
+	local ScriptEditorService = game:GetService("ScriptEditorService")
+	local items = if type(args.items) == "table" then args.items else {}
+	local differ = {}
+	local checked = 0
+	local budget = os.clock()
+	for _, item in items do
+		if type(item) ~= "table" or type(item.guid) ~= "string" then continue end
+		checked += 1
+		local instance = (guidResolver :: any)(item.guid)
+		if not instance or not instance.Parent then
+			table.insert(differ, { guid = item.guid, state = "missing" })
+			continue
+		end
+		local okSource, source = pcall(function() return (instance :: any).Source end)
+		if not okSource then
+			table.insert(differ, { guid = item.guid, state = "unreadable", path = instance:GetFullName(), error = tostring(source) })
+			continue
+		end
+		local okEditor, editor = pcall(function() return ScriptEditorService:GetEditorSource(instance) end)
+		local sourceSame = sameText(source, item.len, item.hash)
+		local editorSame = if okEditor and editor ~= source then sameText(editor, item.len, item.hash) else sourceSame
+		if not sourceSame or not editorSame then
+			table.insert(differ, {
+				guid = item.guid,
+				path = instance:GetFullName(),
+				state = if sourceSame then "tab" elseif editorSame then "source" else "both",
+				len = #source,
+				tabLen = if okEditor and editor ~= source then #editor else nil,
+			})
+		end
+		-- Hashing megabytes holds Studio: a frame back every 50 ms of it
+		if os.clock() - budget > 0.05 then
+			task.wait()
+			budget = os.clock()
+		end
+	end
+	return { checked = checked, differ = differ }
+end
+
+--------------------------------------------------------------------------------------------
+-- A performance sample of one play peer for a few seconds: the frame times (the client's
+-- RenderStepped, the server's Heartbeat), the hitches, memory by tag and the engine's own Stats.
+-- What sessions built by hand with os.clock (806 evals), Stats (250) and frame counters (116).
+
+local function percentile(sorted: { number }, p: number): number
+	if #sorted == 0 then return 0 end
+	return sorted[math.clamp(math.ceil(#sorted * p), 1, #sorted)]
+end
+
+local function round(n: number, places: number?): number
+	local scale = 10 ^ (places or 1)
+	return math.round(n * scale) / scale
+end
+
+local function perfSample(args: { [string]: any }): { [string]: any }
+	local Stats = game:GetService("Stats")
+	local seconds = math.clamp(tonumber(args.seconds) or 3, 0.5, 30)
+	local isClient = RunService:IsClient()
+	local signal = if isClient then RunService.RenderStepped else RunService.Heartbeat
+	local deltas: { number } = {}
+	local connection = signal:Connect(function(dt: number) table.insert(deltas, dt * 1000) end)
+	local memoryBefore = Stats:GetTotalMemoryUsageMb()
+	local started = os.clock()
+	task.wait(seconds)
+	local elapsed = os.clock() - started
+	connection:Disconnect()
+	local sorted = table.clone(deltas)
+	table.sort(sorted)
+	local hitches, worst = 0, 0
+	for _, ms in deltas do
+		if ms > 50 then hitches += 1 end
+		worst = math.max(worst, ms)
+	end
+	local tags = {}
+	for _, tag in Enum.DeveloperMemoryTag:GetEnumItems() do
+		local ok, mb = pcall(function() return Stats:GetMemoryUsageMbForTag(tag) end)
+		if ok and type(mb) == "number" and mb > 0 then table.insert(tags, { tag = tag.Name, mb = round(mb) }) end
+	end
+	table.sort(tags, function(a, b) return a.mb > b.mb end)
+	local top = {}
+	for i = 1, math.min(8, #tags) do
+		top[i] = tags[i]
+	end
+	local engine: { [string]: number } = {}
+	for _, name in { "HeartbeatTimeMs", "PhysicsStepTimeMs", "InstanceCount", "PrimitivesCount", "MovingPrimitivesCount", "ContactsCount", "DataReceiveKbps", "DataSendKbps" } do
+		local ok, value = pcall(function() return (Stats :: any)[name] end)
+		if ok and type(value) == "number" then engine[name] = round(value, 2) end
+	end
+	local result: { [string]: any } = {
+		seconds = round(elapsed, 2),
+		signal = if isClient then "RenderStepped" else "Heartbeat",
+		frames = #deltas,
+		fps = round(#deltas / elapsed),
+		frameMs = { p50 = round(percentile(sorted, 0.5), 2), p90 = round(percentile(sorted, 0.9), 2), p99 = round(percentile(sorted, 0.99), 2), max = round(worst, 2) },
+		hitches = hitches,
+		memoryMb = round(Stats:GetTotalMemoryUsageMb()),
+		memoryChangeMb = round(Stats:GetTotalMemoryUsageMb() - memoryBefore),
+		memoryTags = top,
+		stats = engine,
+		players = #Players:GetPlayers(),
+	}
+	if not isClient then
+		local ok, physics = pcall(function() return workspace:GetRealPhysicsFPS() end)
+		if ok then result.physicsFps = round(physics) end
+	end
+	if isClient and #deltas == 0 then result.warning = "the window drew no frame: it is minimized or covered" end
+	return result
+end
+
+--------------------------------------------------------------------------------------------
+-- Logpoints: a line of a script that prints Luau values when it runs, with no edit to the script
+-- (ScriptDebuggerService, behind Studio's beta "Studio Debugger Luau API"). Set in edit mode,
+-- they fire in the play and their lines reach the play's output. Sessions used chrrxs's for
+-- perf-hunt timings (80 calls in a month).
+
+local logpoints: { [string]: { script: LuaSourceContainer, path: string, line: number, message: string?, condition: string? } } = {}
+
+local function quoted(text: string): string
+	return '"' .. string.gsub(string.gsub(string.gsub(text, "\\", "\\\\"), '"', '\\"'), "\n", "\\n") .. '"'
+end
+
+local function debuggerService(): any
+	local ok, service = pcall(function() return (game :: any):GetService("ScriptDebuggerService") end)
+	if not ok or not service then
+		error(
+			"ScriptDebuggerService is not available: turn on the beta feature \"Studio Debugger Luau API\" (File > Beta Features) and restart Studio",
+			0
+		)
+	end
+	return service
+end
+
+local function logpoint(args: { [string]: any }): { [string]: any }
+	local action = args.action or "add"
+	local service = debuggerService()
+	if action == "list" then
+		local out = {}
+		for _, entry in logpoints do
+			if entry.script.Parent then table.insert(out, { path = entry.path, line = entry.line, message = entry.message, condition = entry.condition }) end
+		end
+		table.sort(out, function(a, b) return if a.path == b.path then a.line < b.line else a.path < b.path end)
+		return { logpoints = out }
+	end
+	if action == "clear" then
+		local removed = 0
+		for key, entry in logpoints do
+			if pcall(function() service:RemoveBreakpoint(entry.script, entry.line) end) then removed += 1 end
+			logpoints[key] = nil
+		end
+		return { removed = removed }
+	end
+	local script: Instance? = nil
+	if type(args.guid) == "string" and guidResolver then script = (guidResolver :: any)(args.guid) end
+	if not script and type(args.path) == "string" and args.path ~= "" then script = resolvePath(args.path) end
+	if not script then error("name the script by its path, or its file", 0) end
+	if not (script :: Instance):IsA("LuaSourceContainer") then error(`{(script :: Instance):GetFullName()} is a {(script :: Instance).ClassName}, not a script`, 0) end
+	local target = script :: LuaSourceContainer
+	local line = math.floor(tonumber(args.line) or 0)
+	if line < 1 then error("line must be a line number, 1 or more", 0) end
+	local path = target:GetFullName()
+	local key = `{path}:{line}`
+	if action == "remove" then
+		local ok, err = pcall(function() service:RemoveBreakpoint(target, line) end)
+		logpoints[key] = nil
+		if not ok then error(`ScriptDebuggerService:RemoveBreakpoint failed: {err}`, 0) end
+		return { removed = 1, path = path, line = line }
+	end
+	if action ~= "add" then error("action must be add, remove, list or clear", 0) end
+	local message = if type(args.message) == "string" and args.message ~= "" then args.message else nil
+	-- LogMessage is a list of Luau expressions, as print takes them: a label first, then the values
+	local spec: { [string]: any } = {
+		Line = line,
+		Enabled = true,
+		ContinueExecution = true,
+		LogMessage = quoted(`[logpoint {target.Name}:{line}]`) .. (if message then ", " .. message else ""),
+	}
+	local condition = if type(args.condition) == "string" and args.condition ~= "" then args.condition else nil
+	if condition then spec.Condition = condition end
+	pcall(function() service:RemoveBreakpoint(target, line) end)
+	local ok, result = pcall(function() return service:AddBreakpoint(target, spec) end)
+	if not ok then
+		error(
+			`ScriptDebuggerService:AddBreakpoint failed: {result} (it needs the beta feature "Studio Debugger Luau API" on and Studio restarted)`,
+			0
+		)
+	end
+	local actual = if type(result) == "table" and type(result.Line) == "number" then result.Line else line
+	logpoints[`{path}:{actual}`] = { script = target, path = path, line = actual, message = message, condition = condition }
+	return {
+		path = path,
+		line = actual,
+		requestedLine = if actual ~= line then line else nil,
+		verified = if type(result) == "table" then result.Verified else nil,
+		note = if type(result) == "table" and type(result.Message) == "string" and result.Message ~= "" then result.Message else nil,
+	}
+end
+
+--------------------------------------------------------------------------------------------
+-- Models as .rbxm files, both ways (SerializationService, plugin security): a play of a
+-- worktree carries scripts only, so a model, a map piece or a UI made elsewhere comes in this
+-- way. chrrxs's import_rbxm and export_rbxm: 167 calls in a month.
+
+local function exportRbxm(args: { [string]: any }): { [string]: any }
+	local paths = if type(args.paths) == "table" then args.paths else {}
+	if #paths == 0 then error("paths is required: the instances to save", 0) end
+	local instances = {}
+	for _, path in paths do
+		table.insert(instances, resolvePath(tostring(path)))
+	end
+	local SerializationService = (game :: any):GetService("SerializationService")
+	local ok, data = pcall(function() return SerializationService:SerializeInstancesAsync(instances) end)
+	if not ok then error(`SerializationService:SerializeInstancesAsync failed: {data}`, 0) end
+	local names = {}
+	for _, instance in instances do
+		table.insert(names, instance:GetFullName())
+	end
+	return { data = base64(data), bytes = buffer.len(data), instances = names }
+end
+
+local function importRbxm(args: { [string]: any }): { [string]: any }
+	if type(args.data) ~= "string" or args.data == "" then error("the file's bytes did not come", 0) end
+	local parent = resolvePath(if type(args.parent) == "string" and args.parent ~= "" then args.parent else "Workspace")
+	local EncodingService = (game :: any):GetService("EncodingService")
+	local SerializationService = (game :: any):GetService("SerializationService")
+	local decoded, raw = pcall(function() return EncodingService:Base64Decode(buffer.fromstring(args.data)) end)
+	if not decoded then error(`could not decode the file: {raw}`, 0) end
+	local ok, made = pcall(function() return SerializationService:DeserializeInstancesAsync(raw) end)
+	if not ok then error(`SerializationService:DeserializeInstancesAsync failed (not an .rbxm?): {made}`, 0) end
+	local ChangeHistoryService = game:GetService("ChangeHistoryService")
+	local recording = if RunService:IsEdit() then ChangeHistoryService:TryBeginRecording("Quack: import .rbxm") else nil
+	local placed = {}
+	local failure: string? = nil
+	for _, instance in made do
+		local parented, err = pcall(function() instance.Parent = parent end)
+		if not parented then
+			failure = `could not put {instance.Name} ({instance.ClassName}) in {parent:GetFullName()}: {err}`
+			break
+		end
+		table.insert(placed, instance)
+	end
+	if failure then
+		for _, instance in placed do
+			pcall(function() instance:Destroy() end)
+		end
+		if recording then ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Cancel) end
+		error(failure, 0)
+	end
+	if recording then ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit) end
+	local names = {}
+	local scripts = 0
+	for _, instance in placed do
+		table.insert(names, `{instance:GetFullName()} ({instance.ClassName})`)
+		if instance:IsA("LuaSourceContainer") then scripts += 1 end
+		for _, d in instance:GetDescendants() do
+			if d:IsA("LuaSourceContainer") then scripts += 1 end
+		end
+	end
+	return { placed = names, scripts = scripts }
+end
+
+--------------------------------------------------------------------------------------------
 -- Keys (virtualInput is declared with the clicks)
 
 local function key(args: { [string]: any }): { [string]: any }
@@ -850,17 +1508,22 @@ end
 
 local HANDLERS: { [string]: { [Role]: (args: { [string]: any }) -> any } } = {
 	eval = {
-		server = function(args) return evalInGame(codeOf(args)) end,
-		client = function(args) return evalInGame(codeOf(args)) end,
+		server = function(args) return evalInGame(withPrelude(args, codeOf(args))) end,
+		client = function(args) return evalInGame(withPrelude(args, codeOf(args))) end,
 	},
-	exec = { edit = function(args) return execInPlugin(codeOf(args)) end },
+	exec = { edit = function(args) return execInPlugin(withPrelude(args, codeOf(args))) end },
 	playState = { edit = function() return { editModeActive = StudioTestService.EditModeActive } end },
 	playStart = {
 		edit = function(args)
 			if not StudioTestService.EditModeActive then error("a play is already running: stop it first", 0) end
 			local run = args.mode == "run"
+			local players = tonumber(args.players)
 			task.spawn(function()
 				local ok, err = pcall(function()
+					if players then
+						-- Studio's Local Server: a server window and one window a player
+						return StudioTestService:ExecuteMultiplayerTestAsync(players, {})
+					end
 					if run then
 						return StudioTestService:ExecuteRunModeAsync({})
 					end
@@ -868,7 +1531,7 @@ local HANDLERS: { [string]: { [Role]: (args: { [string]: any }) -> any } } = {
 				end)
 				if not ok then warn("[Quack]: the play ended with an error:", err) end
 			end)
-			return { mode = if run then "run" else "play" }
+			return { mode = if players then "multiplayer" elseif run then "run" else "play" }
 		end,
 	},
 	stop = {
@@ -878,12 +1541,19 @@ local HANDLERS: { [string]: { [Role]: (args: { [string]: any }) -> any } } = {
 			return { stopping = true }
 		end,
 	},
-	captureBegin = { client = function() return captureBegin() end },
+	captureBegin = { client = function(args: { [string]: any }) return captureBegin(args) end },
 	captureRead = { edit = function(args) return captureRead(args.contentId, tonumber(args.maxWidth)) end },
-	capture = { edit = function() return captureRead(captureBegin().contentId) end },
+	capture = { edit = function(args: { [string]: any }) return captureRead((captureBegin(args) :: any).contentId, tonumber(args.maxWidth)) end },
 	captureBurst = { client = captureBurst, edit = captureBurst },
 	key = { client = key, edit = key },
 	click = { client = click },
+	gui = { client = inspectGui, edit = inspectGui },
+	mouse = { client = mouse },
+	sourceCheck = { edit = sourceCheck },
+	perf = { server = perfSample, client = perfSample },
+	logpoint = { edit = logpoint },
+	exportRbxm = { edit = exportRbxm },
+	importRbxm = { edit = importRbxm },
 	device = { edit = device },
 }
 

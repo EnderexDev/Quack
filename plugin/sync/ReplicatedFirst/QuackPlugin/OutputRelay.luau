@@ -63,13 +63,30 @@ function OutputRelay.start(wsUrl: string, logToDaemon: boolean?): (message: { [s
 		if not pcall(client.Send, client, encoded) then stop() end
 	end
 
-	-- Quack: first on the socket, before the output buffered while it opened
-	local hello = HttpService:JSONEncode({ type = "peerHello", source = source, log = logToDaemon == true })
+	-- Quack: first on the socket, before the output buffered while it opened. A client names its
+	-- player: a multiplayer test has one client a player, each its own socket
+	local Players = game:GetService("Players")
+	local function playerName(): string?
+		local player = if source == "client" then Players.LocalPlayer else nil
+		return if player then player.Name else nil
+	end
 
 	local function flush()
 		if isOpen then return end
 		isOpen = true
-		send(hello)
+		local named = playerName()
+		send(HttpService:JSONEncode({ type = "peerHello", source = source, log = logToDaemon == true, player = named }))
+		if source == "client" and not named then
+			-- A LocalPlayer that comes after the hello is named on its own
+			task.spawn(function()
+				local deadline = os.clock() + 30
+				while not Players.LocalPlayer and os.clock() < deadline do
+					task.wait(0.1)
+				end
+				local name = playerName()
+				if name and isOpen then send(HttpService:JSONEncode({ type = "peerPlayer", player = name })) end
+			end)
+		end
 		for _, encoded in pending do
 			send(encoded)
 		end

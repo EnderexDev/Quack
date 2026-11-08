@@ -50,8 +50,14 @@ if (dirty && !local) {
 }
 
 const signing = path.join(process.env.APPDATA ?? "", "quack", "signing");
+// Dev builds skip LTO and use 16 codegen units (Ender's call, 08/11/26): with Cargo.toml's
+// lto = true and codegen-units = 1, one changed line re-optimised the whole program, 116 s per
+// update; without them it took 21 s, for an exe 25% bigger (installer +10%). Only the Dev
+// channel: Official is built by CI from Cargo.toml's [profile.release], which is unchanged.
+const DEV_PROFILE_ENV = { CARGO_PROFILE_RELEASE_LTO: "false", CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16" };
 const env = {
   ...process.env,
+  ...DEV_PROFILE_ENV,
   TAURI_SIGNING_PRIVATE_KEY: fs.readFileSync(path.join(signing, "quack-updater.key"), "utf8"),
   TAURI_SIGNING_PRIVATE_KEY_PASSWORD: fs.readFileSync(path.join(signing, "quack-updater.key.password"), "utf8"),
 };

@@ -246,6 +246,8 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 	self.guidMap = {}
 	self.usedGuids = {}
 	self.lastHeartbeat = 0
+	-- Quack: verify_sync finds each script by the guid the daemon knows it by
+	StudioTools.setGuidResolver(function(guid: string): Instance? return self.guidMap[guid] end)
 	self.lastSyncedSource = {}
 	self._recentScriptSends = {}
 	self.lastInstanceUpdate = {}

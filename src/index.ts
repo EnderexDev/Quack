@@ -276,7 +276,20 @@ export class SyncDaemon {
     // Quack: the Studio tools (evals, play, screenshots, keys...); screenshots go next to the
     // daemon log, in the project's .quack/ (never synced)
     const quackDir = path.join(path.dirname(path.resolve(config.sourcemapPath)), ".quack");
-    this.studioTools = StudioTools.attach(this.ipc, path.join(quackDir, "screenshots"), path.join(quackDir, "recordings"));
+    // The eval prelude is the game's own code, so it lives where git keeps it: quack-prelude/
+    // next to .quack/ (which is ignored), outside the synced folder
+    this.studioTools = StudioTools.attach(this.ipc, path.join(quackDir, "screenshots"), path.join(quackDir, "recordings"), path.join(path.dirname(quackDir), "quack-prelude"));
+    // verify_sync and find_instances read the synced tree and the files it maps
+    const relative = (file: string) => path.relative(path.resolve(this.fileWriter.getBaseDir()), path.resolve(file)).split(path.sep).join("/");
+    this.studioTools.setPlace({
+      scripts: () => [...this.fileWriter.getAllMappings().values()].map((m) => ({ guid: m.guid, file: relative(m.filePath), text: readFileIfExists(m.filePath) })),
+      unmapped: () => this.unsyncedScripts(),
+      nodes: () => this.tree.getAllNodes().values(),
+      fileOf: (guid) => {
+        const mapping = this.fileWriter.getMapping(guid);
+        return mapping ? relative(mapping.filePath) : undefined;
+      },
+    });
 
     this.setupHandlers();
     // A successor of a daemon that ran older code starts from its tree, before it takes any

@@ -30,6 +30,8 @@ export interface ControlContext {
   bundleDir?: string;
   /** Poll interval for log -f, wait and restart-hub; shorter in tests */
   pollMs?: number;
+  /** Who calls the Studio tools: each caller gets the play errors since its own previous call */
+  caller?: string;
   /** How an AI client starts `mcp` (this same command); connect-ai needs it */
   server?: ServerCommand;
   /** Where the AI clients are; tests point it at a scratch home */
@@ -93,6 +95,24 @@ interface Options {
   seconds?: string;
   fps?: string;
   width?: string;
+  /** gui, mouse, and the tools after them */
+  depth?: string;
+  limit?: string;
+  hidden: boolean;
+  button?: string;
+  space?: string;
+  path?: string;
+  focus?: string;
+  files?: string;
+  class?: string;
+  under?: string;
+  line?: string;
+  message?: string;
+  condition?: string;
+  parent?: string;
+  /** A multiplayer test: which player's client; and how many players a start makes */
+  player?: string;
+  players?: string;
 }
 
 function parse(argv: string[]): { command?: string; args: string[]; options: Options } {
@@ -142,6 +162,22 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       seconds: { type: "string" },
       fps: { type: "string" },
       width: { type: "string" },
+      depth: { type: "string" },
+      limit: { type: "string" },
+      hidden: { type: "boolean" },
+      button: { type: "string" },
+      space: { type: "string" },
+      path: { type: "string" },
+      focus: { type: "string" },
+      files: { type: "string" },
+      class: { type: "string" },
+      under: { type: "string" },
+      line: { type: "string" },
+      message: { type: "string" },
+      condition: { type: "string" },
+      parent: { type: "string" },
+      player: { type: "string" },
+      players: { type: "string" },
     },
   });
   const number = (name: "idle" | "timeout"): number | undefined => {
@@ -196,6 +232,22 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       seconds: values.seconds,
       fps: values.fps,
       width: values.width,
+      depth: values.depth,
+      limit: values.limit,
+      hidden: values.hidden === true,
+      button: values.button,
+      space: values.space,
+      path: values.path,
+      focus: values.focus,
+      files: values.files,
+      class: values.class,
+      under: values.under,
+      line: values.line,
+      message: values.message,
+      condition: values.condition,
+      parent: values.parent,
+      player: values.player,
+      players: values.players,
     },
   };
 }
@@ -239,11 +291,16 @@ Studio (through the ${info.appName} plugin; the code goes as --code=<luau> or --
                             prints what it printed and what it returned
   eval-client [place]       The same in the play client
   exec [place]              Luau in the edit plugin (Studio in edit mode)
-  playtest start|stop|status [place] [--run]   A solo play (--run: Run mode, no client);
-                            stop returns once Studio is back in edit mode
+  playtest start|stop|status [place] [--run] [--players <n>]   A solo play (--run: Run mode, no
+                            client), or a multiplayer test with n players (Studio's Local Server);
+                            stop returns once Studio is back in edit mode. In a multiplayer test,
+                            --player <name> on any client command picks the player's client
   output [place] [--cursor <n>] [--tail <n>] [--filter <text>] [--peer server|client]
                             The play's output; the cursor it prints reads only what came after
-  screenshot [place] [--out <file.png>]   The viewport (the play client's while one runs)
+  screenshot [place] [--out <file.png>] [--width <px>] [--focus <path>]
+                            The viewport (the play client's while one runs); --focus on a GUI
+                            object keeps only its part of the screen, on a part or model points
+                            the camera at it for the capture
   key <KeyCode> [place] [--action tap|press|release] [--duration <s>] | key [place] --text=<text>
                             A key to the play client (edit mode when no play runs)
   device [place] [--id <device>] [--orientation <o>] [--resolution <w>x<h>] [--density <n>]
@@ -259,6 +316,30 @@ Studio (through the ${info.appName} plugin; the code goes as --code=<luau> or --
   record [place] [--seconds <s>] [--fps <n>] [--width <px>] [--out <file.gif>]
                             A GIF of the play view (default 3 s at 5 fps, 640 px wide; at most
                             15 s and 10 fps) and a contact sheet PNG of its frames
+  gui [path] [place] [--depth <n>] [--limit <n>] [--hidden]
+                            A GUI's tree as the player sees it (default PlayerGui in a play,
+                            StarterGui in edit): class, text, image, place, hidden by what,
+                            whether a button takes a click; deeper or hidden parts are counted
+  verify [place] [--files <a,b>]   Whether Studio holds each synced script's disk text, in its
+                            .Source and in an open tab (the text a play copies); the files
+                            are paths from the sync folder (default every script)
+  logpoint add|remove <file> | --path=<path> --line <n> [place] [--message=<luau values>] [--condition=<luau>]
+  logpoint list|clear [place]
+                            A script line that prints values each time it runs in the play, with
+                            no edit to the script (needs Studio's beta "Studio Debugger Luau API")
+  export <path>[,<path>...] [place] [--out <file.rbxm>]   Instances saved as an .rbxm file
+  import <file.rbxm> [place] [--parent <path>]   An .rbxm's instances put in the place (edit
+                            mode, default under Workspace); their scripts sync to disk
+  perf [place] [--seconds <s>] [--peer server|client]
+                            A few seconds of the play's performance in both peers: fps, frame
+                            times p50 / p90 / p99 / max, hitches over 50 ms, memory by tag
+  find [place] [--name <pattern>] [--class <A,B>] [--under <path>] [--limit <n>]
+                            Instances of the synced tree (edit mode, as of the last sync) by
+                            name (* and ?), class and where; scripts with their file
+  mouse <x> <y> [place] | mouse --path=<path> [place] [--action click|double|down|up]
+        [--button left|right|middle] [--space screen]
+                            The play client's mouse at a point on the last screenshot (or the
+                            screen's own pixels), or at a GuiObject's or a part's center
 
 Studio queue (one per place: test jobs, the Studio lock and who waits for it)
   queue [place]             Who holds Studio and for how long, who waits (level, wait), the jobs
@@ -308,10 +389,16 @@ export async function runControl(argv: string[], ctx: ControlContext): Promise<n
     ctx.out(helpText(ctx.info));
     return EXIT.ok;
   }
+  const notes: string[] = [];
+  NOTES.set(ctx, notes);
+  if (options.player !== undefined) PLAYER.set(ctx, options.player);
   try {
     const mutates = MUTATING.has(command) || (command === "ai" && args.length > 0);
     if (mutates && ctx.info.flavor === "official") await confirmOfficial(ctx, options, `${command} ${args.join(" ")}`.trim());
-    return await dispatch(command, args, options, ctx);
+    const code = await dispatch(command, args, options, ctx);
+    // After the command's own answer; --json carries them in its body instead
+    if (!options.json) for (const note of notes) ctx.out(note);
+    return code;
   } catch (error) {
     if (error instanceof Done) return error.code;
     if (options.json) ctx.out(JSON.stringify({ error: (error as Error).message }));
@@ -488,6 +575,22 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
       return record(ctx, options, args[0]);
     case "queue":
       return queue(ctx, options, args);
+    case "gui":
+      return gui(ctx, options, args);
+    case "mouse":
+      return mouse(ctx, options, args);
+    case "verify":
+      return verifySync(ctx, options, args[0]);
+    case "perf":
+      return perf(ctx, options, args[0]);
+    case "logpoint":
+      return logpoint(ctx, options, args);
+    case "export":
+      return exportRbxm(ctx, options, args);
+    case "import":
+      return importRbxm(ctx, options, args);
+    case "find":
+      return findInstances(ctx, options, args[0]);
   }
   throw new UsageError(`unknown command ${command}. Run ${ctx.info.command} --help.`);
 }
@@ -972,7 +1075,10 @@ async function play(ctx: ControlContext, options: Options, query: string | undef
  */
 async function studio(ctx: ControlContext, place: Place, tool: string, args: Record<string, unknown>, waitMs = 60_000): Promise<any> {
   try {
-    return (await ctx.client.post("/api/studio", { placeId: place.placeId, tool, args }, waitMs + 40_000)).result;
+    const player = PLAYER.get(ctx);
+    const result = (await ctx.client.post("/api/studio", { placeId: place.placeId, tool, args: { ...args, caller: ctx.caller ?? "cli", ...(player ? { player } : {}) } }, waitMs + 40_000)).result;
+    if ((Array.isArray(result?.newErrors) && result.newErrors.length) || result?.repeatedErrors) NOTES.get(ctx)?.push(newErrorsText(result.newErrors ?? [], result.repeatedErrors));
+    return result;
   } catch (error) {
     if (error instanceof HubError && error.status === 404 && error.message === "not found") {
       throw new Error(`The hub is older than this command: restart it (${ctx.info.command} restart-hub).`);
@@ -983,6 +1089,20 @@ async function studio(ctx: ControlContext, place: Place, tool: string, args: Rec
     if (error instanceof HubError) throw new Error(`${placeLabel(place)}: ${error.message}`);
     throw error;
   }
+}
+
+/** Lines a command prints after its own answer (the play's new errors), per call */
+const NOTES = new WeakMap<ControlContext, string[]>();
+/** --player: the client a multiplayer test's call goes to */
+const PLAYER = new WeakMap<ControlContext, string>();
+
+/** The play errors logged since the caller's previous Studio call, one line each */
+export function newErrorsText(errors: { source: string; message: string; count: number; at?: string }[], repeated = 0): string {
+  const again = repeated ? `${repeated} more of errors shown before` : "";
+  if (!errors.length) return `The play logged ${again} since the last call.`;
+  const lines = errors.map((e) => `  [${e.source}] ${e.message}${e.at && !e.message.includes(e.at) ? ` (at ${e.at})` : ""}${e.count > 1 ? ` (x${e.count})` : ""}`);
+  if (again) lines.push(`  (and ${again})`);
+  return [`New error${errors.length === 1 && errors[0].count === 1 ? "" : "s"} in the play since the last call (get_runtime_logs has the rest of each):`, ...lines].join("\n");
 }
 
 function luauCode(ctx: ControlContext, options: Options): string {
@@ -1027,7 +1147,8 @@ async function playtest(ctx: ControlContext, options: Options, action: string | 
   if (action !== "start" && action !== "stop" && action !== "status") throw new UsageError("usage: playtest start|stop|status [place] [--run]");
   const place = await resolvePlace(ctx, query);
   const timeoutMs = options.timeout === undefined ? undefined : options.timeout * 1000;
-  const result = await studio(ctx, place, "playtest", { action, ...(action === "start" ? { mode: options.run ? "run" : "play" } : {}), ...(timeoutMs ? { timeoutMs } : {}) }, timeoutMs ?? 60_000);
+  const players = action === "start" ? positiveInt(options.players, "players") : undefined;
+  const result = await studio(ctx, place, "playtest", { action, ...(action === "start" ? { mode: options.run ? "run" : "play" } : {}), ...(players ? { players } : {}), ...(timeoutMs ? { timeoutMs } : {}) }, timeoutMs ?? (players ? 120_000 : 60_000));
   if (options.json) {
     ctx.out(JSON.stringify(result, null, 2));
     return EXIT.ok;
@@ -1038,7 +1159,8 @@ async function playtest(ctx: ControlContext, options: Options, action: string | 
     else ctx.out(`${placeLabel(place)}: a play is running (server: ${result.server}, client: ${result.client}).`);
     return EXIT.ok;
   }
-  if (action === "start") ctx.out(`${placeLabel(place)}: the ${result.mode === "run" ? "Run-mode " : ""}play is running, server${result.mode === "run" ? "" : " and client"} connected in ${result.ms} ms.`);
+  if (action === "start" && Array.isArray(result.players)) ctx.out(`${placeLabel(place)}: the multiplayer test is running, server and ${result.players.join(", ")} connected in ${result.ms} ms (--player <name> picks a client).`);
+  else if (action === "start") ctx.out(`${placeLabel(place)}: the ${result.mode === "run" ? "Run-mode " : ""}play is running, server${result.mode === "run" ? "" : " and client"} connected in ${result.ms} ms.`);
   else ctx.out(`${placeLabel(place)}: the play stopped and Studio is back in edit mode (${result.ms} ms).`);
   return EXIT.ok;
 }
@@ -1073,7 +1195,7 @@ async function output(ctx: ControlContext, options: Options, query: string | und
 
 async function screenshot(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
   const place = await resolvePlace(ctx, query);
-  const result = await studio(ctx, place, "screenshot", {}, 40_000);
+  const result = await studio(ctx, place, "screenshot", { focus: options.focus, width: positiveInt(options.width, "width") }, 40_000);
   if (options.out) {
     const target = path.resolve(ctx.cwd, options.out);
     fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -1084,8 +1206,9 @@ async function screenshot(ctx: ControlContext, options: Options, query: string |
     ctx.out(JSON.stringify(result, null, 2));
     return EXIT.ok;
   }
-  const scaled = result.width !== result.nativeWidth ? `, scaled down from ${result.nativeWidth}x${result.nativeHeight}` : "";
-  ctx.out(`Screenshot of ${result.peer === "client" ? "the play client" : "Studio in edit mode"}: ${result.width}x${result.height}${scaled}, ${(result.bytes / 1024).toFixed(0)} KB PNG, ${result.ms} ms`);
+  const scaled = !result.crop && result.width !== result.nativeWidth ? `, scaled down from ${result.nativeWidth}x${result.nativeHeight}` : "";
+  const focused = result.focus ? ` (${result.crop ? "cropped to" : "camera on"} ${result.focus})` : "";
+  ctx.out(`Screenshot of ${result.peer === "client" ? "the play client" : "Studio in edit mode"}${focused}: ${result.width}x${result.height}${scaled}, ${(result.bytes / 1024).toFixed(0)} KB PNG, ${result.ms} ms`);
   ctx.out(result.file);
   return EXIT.ok;
 }
@@ -1151,6 +1274,219 @@ export function clickSummary(result: any): string {
     ? "selected it and pressed Return"
     : `clicked at (${result.x}, ${result.y}) on a ${result.screen?.width}x${result.screen?.height} screen`;
   return `${result.path}: ${how}; ${signals} fired (${result.ms} ms).`;
+}
+
+/** The tree of the gui command, one line an object, indented by depth */
+export function guiText(result: any): string {
+  const lines: string[] = [];
+  const screen = result.screen ? `, screen ${result.screen.width}x${result.screen.height}` : "";
+  lines.push(`${result.root} (${result.peer === "edit" ? "edit mode" : "the play client"}${screen}; positions in GUI pixels, below the top bar)`);
+  for (const node of result.nodes ?? []) {
+    const parts = [`${"  ".repeat(node.d)}${node.n} [${node.c}]`];
+    if (typeof node.t === "string") parts.push(JSON.stringify(node.t));
+    if (node.img) parts.push(`img ${node.img}`);
+    if (Array.isArray(node.r)) parts.push(`at ${node.r[0]},${node.r[1]} ${node.r[2]}x${node.r[3]}`);
+    if (node.off) parts.push(`hidden (${node.off})`);
+    else if (node.btn === true) parts.push("clickable");
+    else if (typeof node.btn === "string" && node.btn !== "hidden") parts.push(`not clickable: ${node.btn}`);
+    if (Array.isArray(node.scroll) && (node.scroll[0] || node.scroll[1])) parts.push(`scrolled to ${node.scroll[0]},${node.scroll[1]}`);
+    if (node.m) parts.push(`{${node.m}}`);
+    if (node.more) parts.push(`+${node.more} inside`);
+    lines.push(parts.join("  "));
+  }
+  if (result.truncated) lines.push(`(stopped at ${result.nodes.length} objects: a higher limit, or a deeper path)`);
+  return lines.join("\n");
+}
+
+async function gui(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  // gui [path] [place]: an argument with a dot, or a GUI root's name, is a path; else a place
+  const looksLikePath = (value: string | undefined) => value !== undefined && /[.]|^(PlayerGui|StarterGui)$/.test(value);
+  // A place name with a dot in it stays a place: the argument is a path only when no place answers to it
+  let positional = options.path === undefined && looksLikePath(args[0]) ? args[0] : undefined;
+  if (positional !== undefined && args[1] === undefined) {
+    const isPlace = await resolvePlace(ctx, positional).then(() => true, () => false);
+    if (isPlace) positional = undefined;
+  }
+  const target = options.path ?? positional;
+  const place = await resolvePlace(ctx, positional === undefined ? args[0] : args[1]);
+  const result = await studio(ctx, place, "gui", { path: target, depth: wholeOption(options.depth, "depth"), limit: positiveInt(options.limit, "limit"), hidden: options.hidden }, 20_000);
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  ctx.out(guiText(result));
+  return EXIT.ok;
+}
+
+function wholeOption(value: string | undefined, name: string): number | undefined {
+  if (value === undefined) return undefined;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0) throw new UsageError(`--${name} must be a whole number, 0 or more`);
+  return n;
+}
+
+/** One line on a mouse press: where it went and what was under it */
+export function mouseSummary(result: any): string {
+  const what = result.action === "double" ? "double-clicked" : result.action === "down" ? "pressed" : result.action === "up" ? "released" : "clicked";
+  const target = result.target ? ` ${result.target}` : "";
+  const under = [result.under ? `GUI under it: ${result.under}` : "no GUI under it", result.hit ? `world: ${result.hit}` : ""].filter(Boolean).join("; ");
+  const button = result.button && result.button !== "left" ? `${result.button} button ` : "";
+  return `${button}${what}${target} at (${result.x}, ${result.y}) on the ${result.screen?.width}x${result.screen?.height} screen (GUI ${result.gui?.x},${result.gui?.y}); ${under} (${result.ms} ms).`;
+}
+
+async function mouse(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  let x: number | undefined;
+  let y: number | undefined;
+  let rest = args;
+  if (options.path === undefined) {
+    x = Number(need(args[0], "mouse <x> <y> [place] | mouse --path=<path> [place]"));
+    y = Number(need(args[1], "mouse <x> <y> [place]"));
+    if (!Number.isFinite(x) || !Number.isFinite(y)) throw new UsageError("x and y must be numbers (pixels on the last screenshot)");
+    rest = args.slice(2);
+  }
+  if (options.space !== undefined && options.space !== "screen" && options.space !== "screenshot") throw new UsageError("--space must be screenshot or screen");
+  const place = await resolvePlace(ctx, rest[0]);
+  const result = await studio(ctx, place, "mouse", { x, y, path: options.path, action: options.action, button: options.button, space: options.space }, 15_000);
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  ctx.out(mouseSummary(result));
+  return EXIT.ok;
+}
+
+/** verify's answer: a line per script that differs, then the count */
+export function verifyText(result: any): string {
+  const how: Record<string, string> = {
+    source: "Studio's .Source is not the disk's text",
+    tab: "the .Source matches, but an open tab in Studio holds other text (a play copies the tab's)",
+    both: "neither the .Source nor the open tab is the disk's text",
+    missing: "its instance is gone from Studio",
+    unreadable: "Studio could not read its Source",
+  };
+  const lines: string[] = [];
+  for (const d of result.differ ?? []) {
+    const sizes = d.diskLen !== undefined ? ` (disk ${d.diskLen} bytes, Studio ${d.studioLen}${d.tabLen !== undefined ? `, tab ${d.tabLen}` : ""})` : "";
+    lines.push(`${d.file}: ${how[d.state] ?? d.state}${sizes}${d.error ? `: ${d.error}` : ""}`);
+  }
+  for (const file of result.unmapped ?? []) lines.push(`${file}: no instance in Studio (wait --fix sends its create again)`);
+  for (const file of result.unreadable ?? []) lines.push(`${file}: could not be read from disk`);
+  const problems = (result.differ?.length ?? 0) + (result.unmapped?.length ?? 0) + (result.unreadable?.length ?? 0);
+  lines.push(problems
+    ? `${result.same} of ${result.checked} scripts match the disk; ${problems} do not (${result.ms} ms).`
+    : `All ${result.checked} scripts in Studio match the disk (${result.ms} ms).`);
+  return lines.join("\n");
+}
+
+async function verifySync(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  const place = await resolvePlace(ctx, query);
+  const files = options.files === undefined ? undefined : options.files.split(",").map((f) => f.trim()).filter(Boolean);
+  const result = await studio(ctx, place, "verify", { ...(files?.length ? { files } : {}) }, 150_000);
+  const ok = !result.differ?.length && !result.unmapped?.length && !result.unreadable?.length;
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return ok ? EXIT.ok : EXIT.error;
+  }
+  ctx.out(verifyText(result));
+  return ok ? EXIT.ok : EXIT.error;
+}
+
+/** perf's answer: two lines a peer */
+export function perfText(result: any): string {
+  const lines: string[] = [];
+  for (const peer of ["server", "client"]) {
+    const p = result[peer];
+    if (!p) continue;
+    const f = p.frameMs ?? {};
+    const physics = p.physicsFps !== undefined ? `, physics ${p.physicsFps} fps` : "";
+    lines.push(`${peer}: ${p.fps} ${p.signal === "Heartbeat" ? "heartbeats" : "frames"} a second over ${p.seconds} s${physics}; frame ms p50 ${f.p50}, p90 ${f.p90}, p99 ${f.p99}, max ${f.max}; ${p.hitches} over 50 ms${p.warning ? ` (${p.warning})` : ""}`);
+    const tags = (p.memoryTags ?? []).slice(0, 5).map((t: any) => `${t.tag} ${t.mb}`).join(", ");
+    const net = p.stats?.DataReceiveKbps !== undefined ? `; receive ${p.stats.DataReceiveKbps} kbps, send ${p.stats.DataSendKbps}` : "";
+    lines.push(`  memory ${p.memoryMb} MB (${p.memoryChangeMb >= 0 ? "+" : ""}${p.memoryChangeMb} during)${tags ? `: ${tags}` : ""}; ${p.stats?.InstanceCount ?? "?"} instances${net}`);
+  }
+  if (result.note) lines.push(`(${result.note})`);
+  return lines.join("\n");
+}
+
+async function perf(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  const seconds = secondsOption(options.seconds, "seconds") ?? 3;
+  if (options.peer !== undefined && options.peer !== "server" && options.peer !== "client") throw new UsageError("--peer must be server or client");
+  const place = await resolvePlace(ctx, query);
+  const result = await studio(ctx, place, "perf", { seconds, peer: options.peer }, seconds * 1000 + 20_000);
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  ctx.out(perfText(result));
+  return EXIT.ok;
+}
+
+async function logpoint(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const action = need(args[0], "logpoint add|remove|list|clear ...");
+  if (!["add", "remove", "list", "clear"].includes(action)) throw new UsageError("logpoint add|remove <file or path> --line <n> [place], or logpoint list|clear [place]");
+  const needsScript = action === "add" || action === "remove";
+  // The script: a file from the sync folder as the argument, or --path=<instance path>
+  const file = needsScript && options.path === undefined ? need(args[1], `logpoint ${action} <file> --line <n> [place], or --path=<instance path>`) : undefined;
+  const place = await resolvePlace(ctx, file !== undefined ? args[2] : args[1]);
+  const line = needsScript ? positiveInt(need(options.line, "--line <n>"), "line") : undefined;
+  const result = await studio(ctx, place, "logpoint", {
+    action, line, message: options.message, condition: options.condition,
+    ...(file !== undefined ? { file } : needsScript ? { path: options.path } : {}),
+  }, 20_000);
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  if (action === "list") {
+    for (const lp of result.logpoints ?? []) ctx.out(`${lp.path}:${lp.line}${lp.message ? `  ${lp.message}` : ""}${lp.condition ? `  if ${lp.condition}` : ""}`);
+    if (!result.logpoints?.length) ctx.out("No logpoints set (by this plugin since Studio opened).");
+  } else if (action === "clear") ctx.out(`Removed ${result.removed} logpoint(s).`);
+  else if (action === "remove") ctx.out(`Removed the logpoint at ${result.path}:${result.line}.`);
+  else {
+    const moved = result.requestedLine ? ` (Studio moved it from line ${result.requestedLine})` : "";
+    ctx.out(`Logpoint at ${result.path}:${result.line}${moved}: its lines show in the play's output as "[logpoint ...]".${result.note ? ` Studio: ${result.note}` : ""}`);
+  }
+  return EXIT.ok;
+}
+
+async function exportRbxm(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const paths = need(args[0], "export <path>[,<path>...] [place] [--out <file.rbxm>]").split(",").map((p) => p.trim()).filter(Boolean);
+  const place = await resolvePlace(ctx, args[1]);
+  if (options.out !== undefined && !/\.rbxm$/i.test(options.out)) throw new UsageError("--out must be an .rbxm file");
+  const result = await studio(ctx, place, "exportRbxm", { paths, ...(options.out ? { out: path.resolve(ctx.cwd, options.out) } : {}) }, 130_000);
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  ctx.out(`Saved ${result.instances.join(", ")} as ${(result.bytes / 1024).toFixed(0)} KB (${result.ms} ms):`);
+  ctx.out(result.file);
+  return EXIT.ok;
+}
+
+async function importRbxm(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const file = path.resolve(ctx.cwd, need(args[0], "import <file.rbxm> [place] [--parent <path>]"));
+  const place = await resolvePlace(ctx, args[1]);
+  const result = await studio(ctx, place, "importRbxm", { file, parent: options.parent }, 130_000);
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  ctx.out(`Put ${result.placed.join(", ")} in the place${result.scripts ? `; its ${result.scripts} script(s) sync to disk` : ""} (${result.ms} ms).`);
+  return EXIT.ok;
+}
+
+async function findInstances(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  const place = await resolvePlace(ctx, query);
+  const limit = positiveInt(options.limit, "limit");
+  const result = await studio(ctx, place, "find", { name: options.name, className: options.class, under: options.under, ...(limit ? { limit } : {}) }, 30_000);
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  for (const f of result.found) ctx.out(`${f.path} [${f.className}]${f.file ? `  ${f.file}` : ""}`);
+  const more = result.total > result.found.length ? `, the first ${result.found.length} shown (--limit for more)` : "";
+  ctx.out(`${result.total} found among ${result.scanned} instances${more}${result.studioConnected ? "" : "; Studio is not connected, so this is the tree as last synced"} (${result.ms} ms).`);
+  return EXIT.ok;
 }
 
 function secondsOption(value: string | undefined, name: string): number | undefined {

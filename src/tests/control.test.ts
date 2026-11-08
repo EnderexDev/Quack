@@ -429,7 +429,7 @@ function mcpSession(port: number, cwd = os.tmpdir()) {
 }
 
 /** The eight Studio calls an AI makes most (a month of chrrxs use, 08/11/26), by the same names, then a click by path, a wait and a recording */
-const STUDIO_TOOLS = ["eval_server_runtime", "eval_client_runtime", "execute_luau", "solo_playtest", "capture_screenshot", "get_runtime_logs", "simulate_keyboard_input", "set_device_simulator", "click_gui", "wait_for", "record"];
+const STUDIO_TOOLS = ["eval_server_runtime", "eval_client_runtime", "execute_luau", "solo_playtest", "capture_screenshot", "get_runtime_logs", "simulate_keyboard_input", "set_device_simulator", "click_gui", "wait_for", "record", "inspect_gui", "verify_sync", "perf_sample", "set_logpoint", "export_rbxm", "import_rbxm", "find_instances", "simulate_mouse_input"];
 
 test("mcp: initialize carries the instructions, and the tools are the reading ones, wait, play and the Studio tools", { timeout: 15000 }, async () => {
   const mcp = mcpSession(await freePort());
@@ -673,10 +673,20 @@ test("Studio tools: the terminal and the MCP reach the play peers and edit mode 
       }
       if (tool === "captureBegin") return { contentId: "rbxtemp://1" };
       if (tool === "captureRead") return { width: 2, height: 2, data: pixels.toString("base64") };
+      if (tool === "gui") return { root: args.path ?? "StarterGui", nodes: [], truncated: false };
       throw new Error(`${tool} is not faked`);
     });
     const run = control(port, { cwd: path.join(folders["111"], "sync") });
     await waitFor(async () => (await run("status", "--json")).json().sessions[0]?.instances === 3);
+
+    // gui: a dotted argument no place answers to is the path; a place's name is the place
+    const byPath = await run("gui", "StarterGui.Shop");
+    assert.equal(byPath.code, 0, byPath.err);
+    assert.match(byPath.out, /^StarterGui\.Shop \(edit mode/);
+    const byPlace = await run("gui", "alpha", "--json");
+    assert.equal(byPlace.code, 0, byPlace.err);
+    assert.equal(byPlace.json().root, "StarterGui");
+    assert.match((await run("gui", "StarterGui.Shop", "beta")).err, /Beta Game \(222\)/, "path then place: the place named, not the folder's");
 
     const exec = await run("exec", "--code=return 1");
     assert.equal(exec.code, 0, exec.err);

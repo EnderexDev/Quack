@@ -22,6 +22,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2.12", features = ["json"], default-features = false }
 
+# Dev builds (cargo build, tauri dev, cargo test): line numbers only for this crate, so panics
+# and backtraces still name file:line, and no debug info for dependencies. Writing and linking
+# full debug info was half of every rebuild: Quackify's one-line rebuild went from 16.9 s to
+# 8.8 s and its clean build from 87 s to 59 s (measured 08/11/26). Release is untouched.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 codegen-units = 1
 lto = true
