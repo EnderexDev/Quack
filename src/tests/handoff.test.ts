@@ -329,6 +329,12 @@ test("restarting with the daemons: the successor starts from the old daemon's tr
     assert.notEqual(newPid, oldPid, "a new daemon");
     await waitFor(() => !isAlive(oldPid), 5000);
     assert.equal(snapshots(), 1, "no second snapshot: the Studio resumed");
+    // `quack wait` needs a sync newer than the connection; a resume is that sync (08/11/26:
+    // without it every wait on the resumed Anime Astral said "kept syncing")
+    await waitFor(() => {
+      const s = sessionOf(second!);
+      return s?.syncedAt != null && s.studioSince != null && s.syncedAt >= s.studioSince;
+    }, 10000);
     assert.ok(logs.some((l) => /was asked to restart; replacing it/.test(l)), logs.join("\n"));
     assert.equal(fs.readdirSync(path.join(folder, ".quack")).some((f) => f.startsWith("handoff-")), false, "the handoff file is gone");
     const daemonLog = fs.readFileSync(path.join(folder, ".quack", "daemon.log"), "utf8");

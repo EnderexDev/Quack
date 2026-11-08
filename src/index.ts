@@ -630,6 +630,10 @@ export class SyncDaemon {
       // Nor did the disk create, delete or move anything Studio missed (that needs a snapshot)
       if (info.resume && info.session && !this.snapshotRefused && this.lastSync?.session === info.session && this.ipc.canResume()) {
         log.info("Studio resumed its session: no snapshot needed");
+        // The tree is in step with this Studio from now on, as after a snapshot. `quack wait`
+        // waits for a sync newer than the connection, and a resume sends none: on 08/11/26 a
+        // resumed Anime Astral kept every wait at "kept syncing" for hours, 147 ms behind
+        this.lastSync!.at = Date.now();
         return true;
       }
       // Paths rebuilt here from each parent's: a smaller snapshot to send, encode and parse
