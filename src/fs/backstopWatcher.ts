@@ -36,10 +36,23 @@ export type BackstopSubscribe = (
   ignorePaths: string[],
 ) => Promise<BackstopSubscription>;
 
-interface ParcelBinding {
-  subscribe(dir: string, fn: BackstopCallback, opts: { ignorePaths?: string[] }): Promise<void>;
-  unsubscribe(dir: string, fn: BackstopCallback, opts: { ignorePaths?: string[] }): Promise<void>;
+interface ParcelOptions {
+  ignorePaths?: string[];
+  backend?: string;
 }
+
+interface ParcelBinding {
+  subscribe(dir: string, fn: BackstopCallback, opts: ParcelOptions): Promise<void>;
+  unsubscribe(dir: string, fn: BackstopCallback, opts: ParcelOptions): Promise<void>;
+}
+
+/**
+ * Always the Windows backend. The default first asks whether Watchman exists by running
+ * `watchman` through `cmd.exe` (popen): in a daemon, which has no console, that cmd opened a
+ * Terminal window, left open because it exits with an error without Watchman. One per daemon
+ * start: 46 windows in one test run (08/11/26).
+ */
+export const PARCEL_OPTIONS = { backend: "windows" } as const;
 
 const PACKAGE = "@parcel/watcher-win32-x64";
 /** The name bundle-hub.mjs gives the binary next to daemon.mjs */
@@ -118,7 +131,7 @@ export function loadBackstop(
   const loadedFrom = copyForLoading(binary, copyDir);
   const binding = require(loadedFrom) as ParcelBinding;
   const subscribe: BackstopSubscribe = async (dir, callback, ignorePaths) => {
-    const opts = { ignorePaths };
+    const opts: ParcelOptions = { ignorePaths, ...PARCEL_OPTIONS };
     await binding.subscribe(dir, callback, opts);
     return { unsubscribe: () => binding.unsubscribe(dir, callback, opts) };
   };

@@ -357,3 +357,34 @@ test("the loaded copy is reused only when every byte is the shipped one, and a r
     fs.rmSync(scratch, { recursive: true, force: true });
   }
 });
+
+test("the backstop never asks for Watchman, whose check opened a Terminal window per daemon", { skip: process.platform !== "win32" || process.arch !== "x64" }, async () => {
+  // A fake watchman on PATH that leaves a mark when run. Parcel's default backend runs it
+  // through cmd.exe (popen) to see whether Watchman is there; in a daemon, which has no
+  // console, that cmd opened a Terminal window left open by its error exit
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "quack-watchman-"));
+  try {
+    const bin = path.join(scratch, "bin");
+    fs.mkdirSync(bin);
+    const mark = path.join(scratch, "ran.txt");
+    fs.writeFileSync(path.join(bin, "watchman.cmd"), `@echo ran> "${mark}"\r\n@exit /b 1\r\n`);
+    const watched = path.join(scratch, "sync");
+    fs.mkdirSync(watched);
+    const module = new URL("../fs/backstopWatcher.js", import.meta.url).href;
+    const script = `
+      const { loadBackstop } = await import(${JSON.stringify(module)});
+      const backstop = loadBackstop(undefined, ${JSON.stringify(path.join(scratch, "native"))});
+      const subscription = await backstop.subscribe(${JSON.stringify(watched)}, () => {}, []);
+      await subscription.unsubscribe();
+    `;
+    const { execFileSync } = await import("node:child_process");
+    execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      env: { ...process.env, PATH: `${bin};${process.env.PATH}` },
+      windowsHide: true,
+      stdio: "ignore",
+    });
+    assert.equal(fs.existsSync(mark), false, "watchman was run");
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
