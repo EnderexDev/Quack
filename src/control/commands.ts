@@ -64,6 +64,25 @@ interface Options {
   /** play: the worktrees to play (default: the folder you are in); several share one play */
   worktrees: string[];
   help: boolean;
+  /** The Studio tools (eval-server, exec, key, device...): their own values, given as --name=value */
+  code?: string;
+  file?: string;
+  out?: string;
+  cursor?: string;
+  tail?: string;
+  filter?: string;
+  peer?: string;
+  text?: string;
+  action?: string;
+  duration?: string;
+  run: boolean;
+  id?: string;
+  orientation?: string;
+  resolution?: string;
+  density?: string;
+  scaling?: string;
+  stop: boolean;
+  list: boolean;
 }
 
 function parse(argv: string[]): { command?: string; args: string[]; options: Options } {
@@ -87,6 +106,24 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       daemons: { type: "boolean" },
       worktree: { type: "string", short: "w", multiple: true },
       help: { type: "boolean", short: "h" },
+      code: { type: "string" },
+      file: { type: "string" },
+      out: { type: "string" },
+      cursor: { type: "string" },
+      tail: { type: "string" },
+      filter: { type: "string" },
+      peer: { type: "string" },
+      text: { type: "string" },
+      action: { type: "string" },
+      duration: { type: "string" },
+      run: { type: "boolean" },
+      id: { type: "string" },
+      orientation: { type: "string" },
+      resolution: { type: "string" },
+      density: { type: "string" },
+      scaling: { type: "string" },
+      stop: { type: "boolean" },
+      list: { type: "boolean" },
     },
   });
   const number = (name: "idle" | "timeout"): number | undefined => {
@@ -115,6 +152,24 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       daemons: values.daemons === true,
       worktrees: values.worktree ?? [],
       help: values.help === true,
+      code: values.code,
+      file: values.file,
+      out: values.out,
+      cursor: values.cursor,
+      tail: values.tail,
+      filter: values.filter,
+      peer: values.peer,
+      text: values.text,
+      action: values.action,
+      duration: values.duration,
+      run: values.run === true,
+      id: values.id,
+      orientation: values.orientation,
+      resolution: values.resolution,
+      density: values.density,
+      scaling: values.scaling,
+      stop: values.stop === true,
+      list: values.list === true,
     },
   };
 }
@@ -153,6 +208,21 @@ Play
       -w <a> -w <b>           several worktrees in one play, when no two change the same
                             script; the check answers for each one
 
+Studio (through the ${info.appName} plugin; the code goes as --code=<luau> or --file <path>)
+  eval-server [place]       Luau in the play server's game VM, with the game's require cache;
+                            prints what it printed and what it returned
+  eval-client [place]       The same in the play client
+  exec [place]              Luau in the edit plugin (Studio in edit mode)
+  playtest start|stop|status [place] [--run]   A solo play (--run: Run mode, no client);
+                            stop returns once Studio is back in edit mode
+  output [place] [--cursor <n>] [--tail <n>] [--filter <text>] [--peer server|client]
+                            The play's output; the cursor it prints reads only what came after
+  screenshot [place] [--out <file.png>]   The viewport (the play client's while one runs)
+  key <KeyCode> [place] [--action tap|press|release] [--duration <s>] | key [place] --text=<text>
+                            A key to the play client (edit mode when no play runs)
+  device [place] [--id <device>] [--orientation <o>] [--resolution <w>x<h>] [--density <n>]
+         [--scaling <mode>] [--stop] [--list]   The device simulator; no setting shows it
+
 Change${info.flavor === "official" ? " (each asks first; --yes to skip, required without a terminal)" : ""}
   pause | resume            Stop every daemon and turn Studios away / allow them again
   register <placeId> [folder] [--name <name>]   Link a folder (default: here) to a place
@@ -165,7 +235,8 @@ Change${info.flavor === "official" ? " (each asks first; --yes to skip, required
 
 AI
   mcp                       An MCP server on stdio for Claude Code, Cursor, Codex: status, wait, log,
-                            conflicts, doctor and play as tools, with how to use ${info.appName} as its instructions
+                            conflicts, doctor, play and the Studio commands as tools, with how
+                            to use ${info.appName} as its instructions
   ai-clients                Claude Code, Cursor and Codex on this computer, and whether each has the MCP
   connect-ai [claude|cursor|codex|<id>]...   Add the MCP to each one named (default: every one installed).
                             Every config folder counts: CLAUDE_CONFIG_DIR / CODEX_HOME, ~/.claude-*,
@@ -348,6 +419,20 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
     case "ai-clients":
     case "connect-ai":
       return aiClients(ctx, options, command === "connect-ai", args);
+    case "eval-server":
+    case "eval-client":
+    case "exec":
+      return runLuau(ctx, options, command, args[0]);
+    case "playtest":
+      return playtest(ctx, options, args[0], args[1]);
+    case "output":
+      return output(ctx, options, args[0]);
+    case "screenshot":
+      return screenshot(ctx, options, args[0]);
+    case "key":
+      return key(ctx, options, args);
+    case "device":
+      return device(ctx, options, args[0]);
   }
   throw new UsageError(`unknown command ${command}. Run ${ctx.info.command} --help.`);
 }
@@ -824,4 +909,169 @@ async function play(ctx: ControlContext, options: Options, query: string | undef
   // Several worktrees: ok only when every one of them is in the play
   if (several && !(Array.isArray(state.worktrees) && state.worktrees.length === list.length)) return EXIT.error;
   return state.verify.ok ? EXIT.ok : EXIT.error;
+}
+
+/**
+ * One Studio tool call through the hub (`/api/studio`), answered by the place's daemon once
+ * Studio has. `waitMs` is how long the tool itself may take; the hub and daemon add their margin.
+ */
+async function studio(ctx: ControlContext, place: Place, tool: string, args: Record<string, unknown>, waitMs = 60_000): Promise<any> {
+  try {
+    return (await ctx.client.post("/api/studio", { placeId: place.placeId, tool, args }, waitMs + 40_000)).result;
+  } catch (error) {
+    if (error instanceof HubError && error.status === 404 && error.message === "not found") {
+      throw new Error(`The hub is older than this command: restart it (${ctx.info.command} restart-hub).`);
+    }
+    if (error instanceof HubError && /daemon answered 404|no Studio tools/.test(error.message)) {
+      throw new Error(`The daemon of ${placeLabel(place)} is older than this command: ${ctx.info.command} restart-hub --daemons.`);
+    }
+    if (error instanceof HubError) throw new Error(`${placeLabel(place)}: ${error.message}`);
+    throw error;
+  }
+}
+
+function luauCode(ctx: ControlContext, options: Options): string {
+  if (options.code !== undefined && options.file !== undefined) throw new UsageError("give --code or --file, not both");
+  if (options.file !== undefined) {
+    try {
+      return fs.readFileSync(path.resolve(ctx.cwd, options.file), "utf8");
+    } catch (error) {
+      throw new UsageError(`cannot read ${options.file}: ${(error as Error).message}`);
+    }
+  }
+  if (options.code === undefined || options.code.trim() === "") throw new UsageError("give the Luau as --code=<luau> or --file <path>");
+  return options.code;
+}
+
+const PEER_NAME: Record<string, string> = { server: "the play server", client: "the play client", edit: "the edit plugin" };
+
+/** eval-server, eval-client and exec: what the code printed, then what it returned or its error */
+async function runLuau(ctx: ControlContext, options: Options, command: string, query: string | undefined): Promise<number> {
+  const code = luauCode(ctx, options);
+  const place = await resolvePlace(ctx, query);
+  const timeoutMs = (options.timeout ?? 30) * 1000;
+  const result = command === "exec"
+    ? await studio(ctx, place, "exec", { code, timeoutMs }, timeoutMs)
+    : await studio(ctx, place, "eval", { code, peer: command === "eval-client" ? "client" : "server", timeoutMs }, timeoutMs);
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return result.ok ? EXIT.ok : EXIT.error;
+  }
+  for (const line of result.output ?? []) ctx.out(String(line));
+  if (result.ok) {
+    const values: string[] = result.values ?? [];
+    ctx.out(values.length ? `=> ${values.join(", ")}` : "=> (nothing returned)");
+    ctx.out(`(${result.ms} ms in ${PEER_NAME[result.peer] ?? result.peer})`);
+    return EXIT.ok;
+  }
+  ctx.err(`Luau error in ${PEER_NAME[result.peer] ?? result.peer}: ${result.error}`);
+  return EXIT.error;
+}
+
+async function playtest(ctx: ControlContext, options: Options, action: string | undefined, query: string | undefined): Promise<number> {
+  if (action !== "start" && action !== "stop" && action !== "status") throw new UsageError("usage: playtest start|stop|status [place] [--run]");
+  const place = await resolvePlace(ctx, query);
+  const timeoutMs = options.timeout === undefined ? undefined : options.timeout * 1000;
+  const result = await studio(ctx, place, "playtest", { action, ...(action === "start" ? { mode: options.run ? "run" : "play" } : {}), ...(timeoutMs ? { timeoutMs } : {}) }, timeoutMs ?? 60_000);
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  if (action === "status") {
+    if (!result.editConnected) ctx.out(`${placeLabel(place)}: Studio is not connected.`);
+    else if (!result.playing) ctx.out(`${placeLabel(place)}: no play is running.`);
+    else ctx.out(`${placeLabel(place)}: a play is running (server: ${result.server}, client: ${result.client}).`);
+    return EXIT.ok;
+  }
+  if (action === "start") ctx.out(`${placeLabel(place)}: the ${result.mode === "run" ? "Run-mode " : ""}play is running, server${result.mode === "run" ? "" : " and client"} connected in ${result.ms} ms.`);
+  else ctx.out(`${placeLabel(place)}: the play stopped and Studio is back in edit mode (${result.ms} ms).`);
+  return EXIT.ok;
+}
+
+function positiveInt(value: string | undefined, name: string): number | undefined {
+  if (value === undefined) return undefined;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n <= 0) throw new UsageError(`--${name} must be a whole number above 0`);
+  return n;
+}
+
+async function output(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  const place = await resolvePlace(ctx, query);
+  if (options.peer !== undefined && options.peer !== "server" && options.peer !== "client") throw new UsageError("--peer must be server or client");
+  if (options.cursor !== undefined && !/^\d+$/.test(options.cursor)) throw new UsageError("--cursor must be the number a previous read printed");
+  const result = await studio(ctx, place, "logs", { cursor: options.cursor, tail: positiveInt(options.tail, "tail"), filter: options.filter, peer: options.peer }, 5000);
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  if (result.dropped) ctx.out(`(${result.dropped} line(s) after the cursor were dropped from the buffer)`);
+  if (result.skipped) ctx.out(`(${result.skipped} earlier line(s) left out; --tail or a newer --cursor reads fewer)`);
+  const level: Record<string, string> = { MessageWarning: "WARN ", MessageError: "ERROR ", MessageInfo: "INFO " };
+  for (const e of result.entries) {
+    const time = new Date(e.t).toTimeString().slice(0, 8);
+    ctx.out(`${time} ${e.source === "quack" ? "" : `[${e.source}] `}${level[e.type] ?? ""}${String(e.message).replace(/\r?\n/g, "\n    ")}`);
+  }
+  if (!result.entries.length) ctx.out(result.playing ? "(nothing new)" : "(nothing new; no play is running)");
+  ctx.out(`cursor: ${result.cursor}`);
+  return EXIT.ok;
+}
+
+async function screenshot(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  const place = await resolvePlace(ctx, query);
+  const result = await studio(ctx, place, "screenshot", {}, 40_000);
+  if (options.out) {
+    const target = path.resolve(ctx.cwd, options.out);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(result.file, target);
+    result.file = target;
+  }
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  const scaled = result.width !== result.nativeWidth ? `, scaled down from ${result.nativeWidth}x${result.nativeHeight}` : "";
+  ctx.out(`Screenshot of ${result.peer === "client" ? "the play client" : "Studio in edit mode"}: ${result.width}x${result.height}${scaled}, ${(result.bytes / 1024).toFixed(0)} KB PNG, ${result.ms} ms`);
+  ctx.out(result.file);
+  return EXIT.ok;
+}
+
+async function key(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  // key <KeyCode> [place], or key [place] --text=<text>
+  const keyCode = options.text === undefined ? need(args[0], "key <KeyCode> [place] | key [place] --text=<text>") : undefined;
+  const place = await resolvePlace(ctx, options.text === undefined ? args[1] : args[0]);
+  const duration = options.duration === undefined ? undefined : Number(options.duration);
+  if (duration !== undefined && !Number.isFinite(duration)) throw new UsageError("--duration must be a number of seconds");
+  if (options.peer !== undefined && options.peer !== "client" && options.peer !== "edit") throw new UsageError("--peer must be client or edit");
+  const result = await studio(ctx, place, "key", { keyCode, text: options.text, action: options.action, duration, peer: options.peer }, 15_000 + (duration ?? 0) * 1000);
+  if (options.json) ctx.out(JSON.stringify(result, null, 2));
+  else ctx.out(`${options.text !== undefined ? `Typed ${JSON.stringify(options.text)}` : `${options.action ?? "tap"} ${keyCode}`}: sent to ${PEER_NAME[result.peer] ?? result.peer}.`);
+  return EXIT.ok;
+}
+
+async function device(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  const place = await resolvePlace(ctx, query);
+  let resolution: { width: number; height: number } | undefined;
+  if (options.resolution !== undefined) {
+    const match = /^(\d+)x(\d+)$/.exec(options.resolution);
+    if (!match) throw new UsageError("--resolution is <width>x<height>, e.g. 1920x1080");
+    resolution = { width: Number(match[1]), height: Number(match[2]) };
+  }
+  const density = options.density === undefined ? undefined : Number(options.density);
+  if (density !== undefined && !(density > 0)) throw new UsageError("--density must be a number above 0");
+  const result = await studio(ctx, place, "device", {
+    deviceId: options.id, orientation: options.orientation, scalingMode: options.scaling, resolution, pixelDensity: density,
+    stop: options.stop, list: options.list,
+  }, 20_000);
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  if (result.applied && Object.keys(result.applied).length) ctx.out(`Applied ${JSON.stringify(result.applied)}.`);
+  const state = result.after ?? result;
+  const resolutionText = state.resolution ? ` at ${state.resolution.width}x${state.resolution.height}` : "";
+  ctx.out(state.isSimulating
+    ? `Simulating ${state.activeDeviceId}${resolutionText}${state.orientation ? `, ${state.orientation}` : ""}${state.scalingMode ? `, ${state.scalingMode}` : ""}${state.pixelDensity ? `, density ${state.pixelDensity}` : ""}.`
+    : "The device simulator is off.");
+  if (Array.isArray(result.devices)) ctx.out(`Devices: ${result.devices.join(", ")}`);
+  return EXIT.ok;
 }

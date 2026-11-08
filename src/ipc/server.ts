@@ -2,7 +2,17 @@ import { WebSocketServer, WebSocket } from "ws";
 import { log } from "../util/log.js";
 import type { StudioMessage, DaemonMessage } from "./messages.js";
 import { isStudioOutputMessage } from "../studioOutput.js";
-import type { SnapshotRequestOptions, PlayVerifyMessage } from "./messages.js";
+import type { SnapshotRequestOptions, PlayVerifyMessage, ToolResultMessage, ToolRequestMessage, StudioOutputMessage } from "./messages.js";
+
+/** A play DataModel: Studio's solo play runs a server and a client, Run mode only a server */
+export type PlayRole = "server" | "client";
+/** Where a tool runs: the place in edit mode, or one of the play's peers */
+export type PeerRole = "edit" | PlayRole;
+
+function isToolResultMessage(value: unknown): value is ToolResultMessage {
+  const message = value as Partial<ToolResultMessage> | null;
+  return typeof message === "object" && message !== null && message.type === "toolResult" && typeof message.id === "string" && typeof message.ok === "boolean";
+}
 
 function isPlayVerifyMessage(value: unknown): value is PlayVerifyMessage {
   const message = value as Partial<PlayVerifyMessage> | null;
@@ -61,7 +71,11 @@ export class IPCServer {
   private resumed = false;
   private requestSnapshotOnConnect: boolean;
   private pingIntervals = new Map<WebSocket, NodeJS.Timeout>();
-  private outputClients = new Set<WebSocket>();
+  /** Each play peer's /studio-output socket; `role` once its peerHello came */
+  private outputClients = new Map<WebSocket, { role?: PlayRole; log: boolean }>();
+  private toolResultHandler: ((message: ToolResultMessage) => void) | null = null;
+  private runtimeLogHandler: ((message: StudioOutputMessage) => void) | null = null;
+  private peersHandler: (() => void) | null = null;
   private closePromise: Promise<void> | null = null;
   private handshakeComplete = false;
   private studioSession?: string;
@@ -151,6 +165,12 @@ export class IPCServer {
             // On standby: answered once this daemon has taken over, the moment it can resume
             if (this.handshakeGate) void this.handshakeGate.then(() => (this.client === ws ? handshake() : undefined));
             else void handshake();
+            return;
+          }
+
+          // Quack: the edit DataModel's answer to a tool call
+          if (isToolResultMessage(message)) {
+            this.toolResultHandler?.(message);
             return;
           }
 
@@ -320,11 +340,13 @@ export class IPCServer {
     if (this.outputClients.size === 0) {
       log.playtest("started");
     }
-    this.outputClients.add(ws);
+    const peer: { role?: PlayRole; log: boolean } = { log: true };
+    this.outputClients.set(ws, peer);
 
     ws.once("close", () => {
-      if (this.outputClients.delete(ws) && this.outputClients.size === 0) {
-        log.playtest("ended");
+      if (this.outputClients.delete(ws)) {
+        if (this.outputClients.size === 0) log.playtest("ended");
+        this.peersHandler?.();
       }
     });
 
@@ -334,9 +356,19 @@ export class IPCServer {
 
     ws.on("message", (data) => {
       try {
-        const message: unknown = JSON.parse(data.toString());
-        if (isStudioOutputMessage(message) && this.messageHandler) {
-          this.messageHandler(message);
+        const message: any = JSON.parse(data.toString());
+        if (message?.type === "peerHello" && (message.source === "server" || message.source === "client")) {
+          // Quack: a plugin that answers tools; a newer socket of the same peer replaces the older
+          for (const [other, otherPeer] of this.outputClients) if (other !== ws && otherPeer.role === message.source) otherPeer.role = undefined;
+          peer.role = message.source;
+          peer.log = message.log === true;
+          this.peersHandler?.();
+        } else if (isToolResultMessage(message)) {
+          this.toolResultHandler?.(message);
+        } else if (isStudioOutputMessage(message)) {
+          this.runtimeLogHandler?.(message);
+          // The daemon log shows it as before: an older plugin connects only with the relay on
+          if (peer.log) this.messageHandler?.(message);
         } else if (isPlayVerifyMessage(message) && this.messageHandler) {
           // Quack: the play session's check of a `quackdev play` comes on the same relay
           this.messageHandler(message);
@@ -349,9 +381,56 @@ export class IPCServer {
 
   /** Terminate every output relay; their close handlers remove them from the set. */
   private closeOutputClients(): void {
-    for (const client of this.outputClients) {
+    for (const client of this.outputClients.keys()) {
       client.terminate();
     }
+  }
+
+  /** Quack: answers to tool calls, from the edit DataModel or a play peer */
+  public onToolResult(handler: (message: ToolResultMessage) => void): void {
+    this.toolResultHandler = handler;
+  }
+
+  /** Quack: every line a play peer relays, whether or not the daemon log shows it */
+  public onRuntimeLog(handler: (message: StudioOutputMessage) => void): void {
+    this.runtimeLogHandler = handler;
+  }
+
+  /** Quack: a play peer said hello or went away */
+  public onPeersChanged(handler: () => void): void {
+    this.peersHandler = handler;
+  }
+
+  /**
+   * The play's peers: "ready" answers tools, "old" is a socket that never said which peer it is
+   * (a plugin from before 08/11/26), absent is no socket at all
+   */
+  public playPeers(): { server?: "ready" | "old"; client?: "ready" | "old" } {
+    const roles = [...this.outputClients.values()].map((p) => p.role);
+    const unknown = roles.some((r) => r === undefined);
+    const state = (role: PlayRole) => (roles.includes(role) ? "ready" : unknown ? "old" : undefined);
+    return { server: state("server"), client: state("client") };
+  }
+
+  /** Any play socket open, old or new */
+  public playSockets(): number {
+    return this.outputClients.size;
+  }
+
+  /** Sends a tool call to one peer; false when that peer has no socket that answers tools */
+  public sendToPeer(role: PeerRole, message: ToolRequestMessage): boolean {
+    if (role === "edit") {
+      if (!this.client || this.client.readyState !== WebSocket.OPEN || !this.handshakeComplete) return false;
+      this.client.send(JSON.stringify(message));
+      this.lastActivity = Date.now();
+      return true;
+    }
+    for (const [ws, peer] of [...this.outputClients].reverse()) {
+      if (peer.role !== role || ws.readyState !== WebSocket.OPEN) continue;
+      ws.send(JSON.stringify(message));
+      return true;
+    }
+    return false;
   }
 
   /**

@@ -26,22 +26,24 @@ local settingsStore = SettingsStore.new(plugin, Config, Enums.scope, {
 	legacyFlatSettings = false,
 })
 
--- Playtest DataModels only relay output; syncing stays in the edit DataModel
-if RunService:IsRunning() then
+-- Playtest DataModels only relay output; syncing stays in the edit DataModel.
+-- Quack: told apart by IsEdit, not IsRunning: a Run-mode server of a big place loads its
+-- plugins before it starts running (Anime Astral copy, 275k instances, 08/11/26), and with
+-- IsRunning alone it connected as a second Studio syncing the place instead of a play peer
+if RunService:IsRunning() or not RunService:IsEdit() then
 	const OutputRelay = require("@self/OutputRelay")
-	-- Quack: the server of a `quackdev play` checks it got the worktree's scripts and says so
-	-- on the same socket, so the server opens it even with the output relay off
+	-- Quack: both peers open it, output relay on or off: it carries the Studio tools' calls
+	-- (evals, stop, screenshots, keys) and their output. The server of a `quackdev play` also
+	-- checks it got the worktree's scripts and says so on it
 	const isServer = RunService:IsServer()
-	if Config.STREAM_SOLO_OUTPUT or isServer then
-		const send = OutputRelay.start(Config.WS_URL, Config.STREAM_SOLO_OUTPUT)
-		if isServer then
-			task.spawn(function()
-				const PlayOverlay = require("@self/PlayOverlay")
-				const ok, report = pcall(PlayOverlay.check)
-				if ok and report then send(report) end
-				if not ok then warn("[Quack]: Could not check the play's scripts:", report) end
-			end)
-		end
+	const send = OutputRelay.start(Config.WS_URL, Config.STREAM_SOLO_OUTPUT)
+	if isServer then
+		task.spawn(function()
+			const PlayOverlay = require("@self/PlayOverlay")
+			const ok, report = pcall(PlayOverlay.check)
+			if ok and report then send(report) end
+			if not ok then warn("[Quack]: Could not check the play's scripts:", report) end
+		end)
 	end
 	return
 end

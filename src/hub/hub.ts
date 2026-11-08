@@ -226,6 +226,8 @@ interface Handshake {
 /** The app lists a refused place for this long after its last attempt */
 const REFUSAL_SHOWN_MS = 10 * 60_000;
 const MAX_BODY_BYTES = 64 * 1024;
+/** /api/studio carries Luau code (an eval, execute_luau) */
+const STUDIO_BODY_BYTES = 4 * 1024 * 1024;
 
 const MAX_PAYLOAD = 256 * 1024 * 1024;
 /** A Studio must name its place this fast, and send at most this much before it does */
@@ -770,9 +772,11 @@ export class QuackHub {
       }
       let size = 0;
       const chunks: Buffer[] = [];
+      // A Studio tool call carries Luau code
+      const maxBody = url.pathname === "/api/studio" ? STUDIO_BODY_BYTES : MAX_BODY_BYTES;
       req.on("data", (chunk: Buffer) => {
         size += chunk.length;
-        if (size > MAX_BODY_BYTES) {
+        if (size > maxBody) {
           send(413, { error: "too large" });
           req.destroy();
           return;
@@ -781,7 +785,7 @@ export class QuackHub {
       });
       req.on("error", () => res.destroy());
       req.on("end", () => {
-        if (size > MAX_BODY_BYTES) return;
+        if (size > maxBody) return;
         try {
           let body: any;
           try {
@@ -811,6 +815,20 @@ export class QuackHub {
           if (url.pathname === "/api/unsynced") {
             const session = this.playSession(typeof body.placeId === "string" ? body.placeId : null);
             daemonRequest<{ files: string[] }>(session.childPort, session.token, "POST", "/unsynced", {}).then((answer) => send(200, answer), fail);
+            return;
+          }
+          if (url.pathname === "/api/studio") {
+            // Quack: one Studio tool call (eval, exec, playtest, screenshot, logs, key, device),
+            // answered by the place's daemon once Studio has
+            const session = this.playSession(typeof body.placeId === "string" ? body.placeId : null);
+            if (typeof body.tool !== "string") throw new ApiError(400, "tool is required");
+            const args = body.args && typeof body.args === "object" && !Array.isArray(body.args) ? body.args : {};
+            // The daemon's own timeout answers first; this one only covers a daemon that hangs
+            const waitMs = Math.min(Number(args.timeoutMs) > 0 ? Number(args.timeoutMs) : 60_000, 600_000) + 30_000;
+            daemonRequest<{ result: unknown }>(session.childPort, session.token, "POST", "/studio", { tool: body.tool, args }, waitMs).then(
+              (answer) => send(200, answer),
+              fail,
+            );
             return;
           }
           if (url.pathname === "/api/play") {

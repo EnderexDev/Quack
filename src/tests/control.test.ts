@@ -428,7 +428,10 @@ function mcpSession(port: number, cwd = os.tmpdir()) {
   return { call, tool, close, write: (line: string) => input.write(`${line}\n`) };
 }
 
-test("mcp: initialize carries the instructions, and the tools are the reading ones, wait and play", { timeout: 15000 }, async () => {
+/** The eight Studio calls an AI makes most (a month of chrrxs use, 08/11/26), by the same names */
+const STUDIO_TOOLS = ["eval_server_runtime", "eval_client_runtime", "execute_luau", "solo_playtest", "capture_screenshot", "get_runtime_logs", "simulate_keyboard_input", "set_device_simulator"];
+
+test("mcp: initialize carries the instructions, and the tools are the reading ones, wait, play and the Studio tools", { timeout: 15000 }, async () => {
   const mcp = mcpSession(await freePort());
   const init = await mcp.call("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "0" } });
   assert.equal(init.result.protocolVersion, "2025-03-26");
@@ -438,7 +441,7 @@ test("mcp: initialize carries the instructions, and the tools are the reading on
   mcp.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }));
   assert.equal((await mcp.call("initialize", { protocolVersion: "1999-01-01" })).result.protocolVersion, "2025-06-18", "an unknown version gets the newest");
   const names = (await mcp.call("tools/list")).result.tools.map((t: any) => t.name);
-  assert.deepEqual(names, ["status", "wait", "log", "conflicts", "conflict", "doctor", "play"]);
+  assert.deepEqual(names, ["status", "wait", "log", "conflicts", "conflict", "doctor", "play", ...STUDIO_TOOLS]);
   for (const mutating of ["resolve", "pause", "resume", "register", "unregister", "choose", "restart-hub", "open", "ai"]) {
     assert.ok(!names.includes(mutating), `${mutating} is a person's, not a tool`);
   }
@@ -506,7 +509,7 @@ test("mcp: no hub running is a tool error that says so, and the real command spe
   assert.equal(code, 0, "closing stdin ends the server");
   const messages = stdout.split("\n").filter(Boolean).map((line) => JSON.parse(line));
   assert.deepEqual(messages.map((m) => m.id).sort(), [1, 2]);
-  assert.equal(messages.find((m) => m.id === 2).result.tools.length, 7);
+  assert.equal(messages.find((m) => m.id === 2).result.tools.length, 7 + STUDIO_TOOLS.length);
 });
 
 test("connect-ai: Cursor's file keeps every other server and key, a broken one is never overwritten, a missing CLI is not installed", { timeout: 30000 }, async () => {
@@ -631,4 +634,92 @@ test("connect-ai reaches every config folder: the default, ~/.claude-*, ~/.codex
     delete process.env.QUACK_FAKE_DEFAULT;
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+/** A fake Studio whose edit DataModel and play peers answer Quack's tool calls, as the plugin does */
+function toolStudio(port: number, placeId: number, handler: (role: string, tool: string, args: any) => unknown) {
+  const reply = (ws: WebSocket, role: string) => ws.on("message", (raw) => {
+    const message = JSON.parse(raw.toString());
+    if (message.type !== "toolRequest") return;
+    Promise.resolve().then(() => handler(role, message.tool, message.args)).then(
+      (result) => ws.send(JSON.stringify({ type: "toolResult", id: message.id, ok: true, result })),
+      (error) => ws.send(JSON.stringify({ type: "toolResult", id: message.id, ok: false, error: (error as Error).message })),
+    );
+  });
+  const studio = fakeStudio(port, placeId, "ToolScript");
+  reply(studio.ws, "edit");
+  const peers: WebSocket[] = [];
+  const play = async (role: "server" | "client") => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/studio-output?placeId=${placeId}`);
+    reply(ws, role);
+    await new Promise<void>((resolve) => ws.once("open", () => resolve()));
+    ws.send(JSON.stringify({ type: "peerHello", source: role, log: false }));
+    peers.push(ws);
+    return ws;
+  };
+  return { studio, play, close: () => [studio.ws, ...peers].forEach((ws) => ws.terminate()) };
+}
+
+test("Studio tools: the terminal and the MCP reach the play peers and edit mode through the hub, and say why when they cannot", { timeout: 60000 }, async () => {
+  await withHub(async ({ port, folders }) => {
+    const pixels = Buffer.alloc(2 * 2 * 4, 200);
+    const fake = toolStudio(port, 111, (role, tool, args) => {
+      if (tool === "eval" || tool === "exec") {
+        if (args.code.includes("boom")) return { ok: false, error: "eval:1: boom", output: ["before"] };
+        return { ok: true, values: [`${role}: ${args.code}`], output: ["printed"] };
+      }
+      if (tool === "captureBegin") return { contentId: "rbxtemp://1" };
+      if (tool === "captureRead") return { width: 2, height: 2, data: pixels.toString("base64") };
+      throw new Error(`${tool} is not faked`);
+    });
+    const run = control(port, { cwd: path.join(folders["111"], "sync") });
+    await waitFor(async () => (await run("status", "--json")).json().sessions[0]?.instances === 3);
+
+    const exec = await run("exec", "--code=return 1");
+    assert.equal(exec.code, 0, exec.err);
+    assert.equal(exec.out, "printed\n=> edit: return 1\n" + exec.out.split("\n").at(-1));
+    assert.match(exec.out, /ms in the edit plugin\)$/);
+
+    const noPlay = await run("eval-server", "--code=return 1");
+    assert.equal(noPlay.code, 1);
+    assert.match(noPlay.err, /^Alpha Game \(111\): no play is running in this place/);
+    assert.match((await run("eval-server")).err, /give the Luau as --code=<luau> or --file <path>/);
+
+    await fake.play("server");
+    await waitFor(async () => (await run("eval-server", "--code=x")).code === 0);
+    const failed = await run("eval-server", "--code=error('boom')");
+    assert.equal(failed.code, 1);
+    assert.equal(failed.out, "before");
+    assert.equal(failed.err, "Luau error in the play server: eval:1: boom");
+    assert.match((await run("eval-client", "--code=x")).err, /the play client is not connected/);
+
+    // The MCP: code that starts with "--" is the code, not an option; the place comes from the folder
+    const mcp = mcpSession(port, path.join(folders["111"], "sync"));
+    const evaluated = await mcp.tool("eval_server_runtime", { code: "-- a comment\nreturn 2" });
+    assert.equal(evaluated.isError, undefined, evaluated.content[0].text);
+    assert.match(evaluated.content[0].text, /^printed\n=> server: -- a comment\nreturn 2\n\(\d+ ms in the play server\)$/);
+    assert.match((await mcp.tool("eval_client_runtime", { code: "x", place: "alpha" })).content[0].text, /the play client is not connected/);
+    assert.match((await mcp.tool("execute_luau", {})).content[0].text, /code is required/);
+
+    const runMode = await mcp.tool("capture_screenshot", {});
+    assert.equal(runMode.isError, true);
+    assert.match(runMode.content[0].text, /^Alpha Game \(111\): the play client is not connected.*a screenshot needs a Play-mode play/);
+
+    await fake.play("client");
+    await waitFor(async () => (await run("eval-client", "--code=x")).code === 0);
+    const shot = await mcp.tool("capture_screenshot", {});
+    assert.equal(shot.isError, undefined, shot.content[0].text);
+    assert.match(shot.content[0].text, /^Screenshot of the play client: 2x2, \d+ ms\. Saved at .*\.png$/);
+    assert.equal(shot.content[1].type, "image");
+    assert.equal(shot.content[1].mimeType, "image/png");
+    assert.equal(Buffer.from(shot.content[1].data, "base64").subarray(1, 4).toString(), "PNG");
+
+    const logs = await mcp.tool("get_runtime_logs", { tail: 5 });
+    assert.match(logs.content[0].text, /--- play started ---\ncursor: \d+$/);
+    assert.match((await mcp.tool("get_runtime_logs", { cursor: "x1" })).content[0].text, /cursor must be/);
+    assert.match((await mcp.tool("simulate_keyboard_input", {})).content[0].text, /keyCode or text is required/);
+    assert.match((await mcp.tool("solo_playtest", { action: "pause" })).content[0].text, /action must be start, stop or status/);
+    await mcp.close();
+    fake.close();
+  });
 });

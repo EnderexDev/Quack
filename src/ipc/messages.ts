@@ -54,7 +54,8 @@ export type StudioPayloadMessage =
   | PushConfigMessage
   | HandshakeMessageStudio
   | PlayOverlayResultMessage
-  | PlayVerifyMessage;
+  | PlayVerifyMessage
+  | ToolResultMessage;
 
 export interface BatchMessage {
   type: "batch";
@@ -157,7 +158,8 @@ export type DaemonMessage =
   | CreateInstanceMessage
   | DeleteInstanceMessage
   | MoveInstanceMessage
-  | PlayOverlayMessage;
+  | PlayOverlayMessage
+  | ToolRequestMessage;
 
 export interface PatchScriptMessage {
   type: "patchScript";
@@ -300,4 +302,36 @@ export interface PlayVerifyMessage {
   failed: string[];
   /** Swapped scripts the game removed before the check ran: nothing to check */
   unverified?: string[];
+}
+
+/**
+ * Quack: one Studio tool call (an eval, a key press, a screenshot...), sent to the edit
+ * DataModel on its sync socket or to a play peer on its /studio-output socket
+ */
+export interface ToolRequestMessage {
+  type: "toolRequest";
+  id: string;
+  tool: string;
+  args: Record<string, unknown>;
+}
+
+/** The answer to a toolRequest; `error` is Studio's own reason when ok is false */
+export interface ToolResultMessage {
+  type: "toolResult";
+  id: string;
+  ok: boolean;
+  result?: unknown;
+  error?: string;
+}
+
+/**
+ * The first message of a play peer's /studio-output socket (plugins from 08/11/26 on): which
+ * peer it is and whether its output goes to the daemon log too. A socket that never sends it
+ * is an older plugin, which answers no tool.
+ */
+export interface PeerHelloMessage {
+  type: "peerHello";
+  source: "server" | "client";
+  /** The user turned on "stream solo output": the daemon log shows the play's output */
+  log: boolean;
 }

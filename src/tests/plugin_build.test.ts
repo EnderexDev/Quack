@@ -62,3 +62,16 @@ test("in Team Create the plugin never writes an existing script by .Source", () 
   assert.match(guard, /\(fresh or not QuackService\.isTeamCreate\(\)\)/);
   assert.match(plugin, /if message\.type == "patchScript" then[\s\S]{0,200}withScriptPatchLock\(message\.guid/);
 });
+
+// A Run-mode server of a big place loads its plugins before RunService:IsRunning() turns true
+// (Anime Astral copy, 275k instances, 08/11/26): gated on IsRunning alone, the plugin there
+// took the edit path and asked the hub to sync the place as a second Studio, and `playtest
+// start --run` never saw a server peer. IsEdit is false in every play DataModel from the start
+// (chrrxs's PeerRole.detect relies on it), so the play branch has to be taken on it too.
+test("a play DataModel is told apart from the edit one by IsEdit, not IsRunning alone", () => {
+  for (const plugin of [build(false), build(true)]) {
+    const branch = plugin.match(/-- Playtest DataModels only relay output[\s\S]*?\nif (.*) then\n\s*const OutputRelay = require/);
+    assert.ok(branch, "the play branch of QuackPlugin.server.luau was not found");
+    assert.match(branch[1], /not RunService:IsEdit\(\)/);
+  }
+});

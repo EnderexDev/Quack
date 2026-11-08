@@ -983,6 +983,13 @@
               ]
             },
             {
+              "name": "StudioTools",
+              "className": "ModuleScript",
+              "filePaths": [
+                "sync/ReplicatedFirst/QuackPlugin/StudioTools.luau"
+              ]
+            },
+            {
               "name": "Trash",
               "className": "ModuleScript",
               "filePaths": [

@@ -32,6 +32,7 @@ import {
 } from "./studioOutput.js";
 import { BUNDLED, BUNDLED_BUILD } from "./bundled.js";
 import { HubLink, readHubLink } from "./hubLink.js";
+import { StudioTools } from "./studioTools.js";
 import { clearHubLock } from "./hub/owners.js";
 
 /** Quack: a `quackdev play`, from the swap request to the play session's check */
@@ -151,6 +152,7 @@ export function readStampedPlaceId(sourcemapPath: string): number | undefined {
  */
 export class SyncDaemon {
   private ipc: IPCServer;
+  private studioTools!: StudioTools;
   private httpServer: http.Server;
   private tree: TreeManager;
   private fileWriter: FileWriter;
@@ -251,6 +253,7 @@ export class SyncDaemon {
           takeOver: async (request) => this.takeOver(request),
           play: (request) => this.startPlay(request.worktrees ?? request.worktree),
           playState: () => this.play,
+          studio: (tool, args) => this.studioTools.call(tool, args),
           unsynced: (fix) => {
             const files = this.unsyncedScripts();
             if (fix) this.createAgain(files);
@@ -270,6 +273,9 @@ export class SyncDaemon {
       requestSnapshotOnConnect: false,
       verifyClient: this.hubLink ? (req) => this.hubLink!.allows(req) : undefined,
     });
+    // Quack: the Studio tools (evals, play, screenshots, keys...); screenshots go next to the
+    // daemon log, in the project's .quack/ (never synced)
+    this.studioTools = StudioTools.attach(this.ipc, path.join(path.dirname(path.resolve(config.sourcemapPath)), ".quack", "screenshots"));
 
     this.setupHandlers();
     // A successor of a daemon that ran older code starts from its tree, before it takes any

@@ -21,6 +21,9 @@ local Logger = require("./Logger")
 local SettingsStore = require("./SettingsStore")
 local WebSocketClient = require("./WebSocketClient")
 local PlayOverlay = require("./PlayOverlay")
+local StudioTools = require("./StudioTools")
+-- A screenshot or a key in edit mode needs to know the window is drawing
+StudioTools.watchRendering()
 local Trash = require("./Trash")
 
 export type SyncSession = {
@@ -1491,6 +1494,15 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 				else
 					warn("[Quack]: Play of a worktree failed:", result.error)
 					self:notify(`Play failed: {result.error}`, 10)
+				end
+			end)
+		elseif message.type == "toolRequest" then
+			-- Quack: a Studio tool call (execute_luau, a play start, a screenshot read...). It can
+			-- yield for seconds, so off the message loop; the answer goes back on this socket
+			task.spawn(function()
+				local answer = StudioTools.answer(message, "edit")
+				if not sendMessage(answer :: any) then
+					sendMessage({ type = "toolResult", id = message.id, ok = false, error = "the answer could not be sent (not JSON-encodable?)" } :: any)
 				end
 			end)
 		elseif message.type == "requestSnapshot" then

@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 import { BUNDLED_VERSION } from "../bundled.js";
@@ -7,8 +8,9 @@ import type { FlavorInfo } from "./hubClient.js";
 /**
  * `quack mcp` / `quackdev mcp`: the hub for an AI, as an MCP server on stdio (JSON-RPC, one
  * message per line). Each tool runs the terminal command of the same name through runControl,
- * so the terminal and the AI never read the hub two ways. Only reading, waiting and play: a
- * change to the hub (resolve, pause, register...) stays a person's, in the app or the terminal.
+ * so the terminal and the AI never read the hub two ways. Reading, waiting, play and the Studio
+ * tools (evals, execute_luau, playtest, screenshots, keys, the device simulator): a change to the
+ * hub (resolve, pause, register...) stays a person's, in the app or the terminal.
  */
 
 type Context = Omit<ControlContext, "out" | "err" | "confirm" | "interactive" | "color">;
@@ -20,6 +22,8 @@ interface Tool {
   argv: (args: Record<string, unknown>) => string[];
   /** Keeps only the end of a long answer (the log) */
   tail?: (args: Record<string, unknown>) => number;
+  /** Builds the answer from the command's output instead of one text block (a screenshot's image) */
+  finish?: (body: string, code: number) => object[];
 }
 
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -47,6 +51,22 @@ function number(args: Record<string, unknown>, key: string, flag: string): strin
 }
 
 class ToolInputError extends Error {}
+
+const luauSchema = {
+  type: "object",
+  properties: {
+    code: { type: "string", description: "Luau; `return` a value to get it back (tables come back as JSON)" },
+    ...placeProp,
+    timeoutSeconds: { type: "number", description: "How long to wait for it (default 30)" },
+  },
+  required: ["code"],
+};
+
+/** Luau goes as one --code=<text> entry: code that starts with "--" must not read as an option */
+function codeFlag(args: Record<string, unknown>): string {
+  if (typeof args.code !== "string" || args.code.trim() === "") throw new ToolInputError("code is required");
+  return `--code=${args.code}`;
+}
 
 function worktreeList(args: Record<string, unknown>): string[] {
   const value = args.worktrees;
@@ -124,7 +144,157 @@ export const TOOLS: Tool[] = [
       ...number(args, "timeoutSeconds", "--timeout"),
     ],
   },
+  {
+    name: "eval_server_runtime",
+    description: "Runs Luau in the running play's server, in the game VM with the game's require cache (require gives the modules the game's scripts hold). Returns what the code printed (print/warn) and what it returned; a Luau error comes back as the error. Needs a play running (solo_playtest).",
+    inputSchema: luauSchema,
+    argv: (args) => ["eval-server", ...text(args, "place"), codeFlag(args), ...number(args, "timeoutSeconds", "--timeout")],
+  },
+  {
+    name: "eval_client_runtime",
+    description: "Runs Luau in the running play's client (a LocalScript's VM, with the game's require cache): Players.LocalPlayer, the player's GUI, the client's modules. Returns what it printed and returned. Needs a solo play in Play mode (Run mode has no client).",
+    inputSchema: luauSchema,
+    argv: (args) => ["eval-client", ...text(args, "place"), codeFlag(args), ...number(args, "timeoutSeconds", "--timeout")],
+  },
+  {
+    name: "execute_luau",
+    description: "Runs Luau in the Quack plugin of Studio in edit mode (plugin security: Source, Selection, ChangeHistoryService). What it changes in the place syncs to disk like any edit in Studio. Its require gives fresh module copies, not the running game's: use the eval tools for a running play.",
+    inputSchema: luauSchema,
+    argv: (args) => ["exec", ...text(args, "place"), codeFlag(args), ...number(args, "timeoutSeconds", "--timeout")],
+  },
+  {
+    name: "solo_playtest",
+    description: "Starts, stops or reports a solo playtest. start returns once the play's server (and client, in Play mode) is connected; stop returns once Studio is back in edit mode. A play is needed by the eval tools, keyboard input and the play's logs.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["start", "stop", "status"] },
+        mode: { type: "string", enum: ["play", "run"], description: "start only: play (server and client, default) or run (server only)" },
+        ...placeProp,
+        timeoutSeconds: { type: "number", description: "start: how long to wait for the play (default 60); stop: default 15" },
+      },
+      required: ["action"],
+    },
+    argv: (args) => {
+      if (!["start", "stop", "status"].includes(String(args.action))) throw new ToolInputError("action must be start, stop or status");
+      if (args.mode !== undefined && args.mode !== "play" && args.mode !== "run") throw new ToolInputError("mode must be play or run");
+      return ["playtest", String(args.action), ...text(args, "place"), ...(args.mode === "run" ? ["--run"] : []), ...number(args, "timeoutSeconds", "--timeout")];
+    },
+  },
+  {
+    name: "capture_screenshot",
+    description: "A PNG of the Studio viewport: the play client's view while a play runs, else edit mode. Fails with the reason when the window is minimized or not rendering. The file is also saved; its path is in the answer.",
+    inputSchema: { type: "object", properties: { ...placeProp } },
+    argv: (args) => ["screenshot", ...text(args, "place"), "--json"],
+    finish: screenshotAnswer,
+  },
+  {
+    name: "get_runtime_logs",
+    description: "The running play's output (server and client), oldest first, with a cursor: pass the cursor of the last read to get only what came after. The cursor survives a stop and a new play; '--- play started ---' lines mark each play.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...placeProp,
+        cursor: { type: "string", description: "The cursor a previous read returned" },
+        tail: { type: "number", description: "Only the last N lines (default 100 without a cursor, 1000 with one)" },
+        filter: { type: "string", description: "Only lines containing this text" },
+        peer: { type: "string", enum: ["server", "client"], description: "Only one peer's lines" },
+      },
+    },
+    argv: (args) => {
+      if (args.cursor !== undefined && args.cursor !== null && !/^\d+$/.test(String(args.cursor))) throw new ToolInputError("cursor must be the cursor a previous read returned");
+      if (args.peer !== undefined && args.peer !== "server" && args.peer !== "client") throw new ToolInputError("peer must be server or client");
+      if (args.tail !== undefined && !(Number.isInteger(args.tail) && (args.tail as number) > 0)) throw new ToolInputError("tail must be a whole number above 0");
+      return [
+        "output", ...text(args, "place"),
+        ...(args.cursor !== undefined && args.cursor !== null ? [`--cursor=${args.cursor}`] : []),
+        ...(args.tail !== undefined ? [`--tail=${args.tail}`] : []),
+        ...(typeof args.filter === "string" && args.filter ? [`--filter=${args.filter}`] : []),
+        ...(args.peer ? [`--peer=${args.peer}`] : []),
+      ];
+    },
+  },
+  {
+    name: "simulate_keyboard_input",
+    description: "Sends a key (an Enum.KeyCode name: W, Space, E, LeftShift...) or text for the focused TextBox to the play client, or to Studio in edit mode when no play runs. tap presses, waits `duration` and releases. Fails with the reason when the window is minimized.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        keyCode: { type: "string", description: "Enum.KeyCode name; leave out when sending text" },
+        text: { type: "string", description: "Text for the focused TextBox, instead of a key" },
+        action: { type: "string", enum: ["tap", "press", "release"], description: "Default tap" },
+        duration: { type: "number", description: "tap: seconds held (default 0.1)" },
+        peer: { type: "string", enum: ["client", "edit"], description: "Default: the play client when one runs, else edit" },
+        ...placeProp,
+      },
+    },
+    argv: (args) => {
+      const keyCode = text(args, "keyCode");
+      const hasText = typeof args.text === "string";
+      if (!keyCode.length && !hasText) throw new ToolInputError("keyCode or text is required");
+      if (keyCode.length && hasText) throw new ToolInputError("give keyCode or text, not both");
+      if (args.action !== undefined && !["tap", "press", "release"].includes(String(args.action))) throw new ToolInputError("action must be tap, press or release");
+      if (args.peer !== undefined && args.peer !== "client" && args.peer !== "edit") throw new ToolInputError("peer must be client or edit");
+      return [
+        "key", ...keyCode, ...text(args, "place"),
+        ...(hasText ? [`--text=${args.text}`] : []),
+        ...(args.action ? [`--action=${args.action}`] : []),
+        ...(typeof args.duration === "number" ? [`--duration=${args.duration}`] : []),
+        ...(args.peer ? [`--peer=${args.peer}`] : []),
+      ];
+    },
+  },
+  {
+    name: "set_device_simulator",
+    description: "Studio's device simulator: a built-in device (deviceId), orientation (Enum.ScreenOrientation name), resolution, pixel density, scaling mode (Enum.DeviceSimulatorScalingMode name), or stopSimulation. With no setting it reports the state; list adds the device ids.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        deviceId: { type: "string" },
+        orientation: { type: "string" },
+        resolution: { type: "object", properties: { width: { type: "number" }, height: { type: "number" } }, required: ["width", "height"] },
+        pixelDensity: { type: "number" },
+        scalingMode: { type: "string" },
+        stopSimulation: { type: "boolean" },
+        list: { type: "boolean", description: "Also list the built-in device ids" },
+        ...placeProp,
+      },
+    },
+    argv: (args) => {
+      const resolution = args.resolution as { width?: unknown; height?: unknown } | undefined;
+      if (resolution !== undefined && !(Number.isInteger(resolution?.width) && Number.isInteger(resolution?.height))) throw new ToolInputError("resolution must be { width, height } in whole pixels");
+      if (args.pixelDensity !== undefined && typeof args.pixelDensity !== "number") throw new ToolInputError("pixelDensity must be a number");
+      const flag = (key: string, name: string) => (text(args, key).length ? [`--${name}=${args[key]}`] : []);
+      return [
+        "device", ...text(args, "place"),
+        ...flag("deviceId", "id"), ...flag("orientation", "orientation"), ...flag("scalingMode", "scaling"),
+        ...(resolution ? [`--resolution=${resolution.width}x${resolution.height}`] : []),
+        ...(typeof args.pixelDensity === "number" ? [`--density=${args.pixelDensity}`] : []),
+        ...(args.stopSimulation === true ? ["--stop"] : []),
+        ...(args.list === true ? ["--list"] : []),
+      ];
+    },
+  },
 ];
+
+/** The screenshot command's --json answer: its text, and the PNG it saved as an image block */
+function screenshotAnswer(body: string, code: number): object[] {
+  let shot: any;
+  try {
+    shot = JSON.parse(body);
+  } catch {
+    return [{ type: "text", text: body || "(no output)" }];
+  }
+  // --json says a refusal as { error }
+  if (code !== 0 || typeof shot?.file !== "string") return [{ type: "text", text: typeof shot?.error === "string" ? shot.error : body }];
+  const scaled = shot.width !== shot.nativeWidth ? ` (scaled down from ${shot.nativeWidth}x${shot.nativeHeight})` : "";
+  const summary = `Screenshot of ${shot.peer === "client" ? "the play client" : "Studio in edit mode"}: ${shot.width}x${shot.height}${scaled}, ${shot.ms} ms. Saved at ${shot.file}`;
+  try {
+    return [{ type: "text", text: summary }, { type: "image", data: fs.readFileSync(shot.file).toString("base64"), mimeType: "image/png" }];
+  } catch (error) {
+    return [{ type: "text", text: `${summary}, but it could not be read back: ${(error as Error).message}` }];
+  }
+}
 
 export function instructions(info: FlavorInfo): string {
   return `${info.appName} syncs Roblox places in Studio with folders on disk, both ways. One hub (port ${info.port}) runs one daemon per registered place; \`status\` lists each place and its folder. Scripts are files: .luau is a ModuleScript, .server.luau a Script, .client.luau a LocalScript. The terminal command \`${info.command}\` does the same as these tools and more.
@@ -142,7 +312,12 @@ Work on another branch in a git worktree:
 - Its edits never reach Studio. Do not change scripts in Studio for that work (that writes to the synced folder's branch).
 - Test with \`play\` (worktree path). A new file needs \`git add\` first, or the play leaves it out. The answer says 'N of M have the branch'; compare 'N changed, N new' with what the branch touched. To change code: stop the play, edit, \`play\` again.
 - A 'conflict:' line is a script the branch changed that Studio also holds changed by someone else. 'has the place's text' means a tab open and edited in that Studio beat the swap: closing the tab fixes the next play.
-- Maps, models and UI layout live in the place and are not carried by a play.`;
+- Maps, models and UI layout live in the place and are not carried by a play.
+
+Studio tools (through ${info.appName}'s own plugin, for the place named or the one whose folder the AI runs in):
+- solo_playtest start, then eval_server_runtime / eval_client_runtime run Luau inside the running game (its require cache), get_runtime_logs reads the play's output with a cursor, simulate_keyboard_input sends keys to the play client, capture_screenshot shows the viewport. solo_playtest stop returns once Studio is back in edit mode.
+- execute_luau runs in the edit plugin: what it changes in the place syncs to disk.
+- An error says its cause: no Studio connected, no play running, no play client (Run mode), an older plugin (reopen the place), the window minimized, or Luau's own error.`;
 }
 
 /** Serves MCP on `input`/`output` until `input` ends */
@@ -215,12 +390,13 @@ async function callTool(tool: Tool, args: Record<string, unknown>, ctx: Context)
     ...ctx,
     out: (line) => lines.push(line),
     err: (line) => lines.push(line),
-    // Nothing here mutates, and nothing may ever wait on a terminal nobody sees
+    // Nothing here changes the hub, and nothing may ever wait on a terminal nobody sees
     confirm: async () => false,
     interactive: false,
     color: false,
   });
   let body = lines.join("\n");
+  if (tool.finish) return { content: tool.finish(body, code), ...(code === 0 ? {} : { isError: true }) };
   if (tool.tail) {
     const all = body.split("\n");
     const keep = tool.tail(args);

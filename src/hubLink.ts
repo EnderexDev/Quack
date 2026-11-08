@@ -68,7 +68,12 @@ export interface HubLinkHandlers {
   playState?: () => unknown;
   /** Script files on disk with no instance in Studio (`quack wait` lists them); fix sends their creates again */
   unsynced?: (fix: boolean) => string[];
+  /** Quack: one Studio tool call (eval, exec, playtest, screenshot, logs, key, device); a refusal says why */
+  studio?: (tool: string, args: Record<string, any>) => Promise<unknown>;
 }
+
+/** A tool call carries Luau code: larger than the other requests */
+const STUDIO_BODY_MAX = 4 * 1024 * 1024;
 
 export class HubLink {
   private orphanSince: number | null = null;
@@ -107,7 +112,7 @@ export class HubLink {
       res.writeHead(400).end();
       return true;
     }
-    const routes = ["/status", "/adopt", "/kick", "/shutdown", "/export", "/takeover", "/play", "/unsynced"];
+    const routes = ["/status", "/adopt", "/kick", "/shutdown", "/export", "/takeover", "/play", "/unsynced", "/studio"];
     if (!routes.includes(url.pathname)) return false;
     const send = (status: number, body: unknown) => {
       if (res.headersSent || res.destroyed) return;
@@ -139,7 +144,7 @@ export class HubLink {
     let size = 0;
     req.on("data", (chunk: Buffer) => {
       size += chunk.length;
-      if (size > 64 * 1024) req.destroy();
+      if (size > (url.pathname === "/studio" ? STUDIO_BODY_MAX : 64 * 1024)) req.destroy();
       else chunks.push(chunk);
     });
     req.on("end", () => {
@@ -192,6 +197,16 @@ export class HubLink {
         }
         this.handlers.play({ worktree: parsed?.worktree, ...(parsed?.worktrees !== undefined ? { worktrees: parsed.worktrees } : {}) }).then(
           (result) => send(200, { play: result }),
+          (error: Error) => send(409, { error: error.message }),
+        );
+      } else if (url.pathname === "/studio") {
+        if (!this.handlers.studio) {
+          send(404, { error: "this daemon has no Studio tools" });
+          return;
+        }
+        const args = parsed?.args && typeof parsed.args === "object" && !Array.isArray(parsed.args) ? parsed.args : {};
+        this.handlers.studio(typeof parsed?.tool === "string" ? parsed.tool : "", args).then(
+          (result) => send(200, { result }),
           (error: Error) => send(409, { error: error.message }),
         );
       } else if (url.pathname === "/unsynced") {
