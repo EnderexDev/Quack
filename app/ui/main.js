@@ -25,6 +25,7 @@ const ui = {
 const logs = new Map(); // placeId -> { next, lines, reading }
 let contentKey = "";
 let mergesTimer;
+let queueTimer;
 /** Bumped on every content render: an async view drops its work once a newer one started */
 let generation = 0;
 
@@ -198,6 +199,7 @@ function stats(place) {
 /** Stops what the current content view runs in the background, and outdates its pending work */
 function stopContent() {
   clearInterval(mergesTimer);
+  clearInterval(queueTimer);
   generation++;
 }
 
@@ -363,6 +365,7 @@ function renderContent() {
   if (ui.view === "output" || ui.view === "playtest") return renderLog(target);
   if (ui.view === "merges") return renderMerges(target);
   if (ui.view === "folder") return renderFolder(target);
+  if (ui.view === "queue") return renderQueue(target);
   if (ui.view === "conflict") return renderConflict(target);
 }
 
@@ -423,6 +426,114 @@ async function renderMerges(target) {
   await fill();
   // Left before the first answer came: no timer for a view that is gone
   if (mine === generation) mergesTimer = setInterval(fill, MERGES_POLL_MS);
+}
+
+// ---------- Queue ----------
+
+const QUEUE_POLL_MS = 1500;
+/** A short wait: seconds under a minute, else what duration() says */
+const span = (ms) => (ms == null ? "–" : ms < 60_000 ? `${Math.max(0, Math.round(ms / 1000))} s` : duration(ms));
+const who = (client) => client?.name || client?.id || "?";
+
+/**
+ * The place's Studio queue: who holds Studio and for how long, who waits (level and wait), the
+ * tests queued and running, the play, and the day's speed. The one button frees the lock,
+ * whoever holds it (armed by a first click, as Remove is).
+ */
+async function renderQueue(target) {
+  const body = h("div", { class: "view" });
+  target.replaceChildren(body);
+  const placeId = ui.placeId;
+  const mine = generation;
+  let pending = false;
+  let armed = false;
+  const fill = async () => {
+    if (pending) return;
+    pending = true;
+    let q;
+    try {
+      q = await api.get(`/api/queue?placeId=${placeId}`);
+    } catch (error) {
+      if (mine === generation) body.replaceChildren(h("div", { class: "empty" }, t("error", { e: error })));
+      return;
+    } finally {
+      pending = false;
+    }
+    if (mine !== generation) return;
+
+    const release = h("button", { class: "btn dark chunk press danger" }, armed ? t("queueReleaseSure") : t("queueRelease"));
+    release.addEventListener("click", async () => {
+      if (!armed) {
+        armed = true;
+        release.textContent = t("queueReleaseSure");
+        setTimeout(() => {
+          armed = false;
+        }, 3000);
+        return;
+      }
+      armed = false;
+      await api.post("/api/queue/force-release", { placeId }).then(() => toast(t("queueReleased"))).catch(fail);
+      fill();
+    });
+    const holder = q.holder;
+    const studio = h("div", { class: "card chunk" },
+      h("span", { class: "label" }, t("queueStudio")),
+      h("div", { class: "field" },
+        h("span", { class: "grow" },
+          holder ? (holder.runner ? t("queueHeldByQueue", { d: span(holder.heldMs) }) : t("queueHeldBy", { who: who(holder.client), d: span(holder.heldMs) })) : t("queueFree"),
+          holder && h("span", { class: "hint" }, [holder.requestedMin ? t("queueAsked", { n: holder.requestedMin }) : null, t("queueLastCall", { d: span(holder.idleMs), tool: holder.tool })].filter(Boolean).join(" · "))),
+        holder ? release : h("span", { class: "pill live" }, t("queueFree"))),
+      q.cap?.active ? h("p", { class: "note" }, t("queueCapped", { who: q.cap.clientId })) : null,
+      h("div", { class: "field" }, h("span", { class: "grow" }, t("queuePhase")), h("span", { class: "mono muted" }, q.phase)));
+
+    const waiting = h("div", { class: "card chunk" }, h("span", { class: "label" }, t("queueWaiting")));
+    if (!q.waiters.length) waiting.append(h("p", { class: "note" }, t("queueNoWaiting")));
+    q.waiters.forEach((w, i) => waiting.append(h("div", { class: "field" },
+      h("span", { class: "mono muted" }, `${i + 1}.`),
+      h("span", { class: "grow" }, who(w.client), w.task ? h("span", { class: "hint" }, w.task) : null),
+      w.rush ? h("span", { class: "pill bad" }, t("queueRush")) : null,
+      w.exclusive ? h("span", { class: "pill sky" }, t("queueLive")) : null,
+      h("span", { class: "pill brand", title: w.effectiveLevel !== w.level ? t("queueWasLevel", { level: w.level }) : "" }, w.effectiveLevel),
+      h("span", { class: "pill mono" }, `~${w.holdMin} min`),
+      h("span", { class: "mono muted" }, span(w.waitedMs)))));
+
+    const jobs = h("div", { class: "card chunk" }, h("span", { class: "label" }, t("queueJobs")));
+    if (!q.jobs.length) jobs.append(h("p", { class: "note" }, t("queueNoJobs")));
+    for (const j of q.jobs) {
+      const running = q.running?.id === j.id;
+      jobs.append(h("div", { class: "field" },
+        h("span", { class: "grow" }, j.name, h("span", { class: "hint mono" }, `${who(j.client)} · ${shortPath(j.root)}`)),
+        running ? h("span", { class: "pill live" }, t("queueRunning")) : null,
+        j.infra ? h("span", { class: "pill warn", title: j.infra.last }, t("queueInfraTry", { n: j.infra.tries, d: span(j.infra.retryInMs) })) : null,
+        j.alone ? h("span", { class: "pill sky" }, t("queueAlone")) : null,
+        h("span", { class: "mono muted" }, span(running ? q.running.ms : j.waitedMs))));
+    }
+    if (q.play) {
+      jobs.append(h("div", { class: "field" },
+        h("span", { class: "grow" }, t("queuePlay"), h("span", { class: "hint mono" }, q.play.roots.map(shortPath).join(" + "))),
+        q.play.held ? h("span", { class: "pill warn" }, t("queuePlayHeld", { who: q.play.held.client, d: span(q.play.held.leftMs) })) : null,
+        h("span", { class: "mono muted" }, span(Date.now() - q.play.since))));
+    }
+
+    const d = q.today;
+    const stat = (value, label) => h("div", { class: "stat chunk" }, h("span", { class: "v" }, value), h("span", { class: "label" }, label));
+    const failures = Object.entries(d.failures ?? {});
+    const today = h("div", { class: "card chunk" },
+      h("span", { class: "label" }, t("queueToday")),
+      h("div", { class: "stats", style: "margin-top:8px" },
+        stat(String(d.jobs), t("queueJobsDone")),
+        stat(String(d.passed), t("queuePassed")),
+        stat(`${d.plays}`, `${t("queuePlays")} (${d.sharedPlays} ${t("queueShared")})`),
+        stat(d.jobsPerPlay == null ? "–" : String(d.jobsPerPlay), t("queuePerPlay")),
+        stat(span(d.queueP50Ms), t("queueP50")),
+        stat(span(d.queueP90Ms), t("queueP90"))),
+      failures.length ? h("div", { class: "field" }, h("span", { class: "grow" }, t("queueFailures")), ...failures.map(([k, n]) => h("span", { class: "pill warn" }, `${k} ${n}`))) : null,
+      h("p", { class: "note" }, `${d.grants} ${t("queueHolds", { n: d.grantsCapped })}`));
+
+    body.replaceChildren(h("div", { class: "cards" }, h("div", { style: "display:flex;flex-direction:column;gap:16px" }, studio, waiting), h("div", { style: "display:flex;flex-direction:column;gap:16px" }, jobs, today)));
+  };
+  await fill();
+  if (mine === generation) queueTimer = setInterval(fill, QUEUE_POLL_MS);
 }
 
 function renderFolder(target) {
@@ -674,10 +785,11 @@ function mcpCard() {
 async function renderSettings(target) {
   const s = state();
   const mine = generation;
-  const [autostart, daemon, ai] = await Promise.all([
+  const [autostart, daemon, ai, queueSettings] = await Promise.all([
     invoke("get_autostart").catch(() => false),
     invoke("read_daemon_config"),
     api.get(`/api/ai${ui.aiRefresh ? "?refresh=1" : ""}`).catch(() => null),
+    api.get("/api/queue/settings").then((r) => r.settings).catch(() => null),
   ]);
   ui.aiRefresh = false;
   if (mine !== generation) return;
@@ -792,6 +904,7 @@ async function renderSettings(target) {
             h("span", { class: "mono muted", title: `hub ${s?.build ?? "?"}` }, `${ui.app.version}${ui.app.build ? ` · ${ui.app.build}` : ""}`),
             checkUpdate)),
         aiCard(ai),
+        queueCard(queueSettings),
         mcpCard(),
         h("div", { class: "card chunk" },
           h("span", { class: "label" }, t("daemonSettings")),
@@ -802,6 +915,53 @@ async function renderSettings(target) {
 }
 
 // ---------- Navigation ----------
+
+/**
+ * Settings > Queue: every timing of the Studio queue (Spec decision 16), for every game. The hub
+ * checks each value and refuses one out of range; a game's .claude/studio-test.json may change
+ * them for that game.
+ */
+const QUEUE_FIELDS = [
+  ["historyDays", "qsHistoryDays"],
+  ["lockIdleMin", "qsLockIdleMin"],
+  ["lockIdleWaitingMin", "qsLockIdleWaitingMin"],
+  ["capMin", "qsCapMin"],
+  ["holdSec", "qsHoldSec"],
+  ["readySec", "qsReadySec"],
+  ["infraWaitSec", "qsInfraWaitSec"],
+  ["infraTries", "qsInfraTries"],
+  ["lingerSec", "qsLingerSec"],
+  ["agingMin", "qsAgingMin"],
+];
+
+function queueCard(settings) {
+  const card = h("div", { class: "card chunk" }, h("span", { class: "label" }, t("queueCard")));
+  if (!settings) {
+    card.append(h("p", { class: "note" }, t("error", { e: "the hub has no Studio queue" })));
+    return card;
+  }
+  const save = (patch) =>
+    api.post("/api/queue/settings", { settings: patch }).then(() => {
+      toast(t("qsSaved"));
+      contentKey = "";
+      renderContent();
+    }).catch(fail);
+  for (const [key, label] of QUEUE_FIELDS) {
+    const list = key === "infraWaitSec";
+    const input = h("input", { class: "field-input mono", style: "width:96px;text-align:right", value: list ? settings[key].join(", ") : String(settings[key]), inputmode: "decimal", "aria-label": t(label) });
+    input.addEventListener("change", () => {
+      const raw = input.value.trim();
+      const value = list ? raw.split(/[,\s]+/).filter(Boolean).map(Number) : Number(raw);
+      save({ [key]: value });
+    });
+    card.append(h("div", { class: "field" }, h("span", { class: "grow" }, t(label)), input));
+  }
+  const pick = (value, label) => h("button", { class: settings.sharedRetry === value ? "on" : "", onclick: () => save({ sharedRetry: value }) }, t(label));
+  card.append(h("div", { class: "field" }, h("span", { class: "grow" }, t("qsSharedRetry")), h("span", { class: "seg" }, pick("all", "qsSharedAll"), pick("foreign", "qsSharedForeign"))));
+  card.append(h("p", { class: "note" }, t("queueNote")));
+  return card;
+}
+
 
 function show(view, conflictId = null) {
   ui.view = view;

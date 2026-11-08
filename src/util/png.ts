@@ -81,3 +81,23 @@ export function halve(rgba: Buffer, width: number, height: number): { rgba: Buff
   }
   return { rgba: out, width: w, height: h };
 }
+
+/**
+ * Images of one size side by side, `columns` to a row, left to right then top to bottom, with a
+ * `gap` of dark grey between them (a recording's frames as one picture an AI can read).
+ */
+export function sheet(images: Buffer[], width: number, height: number, columns: number, gap = 4): { rgba: Buffer; width: number; height: number } {
+  if (images.length === 0) throw new Error("a contact sheet needs at least one image");
+  const cols = Math.max(1, Math.min(columns, images.length));
+  const rows = Math.ceil(images.length / cols);
+  const w = cols * width + (cols - 1) * gap;
+  const h = rows * height + (rows - 1) * gap;
+  const out = Buffer.alloc(w * h * 4);
+  for (let i = 0; i < out.length; i += 4) out.set([40, 40, 40, 255], i);
+  images.forEach((image, n) => {
+    const x0 = (n % cols) * (width + gap);
+    const y0 = Math.floor(n / cols) * (height + gap);
+    for (let y = 0; y < height; y++) image.copy(out, ((y0 + y) * w + x0) * 4, y * width * 4, (y + 1) * width * 4);
+  });
+  return { rgba: out, width: w, height: h };
+}

@@ -275,7 +275,8 @@ export class SyncDaemon {
     });
     // Quack: the Studio tools (evals, play, screenshots, keys...); screenshots go next to the
     // daemon log, in the project's .quack/ (never synced)
-    this.studioTools = StudioTools.attach(this.ipc, path.join(path.dirname(path.resolve(config.sourcemapPath)), ".quack", "screenshots"));
+    const quackDir = path.join(path.dirname(path.resolve(config.sourcemapPath)), ".quack");
+    this.studioTools = StudioTools.attach(this.ipc, path.join(quackDir, "screenshots"), path.join(quackDir, "recordings"));
 
     this.setupHandlers();
     // A successor of a daemon that ran older code starts from its tree, before it takes any

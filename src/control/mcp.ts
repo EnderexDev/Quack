@@ -2,7 +2,7 @@ import fs from "node:fs";
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 import { BUNDLED_VERSION } from "../bundled.js";
-import { runControl, type ControlContext } from "./commands.js";
+import { recordSummary, runControl, type ControlContext } from "./commands.js";
 import type { FlavorInfo } from "./hubClient.js";
 
 /**
@@ -275,7 +275,91 @@ export const TOOLS: Tool[] = [
       ];
     },
   },
+  {
+    name: "click_gui",
+    description: "Clicks a GUI button in the play client by its instance path (PlayerGui.Shop.Frame.Buy, Players.LocalPlayer.PlayerGui..., or StarterGui.Shop.Frame.Buy for the player's copy). The point comes from the button itself, so display scaling and the device simulator do not matter. Answers whether its Activated / MouseButton1Click fired, the method and the point; refuses with the cause (not a GuiButton, hidden, disabled ScreenGui, zero size, off-screen, covered by another button). method auto (default) clicks with virtual input and, if no signal fired, selects the button and presses Return; select skips the position checks.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "The button's path, dots between names" },
+        method: { type: "string", enum: ["auto", "input", "select"], description: "Default auto" },
+        ...placeProp,
+      },
+      required: ["path"],
+    },
+    argv: (args) => {
+      if (args.method !== undefined && !["auto", "input", "select"].includes(String(args.method))) throw new ToolInputError("method must be auto, input or select");
+      return ["click", ...text(args, "path", true), ...text(args, "place"), ...(args.method ? [`--method=${args.method}`] : [])];
+    },
+  },
+  {
+    name: "wait_for",
+    description: "Waits inside the running play instead of sleeping: until Luau in the play server (or client) turns truthy, tried every intervalMs, or until a play output line matches a regular expression, or the deadline (default 30 s, at most 600). Code with no `return` is taken as an expression (`workspace:FindFirstChild('Boss')`); code with one returns its value. Answers what it returned, the time and the tries; on the deadline, the last value or error. A Luau error in a try (indexing something not there yet) just counts as not yet.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        code: { type: "string", description: "Luau expression, or code that returns; truthy ends the wait" },
+        pattern: { type: "string", description: "A regular expression (JavaScript) for a play output line, from the server or the client" },
+        peer: { type: "string", enum: ["server", "client"], description: "Where the code runs (default server)" },
+        intervalMs: { type: "number", description: "Between tries (default 250)" },
+        timeoutSeconds: { type: "number", description: "The deadline (default 30, at most 600)" },
+        tryTimeoutSeconds: { type: "number", description: "One try's own limit (default 5)" },
+        cursor: { type: "string", description: "Match output lines after this get_runtime_logs cursor too (default: only lines from now on)" },
+        ...placeProp,
+      },
+    },
+    argv: (args) => {
+      const hasCode = typeof args.code === "string" && args.code.trim() !== "";
+      const pattern = typeof args.pattern === "string" && args.pattern !== "" ? args.pattern : undefined;
+      if (!hasCode && !pattern) throw new ToolInputError("code or pattern is required");
+      if (args.peer !== undefined && args.peer !== "server" && args.peer !== "client") throw new ToolInputError("peer must be server or client");
+      if (args.cursor !== undefined && args.cursor !== null && !/^\d+$/.test(String(args.cursor))) throw new ToolInputError("cursor must be the cursor a previous read returned");
+      return [
+        "wait-for", ...text(args, "place"),
+        ...(hasCode ? [codeFlag(args)] : []),
+        ...(pattern ? [`--pattern=${pattern}`] : []),
+        ...(args.peer ? [`--peer=${args.peer}`] : []),
+        ...number(args, "intervalMs", "--interval"),
+        ...number(args, "timeoutSeconds", "--timeout"),
+        ...number(args, "tryTimeoutSeconds", "--try-timeout"),
+        ...(args.cursor !== undefined && args.cursor !== null ? [`--cursor=${args.cursor}`] : []),
+      ];
+    },
+  },
+  {
+    name: "record",
+    description: "A short video of the play client's view (edit mode with no play): screenshots for `seconds` (default 3, at most 15) at `fps` (default 5, at most 10), saved as an animated GIF under the place's .quack/recordings (the last 10 kept). The answer carries a contact sheet of up to 12 frames spread over the recording (left to right, then down) as the image, the real frame rate and the GIF's path, for judging VFX and UI animation that one screenshot cannot show.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        seconds: { type: "number" },
+        fps: { type: "number" },
+        width: { type: "number", description: "Frame width in pixels (default 640)" },
+        ...placeProp,
+      },
+    },
+    argv: (args) => ["record", ...text(args, "place"), ...number(args, "seconds", "--seconds"), ...number(args, "fps", "--fps"), ...number(args, "width", "--width"), "--json"],
+    finish: recordAnswer,
+  },
 ];
+
+/** The record command's --json answer: one line, and the contact sheet as an image block */
+function recordAnswer(body: string, code: number): object[] {
+  let rec: any;
+  try {
+    rec = JSON.parse(body);
+  } catch {
+    return [{ type: "text", text: body || "(no output)" }];
+  }
+  if (code !== 0 || typeof rec?.file !== "string") return [{ type: "text", text: typeof rec?.error === "string" ? rec.error : body }];
+  const times = Array.isArray(rec.sheetAt) ? ` The sheet shows the frames at ${rec.sheetAt.map((ms: number) => `${(ms / 1000).toFixed(1)}`).join(", ")} s.` : "";
+  const summary = `${recordSummary(rec)} GIF: ${rec.file} Sheet: ${rec.sheet}.${times}`;
+  try {
+    return [{ type: "text", text: summary }, { type: "image", data: fs.readFileSync(rec.sheet).toString("base64"), mimeType: "image/png" }];
+  } catch (error) {
+    return [{ type: "text", text: `${summary} The sheet could not be read back: ${(error as Error).message}` }];
+  }
+}
 
 /** The screenshot command's --json answer: its text, and the PNG it saved as an image block */
 function screenshotAnswer(body: string, code: number): object[] {
@@ -316,6 +400,7 @@ Work on another branch in a git worktree:
 
 Studio tools (through ${info.appName}'s own plugin, for the place named or the one whose folder the AI runs in):
 - solo_playtest start, then eval_server_runtime / eval_client_runtime run Luau inside the running game (its require cache), get_runtime_logs reads the play's output with a cursor, simulate_keyboard_input sends keys to the play client, capture_screenshot shows the viewport. solo_playtest stop returns once Studio is back in edit mode.
+- click_gui clicks a button by its path (no pixel coordinates), wait_for waits for Luau to turn truthy or an output line instead of sleeping, record makes a GIF of a few seconds of the play view (its answer shows a contact sheet of the frames).
 - execute_luau runs in the edit plugin: what it changes in the place syncs to disk.
 - An error says its cause: no Studio connected, no play running, no play client (Run mode), an older plugin (reopen the place), the window minimized, or Luau's own error.`;
 }

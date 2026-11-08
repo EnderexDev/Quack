@@ -83,6 +83,16 @@ interface Options {
   scaling?: string;
   stop: boolean;
   list: boolean;
+  /** queue submit: a play of its own start */
+  fresh: boolean;
+  /** click, wait-for, record */
+  method?: string;
+  pattern?: string;
+  interval?: string;
+  tryTimeout?: string;
+  seconds?: string;
+  fps?: string;
+  width?: string;
 }
 
 function parse(argv: string[]): { command?: string; args: string[]; options: Options } {
@@ -124,6 +134,14 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       scaling: { type: "string" },
       stop: { type: "boolean" },
       list: { type: "boolean" },
+      fresh: { type: "boolean" },
+      method: { type: "string" },
+      pattern: { type: "string" },
+      interval: { type: "string" },
+      "try-timeout": { type: "string" },
+      seconds: { type: "string" },
+      fps: { type: "string" },
+      width: { type: "string" },
     },
   });
   const number = (name: "idle" | "timeout"): number | undefined => {
@@ -170,6 +188,14 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       scaling: values.scaling,
       stop: values.stop === true,
       list: values.list === true,
+      fresh: values.fresh === true,
+      method: values.method,
+      pattern: values.pattern,
+      interval: values.interval,
+      tryTimeout: values["try-timeout"],
+      seconds: values.seconds,
+      fps: values.fps,
+      width: values.width,
     },
   };
 }
@@ -222,6 +248,27 @@ Studio (through the ${info.appName} plugin; the code goes as --code=<luau> or --
                             A key to the play client (edit mode when no play runs)
   device [place] [--id <device>] [--orientation <o>] [--resolution <w>x<h>] [--density <n>]
          [--scaling <mode>] [--stop] [--list]   The device simulator; no setting shows it
+  click <path> [place] [--method auto|input|select]   A GUI button in the play client, by its
+                            path (PlayerGui.Shop.Buy, StarterGui.Shop.Buy, Players.LocalPlayer...);
+                            says whether its Activated fired and where it clicked
+  wait-for [place] [--code=<luau> | --file <path>] [--pattern=<regex>] [--peer server|client]
+           [--interval <ms>] [--timeout <s>] [--try-timeout <s>] [--cursor <n>]
+                            Until the Luau (an expression, or code that returns) turns truthy in
+                            the play, or a play output line matches; exit ${EXIT.timeout} once the
+                            deadline (default 30 s, at most 600) passes
+  record [place] [--seconds <s>] [--fps <n>] [--width <px>] [--out <file.gif>]
+                            A GIF of the play view (default 3 s at 5 fps, 640 px wide; at most
+                            15 s and 10 fps) and a contact sheet PNG of its frames
+
+Studio queue (one per place: test jobs, the Studio lock and who waits for it)
+  queue [place]             Who holds Studio and for how long, who waits (level, wait), the jobs
+                            queued and running, the play, and today's speed
+  queue submit <job.luau> [place] [-w <folder>] [--fresh] [--name <name>] [--timeout <min>]
+                            A test job (setup, client, check, cleanup with ctx), run in the
+                            place's play or a worktree's branch (-w; default: the folder you are
+                            in); waits for its verdict. Exit 0 pass, 1 fail, ${EXIT.timeout} infra or no verdict
+  queue release [place]     Free the Studio lock, whoever holds it
+  queue settings            The queue's timings (the app's Settings change them)
 
 Change${info.flavor === "official" ? " (each asks first; --yes to skip, required without a terminal)" : ""}
   pause | resume            Stop every daemon and turn Studios away / allow them again
@@ -433,6 +480,14 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
       return key(ctx, options, args);
     case "device":
       return device(ctx, options, args[0]);
+    case "click":
+      return click(ctx, options, args);
+    case "wait-for":
+      return waitFor(ctx, options, args[0]);
+    case "record":
+      return record(ctx, options, args[0]);
+    case "queue":
+      return queue(ctx, options, args);
   }
   throw new UsageError(`unknown command ${command}. Run ${ctx.info.command} --help.`);
 }
@@ -1074,4 +1129,258 @@ async function device(ctx: ControlContext, options: Options, query: string | und
     : "The device simulator is off.");
   if (Array.isArray(result.devices)) ctx.out(`Devices: ${result.devices.join(", ")}`);
   return EXIT.ok;
+}
+
+async function click(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const target = need(args[0], "click <path> [place]");
+  if (options.method !== undefined && !["auto", "input", "select"].includes(options.method)) throw new UsageError("--method must be auto, input or select");
+  const place = await resolvePlace(ctx, args[1]);
+  const result = await studio(ctx, place, "click", { path: target, method: options.method }, 20_000);
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  ctx.out(clickSummary(result));
+  return EXIT.ok;
+}
+
+/** One line on a click: where, how, and which of the button's signals fired */
+export function clickSummary(result: any): string {
+  const signals = [result.activated ? "Activated" : "", result.mouseButton1Click ? "MouseButton1Click" : ""].filter(Boolean).join(" and ");
+  const how = result.method === "select"
+    ? "selected it and pressed Return"
+    : `clicked at (${result.x}, ${result.y}) on a ${result.screen?.width}x${result.screen?.height} screen`;
+  return `${result.path}: ${how}; ${signals} fired (${result.ms} ms).`;
+}
+
+function secondsOption(value: string | undefined, name: string): number | undefined {
+  if (value === undefined) return undefined;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) throw new UsageError(`--${name} must be a number above 0`);
+  return n;
+}
+
+async function waitFor(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  const code = options.code !== undefined || options.file !== undefined ? luauCode(ctx, options) : undefined;
+  if (code === undefined && !options.pattern) throw new UsageError("give the Luau as --code=<luau> or --file <path>, a --pattern=<regex> for a play output line, or both");
+  if (options.peer !== undefined && options.peer !== "server" && options.peer !== "client") throw new UsageError("--peer must be server or client");
+  if (options.cursor !== undefined && !/^\d+$/.test(options.cursor)) throw new UsageError("--cursor must be the number a previous read printed");
+  const place = await resolvePlace(ctx, query);
+  const timeoutMs = Math.min(options.timeout ?? 30, 600) * 1000;
+  const intervalMs = secondsOption(options.interval, "interval");
+  const tryTimeout = secondsOption(options.tryTimeout, "try-timeout");
+  const result = await studio(ctx, place, "waitFor", {
+    code,
+    pattern: options.pattern,
+    peer: options.peer,
+    cursor: options.cursor,
+    timeoutMs,
+    ...(intervalMs !== undefined ? { intervalMs } : {}),
+    ...(tryTimeout !== undefined ? { tryTimeoutMs: tryTimeout * 1000 } : {}),
+  }, timeoutMs);
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return result.met ? EXIT.ok : EXIT.timeout;
+  }
+  const where = PEER_NAME[result.peer] ?? "the play";
+  const tries = `${result.tries} ${result.tries === 1 ? "try" : "tries"}`;
+  if (result.met && result.by === "pattern") {
+    ctx.out(`Matched after ${result.ms} ms (${tries}): [${result.line.source}] ${result.line.message}`);
+  } else if (result.met) {
+    for (const line of result.output ?? []) ctx.out(String(line));
+    ctx.out(`Truthy after ${result.ms} ms, ${tries} in ${where}${result.values?.length ? `: => ${result.values.join(", ")}` : ""}`);
+  } else {
+    ctx.err(`Not met in ${(result.ms / 1000).toFixed(1)} s (${tries}${code !== undefined ? ` in ${where}` : ""}).`);
+    if (result.last?.error) ctx.err(`Last try: ${result.last.error}`);
+    else if (result.last) ctx.err(`Last try: => ${result.last.values?.length ? result.last.values.join(", ") : "(nothing returned)"}`);
+  }
+  ctx.out(`cursor: ${result.cursor}`);
+  return result.met ? EXIT.ok : EXIT.timeout;
+}
+
+async function record(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  const span = secondsOption(options.seconds, "seconds") ?? 3;
+  const fps = secondsOption(options.fps, "fps") ?? 5;
+  const width = positiveInt(options.width, "width");
+  if (options.out !== undefined && !/\.gif$/i.test(options.out)) throw new UsageError("--out must be a .gif file");
+  const place = await resolvePlace(ctx, query);
+  // The frames are read after the capture: ~0.1 s each in PA, more in a big place
+  const timeoutMs = span * 1000 + 180_000;
+  const result = await studio(ctx, place, "record", { seconds: span, fps, ...(width ? { width } : {}), timeoutMs }, timeoutMs);
+  if (options.out) {
+    const target = path.resolve(ctx.cwd, options.out);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(result.file, target);
+    result.file = target;
+  }
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  ctx.out(recordSummary(result));
+  ctx.out(result.file);
+  ctx.out(result.sheet);
+  return EXIT.ok;
+}
+
+/** One line on a recording: what was captured, how fast, how big */
+export function recordSummary(result: any): string {
+  const source = result.peer === "client" ? "the play client" : "Studio in edit mode";
+  const skipped = result.skipped ? `, ${result.skipped} unreadable` : "";
+  return `Recorded ${result.frames} frames of ${source} in ${result.seconds} s: ${result.fps} fps real (asked ${result.targetFps}${skipped}; ${result.peer === "client" ? "the game" : "Studio"} drew ${result.gameFps} fps meanwhile), ${result.width}x${result.height} GIF, ${(result.bytes / 1024).toFixed(0)} KB, ${result.ms} ms in all.`;
+}
+
+// ---------------------------------------------------------------------------------------
+// The Studio queue
+
+const minutes = (ms: number | null | undefined) => (ms == null ? "-" : ms < 60_000 ? `${Math.round(ms / 1000)} s` : `${Math.round(ms / 6000) / 10} min`);
+const clientLabel = (c: any) => (c?.name ? `${c.name} (${c.id})` : (c?.id ?? "?"));
+
+export function queueText(q: any): string {
+  const lines: string[] = [`${q.name ?? q.placeId}: ${q.phase}`];
+  if (q.holder) {
+    const asked = q.holder.requestedMin ? `, asked ${q.holder.requestedMin} min` : "";
+    lines.push(`  Studio: held by ${q.holder.runner ? "the queue" : clientLabel(q.holder.client)} for ${minutes(q.holder.heldMs)}${asked}, last call ${minutes(q.holder.idleMs)} ago (${q.holder.tool})`);
+  } else lines.push("  Studio: free");
+  if (q.cap?.active) lines.push(`  capped: ${q.cap.clientId} gets Studio again after the queue's next batch`);
+  if (q.waiters?.length) {
+    lines.push(`  waiting for Studio (${q.waiters.length}), next first:`);
+    q.waiters.forEach((w: any, i: number) =>
+      lines.push(
+        `    ${i + 1}. ${w.rush ? "RUSH " : ""}${w.effectiveLevel}${w.effectiveLevel !== w.level ? ` (was ${w.level})` : ""}, ~${w.holdMin} min, waiting ${minutes(w.waitedMs)}${w.exclusive ? ", live" : ""}: ${clientLabel(w.client)}${w.task ? `: ${w.task}` : ""}`,
+      ),
+    );
+  }
+  if (q.running) lines.push(`  running: ${q.running.name} (${clientLabel(q.running.client)}), ${minutes(q.running.ms)}`);
+  const queued = (q.jobs ?? []).filter((j: any) => j.state === "pending");
+  if (queued.length) {
+    lines.push(`  jobs queued (${queued.length}):`);
+    for (const j of queued) lines.push(`    ${j.name} (${clientLabel(j.client)}), ${minutes(j.waitedMs)}${j.infra ? `, infra try ${j.infra.tries}, again in ${minutes(j.infra.retryInMs)}` : ""}${j.alone ? ", again alone" : ""}`);
+  }
+  if (q.play) lines.push(`  play: ${q.play.roots.join(", ")}, ${q.play.jobs} job(s), up ${minutes(Date.now() - q.play.since)}${q.play.held ? `, held for ${q.play.held.client} (${minutes(q.play.held.leftMs)} left)` : ""}`);
+  const t = q.today;
+  if (t) {
+    const fails = Object.entries(t.failures ?? {})
+      .map(([k, n]) => `${k} ${n}`)
+      .join(", ");
+    lines.push(
+      `  today: ${t.jobs} job(s), ${t.passed} passed, ${t.plays} play(s) (${t.sharedPlays} shared), ${t.jobsPerPlay ?? "-"} jobs per play, queue p50 ${minutes(t.queueP50Ms)} p90 ${minutes(t.queueP90Ms)}${fails ? `, failed: ${fails}` : ""}, ${t.grants} hold(s) by clients${t.grantsCapped ? ` (${t.grantsCapped} capped)` : ""}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+/** A verdict as the CLI prints it */
+export function verdictText(r: any): string {
+  const lines = [`${r.pass ? "PASS" : r.infra ? "INFRA" : r.dropped ? "DROPPED" : "FAIL"}  ${r.name}${r.play ? `  (${r.play})` : ""}`];
+  if (r.dropped) lines.push(`  ${r.dropped}`);
+  if (r.reason) lines.push(`  reason: ${r.reason}`);
+  if (r.infra) lines.push("  not a verdict on the job: Studio, the daemon or the play failed (retried first). Submit again once the reason is gone.");
+  if (r.infraRetried) lines.push(`  ran after infra failures: ${r.infraRetried}`);
+  if (r.held) lines.push(`  the play is held ${r.held} s for this client: fix the job and submit it again now to run in the same play`);
+  if (r.sharedWith) lines.push(`  ran in a play shared with ${r.sharedWith.join(", ")} and was not run again alone (no error outside this job's files; sharedRetry: foreign)`);
+  if (r.firstRun) {
+    lines.push(`  first run FAILED in a play shared with ${r.firstRun.with.join(", ")}: ${r.firstRun.reason || "see the phases"}`);
+    lines.push(`  this verdict is the run in a play of this branch alone${r.pass ? ": the shared failure came from the other branch(es)" : ""}`);
+  }
+  if (r.notYours) lines.push(`  NOT YOURS: ${r.notYours}`);
+  for (const [phase, p] of Object.entries<any>(r.phases ?? {})) {
+    const checks = p.checks ?? [];
+    const bad = checks.filter((c: any) => !c.ok);
+    lines.push(`  ${phase}: ${p.ok === false ? "ERROR" : "ok"}${checks.length ? `, ${checks.length - bad.length}/${checks.length} checks` : ""}${p.value != null ? `, returned ${p.value}` : ""}`);
+    if (p.error) lines.push(`    ${String(p.error).split("\n").slice(0, 6).join("\n    ")}`);
+    for (const c of bad) lines.push(`    FAILED ${c.label}${c.expected !== undefined ? `: expected ${c.expected}, got ${c.actual}` : c.detail ? `: ${c.detail}` : ""}`);
+  }
+  for (const q of r.quackPlay ?? []) lines.push(`  quack play: ${q}`);
+  for (const w of r.syncWarnings ?? []) lines.push(`  warning: ${w}`);
+  if (r.console?.length) {
+    lines.push(`  console (${r.console.length} lines during this job):`);
+    for (const l of r.console.slice(0, 40)) lines.push(`    ${l}`);
+    if (r.console.length > 40) lines.push(`    ... ${r.console.length - 40} more in the result file`);
+  }
+  lines.push(`  ${r.ms ?? 0} ms running, ${Math.round((r.queuedMs ?? 0) / 1000)} s in the queue`);
+  return lines.join("\n");
+}
+
+async function queue(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const [sub, ...rest] = args;
+  const showStatus = async (query: string | undefined) => {
+    const place = await resolvePlace(ctx, query);
+    const status = await ctx.client.get("/api/queue", { placeId: place.placeId });
+    ctx.out(options.json ? JSON.stringify(status, null, 2) : queueText(status));
+    return EXIT.ok;
+  };
+  if (sub === "status") return showStatus(rest[0]);
+  if (sub === "settings") {
+    const answer = await ctx.client.get("/api/queue/settings");
+    ctx.out(
+      options.json
+        ? JSON.stringify(answer, null, 2)
+        : `${Object.entries(answer.settings)
+            .map(([k, v]) => `${k}: ${JSON.stringify(v)}`)
+            .join("\n")}\n(${answer.file})`,
+    );
+    return EXIT.ok;
+  }
+  if (sub === "release") {
+    const place = await resolvePlace(ctx, rest[0]);
+    if (ctx.info.flavor === "official") await confirmOfficial(ctx, options, `queue release ${placeLabel(place)}`);
+    const answer = await ctx.client.post("/api/queue/force-release", { placeId: place.placeId });
+    ctx.out(
+      options.json
+        ? JSON.stringify(answer, null, 2)
+        : answer.released
+          ? `Studio lock of ${placeLabel(place)} freed (was ${clientLabel(answer.was.client)}).`
+          : `Studio lock of ${placeLabel(place)} was already free.`,
+    );
+    return EXIT.ok;
+  }
+  if (sub !== "submit") return showStatus(sub);
+  const file = need(rest[0], "queue submit <job.luau> [place] [-w <folder>]");
+  let source: string;
+  try {
+    source = fs.readFileSync(path.resolve(ctx.cwd, file), "utf8");
+  } catch (error) {
+    throw new UsageError(`cannot read ${file}: ${(error as Error).message}`);
+  }
+  const root = path.resolve(ctx.cwd, options.worktrees[0] ?? ".");
+  let place: Place;
+  if (rest[1]) place = await resolvePlace(ctx, rest[1]);
+  else {
+    const state = await ctx.client.get("/api/state");
+    const inside = (state.places as Place[]).find((p) => sameOrInside(p.folder, root));
+    place = inside ?? (await placeOfWorktree(ctx, root));
+  }
+  // A job runs the folder it names: the place's own, or a worktree's top folder (its branch)
+  const folder = sameOrInside(place.folder, root) ? place.folder : worktreeTop(root);
+  // No pid: the job is not this process's, so it stays queued when the command gives up waiting
+  const client = { id: `cli-${process.pid}`, name: "quack queue submit" };
+  const job = { root: folder, source, ...(options.fresh ? { fresh: true } : {}), ...(options.name ? { name: options.name } : {}) };
+  const { id } = await ctx.client.post("/api/queue/submit", { placeId: place.placeId, client, job });
+  if (!options.json) ctx.out(`Submitted to ${placeLabel(place)}${folder !== place.folder ? ` (the branch of ${folder})` : ""}. Waiting for the verdict...`);
+  const deadline = Date.now() + (options.timeout ?? 20) * 60_000;
+  for (;;) {
+    const answer = await ctx.client.get("/api/queue/job", { placeId: place.placeId, id });
+    if (answer.state === "done") {
+      const verdict = answer.verdict;
+      ctx.out(options.json ? JSON.stringify(verdict, null, 2) : verdictText(verdict));
+      return verdict.pass ? EXIT.ok : verdict.infra ? EXIT.timeout : EXIT.error;
+    }
+    if (Date.now() > deadline) {
+      ctx.err(`No verdict yet; the job stays queued (${id}).`);
+      return EXIT.timeout;
+    }
+    await new Promise((r) => setTimeout(r, ctx.pollMs ?? 500));
+  }
+}
+
+/** The top folder of the git checkout holding `dir` */
+function worktreeTop(dir: string): string {
+  let at = path.resolve(dir);
+  for (;;) {
+    if (fs.existsSync(path.join(at, ".git"))) return at;
+    const up = path.dirname(at);
+    if (up === at) return path.resolve(dir);
+    at = up;
+  }
 }

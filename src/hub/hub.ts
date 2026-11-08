@@ -13,6 +13,8 @@ import { findStampedFolders, folderNameFor } from "./candidates.js";
 import type { DaemonStatus } from "../hubLink.js";
 import { clearHubLock, folderOwner, isAlive, readHubLock, stopOwner, writeHubLock, type FolderOwner, type HubLock } from "./owners.js";
 import { loadRegistry, saveRegistry, type Registry } from "./registry.js";
+import { HubQueues, QueueError } from "../queue/hubQueues.js";
+import type { StudioPort, Timings } from "../queue/queue.js";
 
 /**
  * Quack hub: one port for every Studio. It reads the place from the plugin's handshake, starts
@@ -54,6 +56,8 @@ export interface HubOptions {
   detectAi?: (settings: ReturnType<typeof readMergeSettings>, force: boolean) => Promise<Detected>;
   handshakeDeadlineMs?: number;
   daemonStartTimeoutMs?: number;
+  /** The Studio queue's own timings and clock (tests) */
+  queue?: { timings?: Partial<Timings>; tickMs?: number; settingsFile?: string; alive?: (pid: number) => boolean };
 }
 
 /** A daemon the last hub left running that this one replaces instead of adopting */
@@ -278,9 +282,57 @@ export class QuackHub {
   /** Tells this hub from the one started after it, for `quack restart-hub` */
   private startedAt = 0;
   private readonly log: (line: string) => void;
+  /** The Studio queue of every place: jobs, the lock and who waits for it */
+  readonly queues: HubQueues;
 
   constructor(private readonly options: HubOptions) {
     this.log = options.log ?? ((line) => console.log(`[${new Date().toISOString()}] ${line}`));
+    this.queues = new HubQueues({
+      registryFile: options.registryFile,
+      places: () => this.registry().places,
+      port: (placeId) => this.studioPort(placeId),
+      log: (line) => this.log(line),
+      ...(options.queue?.timings ? { timings: options.queue.timings } : {}),
+      ...(options.queue?.tickMs ? { tickMs: options.queue.tickMs } : {}),
+      ...(options.queue?.settingsFile ? { settingsFile: options.queue.settingsFile } : {}),
+      ...(options.queue?.alive ? { alive: options.queue.alive } : {}),
+    });
+  }
+
+  /**
+   * How the Studio queue reaches a place's daemon: its Studio tools and its worktree play. The
+   * daemon of the moment, looked up on each call (a restart or a takeover replaces it).
+   */
+  private studioPort(placeId: string): StudioPort {
+    const session = () => {
+      const s = this.sessions.get(placeId);
+      if (!s) throw new Error("no daemon runs for this place: open it in Studio");
+      return s;
+    };
+    return {
+      studio: async (tool, args, waitMs = 60_000) => {
+        const s = session();
+        const answer = await daemonRequest<{ result: unknown }>(s.childPort, s.token, "POST", "/studio", { tool, args }, waitMs + 30_000);
+        return answer.result;
+      },
+      play: async (worktrees) => {
+        const s = session();
+        const request = worktrees.length > 1 ? { worktree: worktrees[0], worktrees } : { worktree: worktrees[0] };
+        this.log(`${s.name ?? placeId}: queue play of ${worktrees.join(", ")}`);
+        const { play } = await daemonRequest<{ play: any }>(s.childPort, s.token, "POST", "/play", request, 60_000);
+        if (!play?.result?.ok) return play;
+        // The play session's check comes once its plugin loads, seconds after the game's scripts
+        const deadline = Date.now() + 60_000;
+        let state = play;
+        while (!state.verify && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 300));
+          const latest = (await daemonRequest<{ play: any }>(session().childPort, session().token, "GET", "/play", undefined, 5000)).play;
+          if (latest && latest.id !== play.id) throw new Error("another play of this place started before this one's check came back");
+          if (latest) state = latest;
+        }
+        return state;
+      },
+    };
   }
 
   private registry(): Registry {
@@ -322,6 +374,8 @@ export class QuackHub {
     await this.listenWhenFree();
     this.startedAt = Date.now();
     this.log(`Quack hub listening on ${this.options.port} (registry ${this.options.registryFile})`);
+    // The Studio queues saved by the last hub: their jobs run again, their plays are adopted
+    this.queues.start();
     // Daemons that need replacing are replaced now, all at once, with the hub already answering;
     // a Studio of one of those places waits in route() for its own replacement only
     for (const replacement of replacements) {
@@ -384,6 +438,7 @@ export class QuackHub {
    */
   async stop(options: { handoff?: boolean; replaceDaemons?: boolean } = {}): Promise<void> {
     this.stopping = true;
+    this.queues.stop();
     // A start or replacement already under way finishes first, so its daemon is in the list below
     await Promise.allSettled([...this.replacing.values()]);
     await Promise.allSettled([...this.starting.values()]);
@@ -622,6 +677,9 @@ export class QuackHub {
     for (const [id, choice] of this.pending) if (now - choice.lastSeen > PENDING_STALE_MS) this.pending.delete(id);
     return {
       build: BUNDLED_BUILD ?? "dist",
+      // What this hub can do beyond syncing: clients look here before using an API
+      capabilities: ["queue"],
+      queues: this.queues.summary(),
       startedAt: this.startedAt,
       paused: this.paused,
       sessions: this.listSessions(),
@@ -710,7 +768,7 @@ export class QuackHub {
       return;
     }
     const fail = (error: unknown) => {
-      if (error instanceof ApiError) send(error.status, { error: error.message });
+      if (error instanceof ApiError || error instanceof QueueError) send(error.status, { error: error.message });
       else {
         this.log(`API ${url.pathname} failed: ${(error as Error).message}`);
         send(500, { error: (error as Error).message });
@@ -753,6 +811,10 @@ export class QuackHub {
             daemonRequest<{ play: unknown }>(session.childPort, session.token, "GET", "/play").then((answer) => send(200, answer), fail);
             return;
           }
+          case "/api/queue":
+          case "/api/queue/job":
+          case "/api/queue/settings":
+            return send(200, this.queues.handleGet(url.pathname, q));
           case "/api/unsynced": {
             const session = this.playSession(q.get("placeId"));
             daemonRequest<{ files: string[] }>(session.childPort, session.token, "GET", "/unsynced").then((answer) => send(200, answer), fail);
@@ -773,7 +835,7 @@ export class QuackHub {
       let size = 0;
       const chunks: Buffer[] = [];
       // A Studio tool call carries Luau code
-      const maxBody = url.pathname === "/api/studio" ? STUDIO_BODY_BYTES : MAX_BODY_BYTES;
+      const maxBody = url.pathname === "/api/studio" || url.pathname === "/api/queue/submit" ? STUDIO_BODY_BYTES : MAX_BODY_BYTES;
       req.on("data", (chunk: Buffer) => {
         size += chunk.length;
         if (size > maxBody) {
@@ -811,6 +873,9 @@ export class QuackHub {
             const checked = this.aiLastUsable ? Promise.resolve() : this.aiStatus();
             checked.then(() => this.setAi(body)).then(() => this.aiStatus()).then((status) => send(200, status), fail);
             return;
+          }
+          if (url.pathname.startsWith("/api/queue")) {
+            return send(200, this.queues.handlePost(url.pathname, body));
           }
           if (url.pathname === "/api/unsynced") {
             const session = this.playSession(typeof body.placeId === "string" ? body.placeId : null);

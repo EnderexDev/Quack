@@ -428,8 +428,8 @@ function mcpSession(port: number, cwd = os.tmpdir()) {
   return { call, tool, close, write: (line: string) => input.write(`${line}\n`) };
 }
 
-/** The eight Studio calls an AI makes most (a month of chrrxs use, 08/11/26), by the same names */
-const STUDIO_TOOLS = ["eval_server_runtime", "eval_client_runtime", "execute_luau", "solo_playtest", "capture_screenshot", "get_runtime_logs", "simulate_keyboard_input", "set_device_simulator"];
+/** The eight Studio calls an AI makes most (a month of chrrxs use, 08/11/26), by the same names, then a click by path, a wait and a recording */
+const STUDIO_TOOLS = ["eval_server_runtime", "eval_client_runtime", "execute_luau", "solo_playtest", "capture_screenshot", "get_runtime_logs", "simulate_keyboard_input", "set_device_simulator", "click_gui", "wait_for", "record"];
 
 test("mcp: initialize carries the instructions, and the tools are the reading ones, wait, play and the Studio tools", { timeout: 15000 }, async () => {
   const mcp = mcpSession(await freePort());
@@ -664,6 +664,9 @@ test("Studio tools: the terminal and the MCP reach the play peers and edit mode 
   await withHub(async ({ port, folders }) => {
     const pixels = Buffer.alloc(2 * 2 * 4, 200);
     const fake = toolStudio(port, 111, (role, tool, args) => {
+      if (tool === "eval" && args.code.startsWith("local __quack_w")) return { ok: true, values: ["true", "ready"], output: [] };
+      if (tool === "click") return { path: `Players.Ender.${args.path}`, method: "input", x: 1, y: 2, screen: { width: 10, height: 10 }, activated: true, mouseButton1Click: false, ms: 5 };
+      if (tool === "captureBurst") return { frames: [{ at: 0, contentId: "rbxtemp://1" }, { at: 200, contentId: "rbxtemp://2" }], asked: 2, seconds: 0.4, gameFps: 60 };
       if (tool === "eval" || tool === "exec") {
         if (args.code.includes("boom")) return { ok: false, error: "eval:1: boom", output: ["before"] };
         return { ok: true, values: [`${role}: ${args.code}`], output: ["printed"] };
@@ -719,7 +722,55 @@ test("Studio tools: the terminal and the MCP reach the play peers and edit mode 
     assert.match((await mcp.tool("get_runtime_logs", { cursor: "x1" })).content[0].text, /cursor must be/);
     assert.match((await mcp.tool("simulate_keyboard_input", {})).content[0].text, /keyCode or text is required/);
     assert.match((await mcp.tool("solo_playtest", { action: "pause" })).content[0].text, /action must be start, stop or status/);
+
+    // A click by path, a wait and a recording
+    const clicked = await run("click", "PlayerGui.Shop.Buy");
+    assert.equal(clicked.code, 0, clicked.err);
+    assert.match(clicked.out, /^Players\.Ender\.PlayerGui\.Shop\.Buy: clicked at \(1, 2\) on a 10x10 screen; Activated fired \(\d+ ms\)\.$/);
+    assert.match((await mcp.tool("click_gui", {})).content[0].text, /path is required/);
+    const waited = await mcp.tool("wait_for", { code: "workspace.Ready" });
+    assert.equal(waited.isError, undefined, waited.content[0].text);
+    assert.match(waited.content[0].text, /^Truthy after \d+ ms, 1 try in the play server: => ready\ncursor: \d+$/);
+    assert.match((await mcp.tool("wait_for", {})).content[0].text, /code or pattern is required/);
+    const missed = await run("wait-for", "--pattern=never printed", "--timeout", "0.3");
+    assert.equal(missed.code, 3, "a deadline that passes exits as a timeout");
+    assert.match(missed.err, /^Not met in 0\.\d s \(0 tries\)\.$/);
+    const rec = await mcp.tool("record", { seconds: 1 });
+    assert.equal(rec.isError, undefined, rec.content[0].text);
+    assert.match(rec.content[0].text, /^Recorded 2 frames of the play client in 0\.4 s: 5 fps real \(asked 5; the game drew 60 fps meanwhile\), 2x2 GIF, .* GIF: .*\.gif Sheet: .*-sheet\.png\. The sheet shows the frames at 0\.0, 0\.2 s\.$/);
+    assert.equal(rec.content[1].type, "image");
+    assert.equal(Buffer.from(rec.content[1].data, "base64").subarray(1, 4).toString(), "PNG");
     await mcp.close();
     fake.close();
+  });
+});
+
+test("queue: who holds Studio and who waits, the settings, a forced release, a submit that waits for its verdict", { timeout: 60000 }, async () => {
+  await withHub(async ({ port, folders }) => {
+    const run = control(port, { cwd: folders["111"] });
+    const post = (pathname: string, body: unknown) =>
+      fetch(`http://127.0.0.1:${port}${pathname}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }).then((r) => r.json());
+    await post("/api/queue/lock", { placeId: "111", op: "claim", client: { id: "s1", name: "session one", pid: process.pid }, tool: "solo_playtest" });
+    await post("/api/queue/lock", { placeId: "111", op: "join", client: { id: "s2", name: "session two", pid: process.pid }, waiter: { task: "buy the sword", holdMin: 3, level: "update", exclusive: true } });
+    const status = await run("queue");
+    assert.equal(status.code, 0, status.err);
+    assert.match(status.out, /Studio: held by session one \(s1\) for \d+ s, last call/);
+    assert.match(status.out, /1\. update, ~3 min, waiting \d+ s, live: session two \(s2\): buy the sword/);
+    assert.equal((await run("queue", "settings", "--json")).json().settings.capMin, 5);
+    const released = await run("queue", "release");
+    assert.match(released.out, /Studio lock of Alpha Game \(111\) freed \(was session one \(s1\)\)/);
+    // Official asks first; without a terminal it needs --yes
+    const official = control(port, { cwd: folders["111"], flavor: "official" });
+    assert.equal((await official("queue", "release")).code, 1);
+    // A job with no Studio open waits; past --timeout it stays queued and says so
+    fs.writeFileSync(path.join(folders["111"], "job.luau"), "--! name: cli job\nreturn {}");
+    const submitted = await run("queue", "submit", "job.luau", "--timeout", "0.01");
+    assert.equal(submitted.code, 3, submitted.out + submitted.err);
+    assert.match(submitted.out, /Submitted to Alpha Game \(111\)\. Waiting for the verdict/);
+    assert.match(submitted.err, /No verdict yet; the job stays queued/);
+    const queued = (await run("queue", "--json")).json();
+    assert.equal(queued.jobs[0].name, "cli job");
+    assert.equal(queued.jobs[0].client.name, "quack queue submit");
+    assert.equal(queued.jobs[0].client.pid, undefined, "a terminal's job is not its process's: it stays queued after the command exits");
   });
 });
