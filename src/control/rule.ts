@@ -71,7 +71,7 @@ Each cycle costs a play stop and load: change everything you can, then test it a
 
 - \`get_roblox_docs\` reads Roblox's engine reference for a class, enum, datatype or library, with each property's read and write security: check it instead of guessing an API, and before trusting a write.
 - \`search_assets\`, \`get_asset_details\` and \`get_asset_thumbnail\` look in the Creator Store with no Studio. \`preview_asset\` loads a model without placing it and lists its scripts (a backdoor scan); \`insert_asset\` puts it in the place with every script stripped.
-- \`upload_asset\` uploads a file through Open Cloud (key and creator in the environment or ${app}'s \`open-cloud.env\`). It keeps a log by the file's hash: a repeat answers the asset already uploaded, or keeps waiting on the same upload, instead of making a duplicate. A Decal's answer includes the image id that goes in \`rbxassetid://\`.
+- \`upload_asset\` uploads a file through Open Cloud, with the key and the owner the user saved in ${app}'s Settings (Open Cloud); without them it says so, and the key is the user's to give there, never yours to ask for in chat. It keeps a log by the file's hash: a repeat answers the asset already uploaded, or keeps waiting on the same upload, instead of making a duplicate. A Decal's answer includes the image id that goes in \`rbxassetid://\`.
 
 ## Git in the synced folder
 

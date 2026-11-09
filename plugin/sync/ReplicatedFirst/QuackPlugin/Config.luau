@@ -44,6 +44,8 @@ configTable = {
 	AUTO_OPEN_MODAL = true,
 	SYNC_REMINDERS = true, -- Remind to sync when opening a previously synced Place
 	STREAM_SOLO_OUTPUT = false,
+	-- Quack: the app's log (scripts written, merges, refusals) also in Studio's Output. Opt-in
+	DAEMON_OUTPUT = false,
 }
 
 return configTable

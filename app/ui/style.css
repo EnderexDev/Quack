@@ -92,8 +92,18 @@ button.pill { cursor: pointer; }
 .seg button { padding: 5px 10px; font-size: 10px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-400); cursor: pointer; transition: background-color .18s, color .18s; }
 .seg button.on { background: var(--brand-400); color: var(--line); }
 
-input.field-input { font: inherit; font-size: 12.5px; color: var(--ink-200); background: var(--ink-900); border: 3px solid var(--line); border-radius: 10px; padding: 7px 10px; outline: none; min-width: 0; }
-input.field-input:focus { border-color: var(--brand-400); }
+.field-input { font: inherit; font-size: 12.5px; color: var(--ink-200); background: var(--ink-900); border: 3px solid var(--line); border-radius: 10px; padding: 7px 10px; outline: none; min-width: 0; }
+.field-input:focus { border-color: var(--brand-400); }
+select.field-input { cursor: pointer; max-width: 260px; }
+
+/* "Open in …" and its ▾, the list of the other editors found */
+.split { display: inline-flex; gap: 6px; }
+.btn.more { padding-inline: 9px; }
+.menu { position: fixed; z-index: 15; min-width: 200px; background: var(--ink-900); border-radius: 12px; padding: 8px; display: flex; flex-direction: column; gap: 2px; }
+.menu .label { padding: 2px 8px 6px; }
+.menu button { text-align: left; padding: 7px 8px; border-radius: 8px; color: var(--ink-200); font-weight: 600; font-size: 12.5px; cursor: pointer; transition: background-color .18s, color .18s; }
+.menu button:hover, .menu button:focus-visible { background: var(--ink-800); color: var(--brand-400); outline: none; }
+.menu button.on { color: var(--brand-400); }
 
 .toast { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); background: var(--ink-800); color: var(--ink-200); border-radius: 12px; padding: 9px 14px; font-weight: 600; z-index: 10; max-width: 80vw; }
 .toast.bad { color: #ffb3b0; }

@@ -867,3 +867,55 @@ test("queue: who holds Studio and who waits, the settings, a forced release, a s
     assert.equal(queued.jobs[0].client.pid, undefined, "a terminal's job is not its process's: it stays queued after the command exits");
   });
 });
+
+// 09/11/26: the app's Open Cloud setting runs `cloud`; the key arrives on stdin and is never printed
+test("cloud: the key and creator saved in open-cloud.env, the key never printed, other lines kept", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-cloud-"));
+  try {
+    const file = path.join(dataDir, "open-cloud.env");
+    fs.writeFileSync(file, "# mine\nOTHER=1\nROBLOX_CREATOR_GROUP_ID=77\n");
+    const key = "SECRETKEY-abcdefghijklmnop-WXYZ";
+    const run = async (argv: string[], stdin = "") => {
+      const out: string[] = [];
+      const err: string[] = [];
+      const code = await runControl(argv, {
+        info: flavorInfo("dev"), client: new HubClient(1), out: (l) => out.push(l), err: (l) => err.push(l),
+        confirm: async () => false, interactive: false, color: false, cwd: dataDir, openUri: async () => {},
+        roblox: { dataDir, env: {} }, readStdin: async () => stdin,
+      });
+      return { code, out: out.join("\n"), err: err.join("\n") };
+    };
+
+    const saved = await run(["cloud", "set", "--key-stdin", "--user=123", "--json"], `${key}\r\n`);
+    assert.equal(saved.code, 0, saved.err);
+    assert.ok(!saved.out.includes(key), "the key is not in the answer");
+    const json = JSON.parse(saved.out);
+    assert.equal(json.hasKey, true);
+    assert.equal(json.keyEnd, "WXYZ");
+    assert.equal(json.userId, "123");
+    assert.equal(json.groupId, undefined, "a user id replaces the group id");
+    const text = fs.readFileSync(file, "utf8");
+    assert.match(text, /^# mine\nOTHER=1\n/, "other lines stay, in their place");
+    assert.ok(text.includes(`ROBLOX_OPEN_CLOUD_API_KEY=${key}\n`), "the key is written without the line break");
+    assert.ok(!text.includes("ROBLOX_CREATOR_GROUP_ID"));
+
+    const shown = await run(["cloud"]);
+    assert.match(shown.out, /Key saved \(ends in WXYZ\), user 123/);
+    assert.ok(!shown.out.includes(key));
+
+    const group = JSON.parse((await run(["cloud", "set", "--group=456", "--json"])).out);
+    assert.equal(group.groupId, "456");
+    assert.equal(group.userId, undefined);
+    assert.equal(group.hasKey, true, "setting the creator keeps the key");
+
+    assert.equal((await run(["cloud", "set", "--user=abc"])).code, 1, "an id is a number");
+    assert.equal((await run(["cloud", "set", "--key-stdin"], "  ")).code, 1, "an empty stdin is refused");
+
+    const cleared = JSON.parse((await run(["cloud", "clear", "--json"])).out);
+    assert.equal(cleared.hasKey, false);
+    assert.equal(cleared.groupId, "456", "clear removes only the key");
+    assert.ok(!fs.readFileSync(file, "utf8").includes("ROBLOX_OPEN_CLOUD_API_KEY"));
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});

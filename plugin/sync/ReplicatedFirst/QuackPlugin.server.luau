@@ -88,6 +88,7 @@ const uiCallbacks: quackApp.CallbackFunctions = {
 		Config[key] = value
 		settingsStore:saveSettings() -- Playtest DataModels read settings when they start
 		if key == "SERVICE_LIST" then session:rebuildServiceSet() end
+		if key == "DAEMON_OUTPUT" then session:setDaemonOutput(Config.DAEMON_OUTPUT == true) end
 		if key == "AUTO_CONNECT" then
 			if value then
 				session:startAutoConnect()

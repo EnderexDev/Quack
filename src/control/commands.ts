@@ -8,7 +8,7 @@ import { PLAY_TAB_HINT } from "../play/overlay.js";
 import { rule, rulePrompt } from "./rule.js";
 import {
   assetDetails, assetThumbnail, detailsText, docsText, imageIdLua, rememberImageId, RobloxError, robloxDocs, robloxEnv, searchAssets, searchText,
-  uploadAsset, type RobloxEnv,
+  uploadAsset, type RobloxEnv, cloudSettings, saveCloudSettings,
 } from "./roblox.js";
 
 /**
@@ -41,6 +41,8 @@ export interface ControlContext {
   server?: ServerCommand;
   /** Where the AI clients are; tests point it at a scratch home */
   clients?: ClientsEnv;
+  /** The whole of stdin (cloud set --key-stdin: a key never goes on the command line) */
+  readStdin?: () => Promise<string>;
   /** The Roblox web tools' fetch, data folder and environment; tests replace them */
   roblox?: Partial<RobloxEnv>;
 }
@@ -134,6 +136,8 @@ interface Options {
   devices?: string;
   /** rule: the rule with how an AI installs or updates it (what the app copies) */
   prompt: boolean;
+  /** cloud set: the Open Cloud key comes on stdin */
+  keyStdin: boolean;
   /** docs, asset, memory, profiler, scene */
   type?: string;
   section?: string;
@@ -228,6 +232,7 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       "close-edited": { type: "boolean" },
       devices: { type: "string" },
       prompt: { type: "boolean" },
+      "key-stdin": { type: "boolean" },
       type: { type: "string" },
       section: { type: "string" },
       size: { type: "string" },
@@ -326,6 +331,7 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       closeEdited: values["close-edited"] === true,
       devices: values.devices,
       prompt: values.prompt === true,
+      keyStdin: values["key-stdin"] === true,
       type: values.type,
       section: values.section,
       size: values.size,
@@ -504,6 +510,10 @@ AI
   mcp                       An MCP server on stdio for Claude Code, Cursor, Codex: status, wait, log,
                             conflicts, doctor, play and the Studio commands as tools, with how
                             to use ${info.appName} as its instructions
+  cloud                     The Open Cloud key and creator upload_asset uses (the key's last 4 only)
+  cloud set [--user <id> | --group <id>] [--key-stdin]   Save them in open-cloud.env (the key read
+                            from stdin, never the command line; the app's Settings do the same)
+  cloud clear               Remove the saved key
   rule [--prompt]           How an AI uses ${info.appName}, for its instructions file (CLAUDE.md, AGENTS.md);
                             --prompt adds how the AI puts it there or swaps an older copy
                             (the app's "Copy rule for AI" copies that)
@@ -693,6 +703,8 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
       return restartHub(ctx, options);
     case "play":
       return play(ctx, options, args[0]);
+    case "cloud":
+      return cloud(ctx, options, args);
     case "rule": {
       const { version, text } = rule(ctx.info);
       const body = options.prompt ? rulePrompt(ctx.info) : text;
@@ -1885,6 +1897,34 @@ export function recordSummary(result: any): string {
 /** The Roblox web tools' world: %APPDATA%\quack (next to the registry) unless a test says otherwise */
 function rbx(ctx: ControlContext): RobloxEnv {
   return robloxEnv(ctx.roblox?.dataDir ?? path.dirname(ctx.info.registry), ctx.roblox);
+}
+
+/** The Open Cloud key and creator in open-cloud.env: shown (never the key), saved, cleared */
+async function cloud(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const env = rbx(ctx);
+  const action = args[0] ?? "show";
+  let result: ReturnType<typeof cloudSettings>;
+  if (action === "show") result = cloudSettings(env);
+  else if (action === "clear") result = saveCloudSettings(env, { key: "" });
+  else if (action === "set") {
+    if (options.user !== undefined && options.group !== undefined) throw new UsageError("give --user or --group, not both");
+    let key: string | undefined;
+    if (options.keyStdin) {
+      if (!ctx.readStdin) throw new UsageError("--key-stdin needs a key on stdin");
+      key = (await ctx.readStdin()).trim();
+      if (!key) throw new UsageError("no key came on stdin");
+    }
+    if (key === undefined && options.user === undefined && options.group === undefined) throw new UsageError("cloud set needs --key-stdin, --user <id> or --group <id>");
+    result = saveCloudSettings(env, { key, userId: options.user, groupId: options.group });
+  } else throw new UsageError("cloud [show] | cloud set [--user <id> | --group <id>] [--key-stdin] | cloud clear");
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  const creator = result.groupId ? `group ${result.groupId}` : result.userId ? `user ${result.userId}` : "no creator";
+  ctx.out(`${result.hasKey ? (result.keyEnd ? `Key saved (ends in ${result.keyEnd})` : "Key saved") : "No key saved"}, ${creator}: ${result.file}`);
+  if (result.fromEnvironment.length) ctx.out(`The environment sets ${result.fromEnvironment.join(", ")}, which wins over the file.`);
+  return EXIT.ok;
 }
 
 async function docs(ctx: ControlContext, options: Options, args: string[]): Promise<number> {

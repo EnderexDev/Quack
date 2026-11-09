@@ -11,7 +11,8 @@ import {
   LINE_BREAK,
   isStudioOutputMessage,
 } from "../studioOutput.js";
-import { timestamp } from "../util/log.js";
+import { timestamp, log } from "../util/log.js";
+import { getCurrentVersion } from "../util/versionUtils.js";
 import type { StudioOutputMessage } from "../ipc/messages.js";
 
 function waitForOpen(webSocket: WebSocket): Promise<void> {
@@ -228,6 +229,96 @@ test("rejects playtest output while Studio is not connected", async () => {
     await closed;
     assert.equal(ipcServer.isConnected(), false);
   } finally {
+    await stopServer(httpServer, ipcServer);
+  }
+});
+
+/** Opens a Studio connection, handshakes with `extra`, and collects every message it gets */
+async function handshaken(url: string, extra: Record<string, unknown>) {
+  const ws = new WebSocket(url);
+  const received: any[] = [];
+  ws.on("message", (data) => received.push(JSON.parse(data.toString())));
+  await waitForOpen(ws);
+  ws.send(JSON.stringify({ type: "handshakeStudio", version: getCurrentVersion(), ...extra }));
+  const deadline = Date.now() + 2000;
+  while (!received.some((m) => m.type === "handshakeAck")) {
+    assert.ok(Date.now() < deadline, "no handshakeAck");
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  return { ws, received };
+}
+
+const settle = () => new Promise((r) => setTimeout(r, 150));
+const logLines = (received: any[]) =>
+  received.filter((m) => m.type === "daemonLog").flatMap((m) => m.lines);
+
+test("sends the daemon log to a Studio that asked for it, as plain lines", async () => {
+  const { httpServer, ipcServer, url } = await startServer();
+  const { ws, received } = await handshaken(url, { daemonLog: true });
+  try {
+    assert.equal(received.find((m) => m.type === "handshakeAck")?.daemonLog, true);
+    log.info("Wrote %d files", 3);
+    log.script("src/Foo.luau", "updated");
+    log.warn("careful");
+    await settle();
+    assert.deepEqual(logLines(received), [
+      { level: "info", text: "Wrote 3 files" },
+      { level: "script", text: "~ src/Foo.luau" },
+      { level: "warn", text: "careful" },
+    ]);
+    // One message for lines logged together
+    assert.equal(received.filter((m) => m.type === "daemonLog").length, 1);
+
+    // Turned off while connected: nothing more
+    ws.send(JSON.stringify({ type: "daemonLogOptions", enabled: false }));
+    await settle();
+    log.info("after off");
+    await settle();
+    assert.equal(logLines(received).some((l) => l.text === "after off"), false);
+
+    // And on again
+    ws.send(JSON.stringify({ type: "daemonLogOptions", enabled: true }));
+    await settle();
+    log.info("after on");
+    await settle();
+    assert.equal(logLines(received).some((l) => l.text === "after on"), true);
+  } finally {
+    ws.terminate();
+    await stopServer(httpServer, ipcServer);
+  }
+});
+
+test("sends no log to a Studio that did not ask (off by default, older plugins)", async () => {
+  const { httpServer, ipcServer, url } = await startServer();
+  const { ws, received } = await handshaken(url, {});
+  try {
+    log.info("not for Studio");
+    await settle();
+    assert.deepEqual(logLines(received), []);
+  } finally {
+    ws.terminate();
+    await stopServer(httpServer, ipcServer);
+  }
+});
+
+test("a burst of log lines is capped and the rest counted", async () => {
+  const { httpServer, ipcServer, url } = await startServer();
+  const { ws, received } = await handshaken(url, { daemonLog: true });
+  try {
+    const print = console.log;
+    console.log = () => {};
+    try {
+      for (let i = 0; i < 1618; i++) log.script(`src/S${i}.luau`, "created");
+    } finally {
+      console.log = print;
+    }
+    await settle();
+    const messages = received.filter((m) => m.type === "daemonLog");
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].lines.length, 200);
+    assert.equal(messages[0].dropped, 1418);
+  } finally {
+    ws.terminate();
     await stopServer(httpServer, ipcServer);
   }
 });

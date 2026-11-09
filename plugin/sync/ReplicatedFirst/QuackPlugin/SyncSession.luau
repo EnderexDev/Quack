@@ -74,6 +74,7 @@ export type SyncSession = {
 	startAutoConnect: (self: SyncSession) -> (),
 	stopAutoConnect: (self: SyncSession) -> (),
 	setPlaceIgnored: (self: SyncSession, ignored: boolean) -> (),
+	setDaemonOutput: (self: SyncSession, enabled: boolean) -> (),
 	requestSetup: (self: SyncSession) -> (),
 	markPlaceSynced: (self: SyncSession) -> (),
 	restoreDeleted: (self: SyncSession, id: number) -> (),
@@ -100,6 +101,8 @@ export type SyncSession = {
 	_tracking: boolean?,
 	-- The link dropped while synced: changes queue up while it reconnects
 	_offline: boolean?,
+	-- The daemon's handshakeAck offered its log for Studio's Output (daemonLogOptions is safe)
+	_daemonLogOffered: boolean?,
 	_offlineSince: number?,
 	-- Scripts sent lately, with the text agreed before: resent after a resume
 	_recentScriptSends: { [string]: { at: number, base: string? } },
@@ -650,6 +653,31 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 		return sendMessage("pushConfig", {
 			config = configPayload,
 		})
+	end
+
+	--- "Quack log in Output" switched while connected. A daemon whose ack did not offer its log
+	--- (older than this setting) is told nothing: it would log the message as unknown.
+	function self:setDaemonOutput(enabled: boolean)
+		if not self.handshakeComplete or not self._daemonLogOffered then return end
+		sendMessage("daemonLogOptions", { enabled = enabled })
+	end
+
+	--- The daemon's log lines (`daemonLog`), as the app shows them, minus its clock: Studio's
+	--- Output has its own. Warnings and errors always show; the rest follows "Silent".
+	local function printDaemonLog(message)
+		if not self.config.DAEMON_OUTPUT or type(message.lines) ~= "table" then return end
+		for _, line in message.lines do
+			if type(line) ~= "table" or type(line.text) ~= "string" then continue end
+			if line.level == "warn" or line.level == "error" then
+				warn("[Quack]:", line.text)
+			else
+				Logger.info("[Quack]:", line.text)
+			end
+		end
+		local dropped = tonumber(message.dropped)
+		if dropped and dropped > 0 then
+			Logger.info(`[Quack]: ... {dropped} more lines, in the Quack app's log`)
+		end
 	end
 
 	local function onInstanceRemoved(instance)
@@ -1617,6 +1645,7 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 				end
 			end)
 		elseif message.type == "handshakeAck" then
+			self._daemonLogOffered = message.daemonLog == true
 			local daemonVersion = message.version
 			if
 				type(daemonVersion) ~= "string"
@@ -1692,6 +1721,8 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 				else nil)
 		elseif message.type == "pong" then
 			self:debugPrint("Received pong")
+		elseif message.type == "daemonLog" then
+			printDaemonLog(message)
 		else
 			warn("[Quack]: Unknown message type:", message.type)
 		end
@@ -1728,6 +1759,8 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 				-- Still tracking after a drop, with the changes queued: a daemon that has this
 				-- session's tree answers resumed and asks for no snapshot
 				resume = self._tracking == true,
+				-- "Quack log in Output": the daemon sends its log lines (an older one ignores this)
+				daemonLog = self.config.DAEMON_OUTPUT == true,
 			})
 
 			local startTime = tick()

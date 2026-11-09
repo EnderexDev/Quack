@@ -65,3 +65,29 @@ test("Settings copies the rule for AI from the shipped command", () => {
   }
   assert.equal([...i18n.matchAll(/ruleCopied: "[^"]*\{version\}/g)].length, 2, "ruleCopied names the version");
 });
+
+// 09/11/26: Settings keeps the Open Cloud key (through the shipped `cloud`, the key on stdin),
+// and a notice asks to give the AI the new rule until the user says they did
+test("Settings saves the Open Cloud key through `cloud`, and the rule notice stays until confirmed", () => {
+  const main = read("src-tauri/src/main.rs");
+  assert.match(main, /#\[tauri::command\]\r?\nasync fn cloud_settings\(/);
+  const handlers = main.slice(main.indexOf("generate_handler!["), main.indexOf("])", main.indexOf("generate_handler![")));
+  assert.match(handlers, /\bcloud_settings,/);
+  const command = main.slice(main.indexOf("async fn cloud_settings("), main.indexOf("/** The daemon settings"));
+  assert.match(command, /"--key-stdin"/, "the key goes on stdin");
+  assert.ok(!/format!\("--key/.test(command), "never on the command line");
+  assert.match(main, /rule_seen: Option<String>/);
+
+  const html = read("ui/index.html");
+  assert.match(html, /id="ruleUpdate"/);
+  const ui = read("ui/main.js");
+  const notice = ui.slice(ui.indexOf("function renderRuleNotice("), ui.indexOf("async function copyText("));
+  assert.match(notice, /seen !== version/, "shown while the confirmed version is not the shipped one");
+  assert.match(notice, /invoke\("set_settings", \{ ruleSeen: version \}\)/, "only the confirm click hides it");
+  assert.match(ui, /invoke\("cloud_settings"/);
+
+  const i18n = read("ui/i18n.js");
+  for (const key of ["ruleLabel", "ruleFirst", "ruleChanged", "ruleDone", "cloudCard", "cloudNote", "cloudKeySaved", "cloudKeySavedShort", "cloudSave", "cloudRemove", "cloudFile"]) {
+    assert.equal([...i18n.matchAll(new RegExp(`\\n\\s+${key}: "`, "g"))].length, 2, key);
+  }
+});

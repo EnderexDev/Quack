@@ -136,6 +136,7 @@ function SettingsStore:saveSettings()
 	globalScoped.SILENT_MODE = self.config.SILENT_MODE
 	globalScoped.AUTO_OPEN_MODAL = self.config.AUTO_OPEN_MODAL
 	globalScoped.SYNC_REMINDERS = self.config.SYNC_REMINDERS
+	globalScoped.DAEMON_OUTPUT = self.config.DAEMON_OUTPUT
 	allSettings[self.scopeEnum.GLOBAL] = globalScoped
 
 	allSettings[scopeKey] = scopedCopy
@@ -190,11 +191,12 @@ function SettingsStore:loadSettings()
 		if value ~= nil then self.config[key] = value end
 	end
 
-	-- DEBUG_MODE, SILENT_MODE, AUTO_OPEN_MODAL and SYNC_REMINDERS always come from global.
+	-- DEBUG_MODE, SILENT_MODE, AUTO_OPEN_MODAL, SYNC_REMINDERS and DAEMON_OUTPUT always come from global.
 	if globalScoped.DEBUG_MODE ~= nil then self.config.DEBUG_MODE = globalScoped.DEBUG_MODE end
 	if globalScoped.SILENT_MODE ~= nil then self.config.SILENT_MODE = globalScoped.SILENT_MODE end
 	if globalScoped.AUTO_OPEN_MODAL ~= nil then self.config.AUTO_OPEN_MODAL = globalScoped.AUTO_OPEN_MODAL end
 	if globalScoped.SYNC_REMINDERS ~= nil then self.config.SYNC_REMINDERS = globalScoped.SYNC_REMINDERS end
+	if globalScoped.DAEMON_OUTPUT ~= nil then self.config.DAEMON_OUTPUT = globalScoped.DAEMON_OUTPUT end
 end
 
 function SettingsStore:getScope(): string return self.scope end

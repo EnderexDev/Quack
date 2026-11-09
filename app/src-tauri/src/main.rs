@@ -104,6 +104,13 @@ struct Settings {
      */
     hub_entry: Option<String>,
     node: String,
+    /**
+     * The version of the rule for AI the user said they gave their AI ("I pasted it"). While the
+     * shipped rule's version differs, the window shows the rule notice; only that click hides it.
+     */
+    rule_seen: Option<String>,
+    /** The editor "Open in …" uses, by id; unset: the one used last */
+    editor: Option<String>,
 }
 
 impl Default for Settings {
@@ -116,6 +123,8 @@ impl Default for Settings {
             registry: appdata().join("quack").join(flavor::REGISTRY).to_string_lossy().into_owned(),
             hub_entry: None,
             node: "node".into(),
+            rule_seen: None,
+            editor: None,
         }
     }
 }
@@ -239,7 +248,14 @@ fn get_settings(app: AppHandle) -> Settings {
 }
 
 #[tauri::command]
-fn set_settings(app: AppHandle, language: Option<String>, notify: Option<bool>) -> Result<Settings, String> {
+fn set_settings(app: AppHandle, language: Option<String>, notify: Option<bool>, rule_seen: Option<String>, editor: Option<String>) -> Result<Settings, String> {
+    // An editor id must be one installed here; "" goes back to the one used last
+    let editor = match editor.as_deref() {
+        None => None,
+        Some("") => Some(None),
+        Some(id) if find_editors(&EditorRoots::of_this_computer()).iter().any(|e| e.id == id) => Some(Some(id.to_string())),
+        Some(id) => return Err(format!("the editor {id} was not found")),
+    };
     let shared = app.state::<Shared>();
     let settings = {
         let mut settings = shared.settings.lock().unwrap();
@@ -251,6 +267,15 @@ fn set_settings(app: AppHandle, language: Option<String>, notify: Option<bool>) 
         }
         if let Some(notify) = notify {
             settings.notify = notify;
+        }
+        if let Some(version) = rule_seen {
+            if version.len() > 32 || !version.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return Err("rule_seen must be a rule version".into());
+            }
+            settings.rule_seen = Some(version);
+        }
+        if let Some(editor) = editor {
+            settings.editor = editor;
         }
         settings.clone()
     };
@@ -719,6 +744,70 @@ async fn ai_rule(app: AppHandle) -> Result<Value, String> {
     .map_err(|e| e.to_string())?
 }
 
+/** The shipped command's path: this repo's dist in debug, resources/hub/cli.mjs installed */
+fn cli_path(app: &AppHandle) -> Result<PathBuf, String> {
+    if cfg!(debug_assertions) {
+        return Ok(Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("dist").join("control").join("main.js"));
+    }
+    resource(app, &["hub", "cli.mjs"]).ok_or_else(|| "the app's files were not found".to_string())
+}
+
+/**
+ * The Open Cloud key and creator upload_asset uses (`cloud`), and saving them (`cloud set` /
+ * `cloud clear`). The shipped command reads and writes open-cloud.env, so the app, the terminal and
+ * the upload never disagree. The key goes on the child's stdin, never its command line, and never
+ * comes back: the answer carries only its last 4 characters.
+ */
+#[tauri::command]
+async fn cloud_settings(app: AppHandle, key: Option<String>, user_id: Option<String>, group_id: Option<String>, clear: Option<bool>) -> Result<Value, String> {
+    let node = app.state::<Shared>().settings.lock().unwrap().node.clone();
+    let cli = cli_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut args: Vec<String> = vec!["--flavor".into(), flavor::CLI_FLAVOR.into(), "cloud".into()];
+        let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+        if clear == Some(true) {
+            args.push("clear".into());
+        } else if key.is_some() || user_id.is_some() || group_id.is_some() {
+            args.push("set".into());
+            if key.is_some() {
+                args.push("--key-stdin".into());
+            }
+            // An empty id clears that creator: passed as --user= so it is not read as a missing value
+            if let Some(id) = user_id {
+                args.push(format!("--user={id}"));
+            }
+            if let Some(id) = group_id {
+                args.push(format!("--group={id}"));
+            }
+        }
+        args.push("--json".into());
+        let mut child = hidden_command(&node)
+            .arg(&cli)
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("could not run {node}: {e}"))?;
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().ok_or("no stdin")?;
+            if let Some(key) = key {
+                stdin.write_all(key.as_bytes()).map_err(|e| e.to_string())?;
+            }
+            // Dropped here: the child sees the end of stdin
+        }
+        let output = child.wait_with_output().map_err(|e| e.to_string())?;
+        let value = serde_json::from_slice::<Value>(&output.stdout).map_err(|_| String::from_utf8_lossy(&output.stderr).trim().to_string())?;
+        match value.get("error").and_then(|e| e.as_str()) {
+            Some(error) => Err(error.to_string()),
+            None => Ok(value),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /** The daemon settings, read only: one file for every game, shared by Quack and Quack Dev */
 #[tauri::command]
 fn read_daemon_config() -> Value {
@@ -759,28 +848,168 @@ fn hidden_command(program: &str) -> Command {
     command
 }
 
+/** A code editor found on this computer, for "Open in …" */
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Editor {
+    /** Stable across updates: a VS Code fork's applicationName ("code", "cursor"), else fixed */
+    id: String,
+    name: String,
+    /** The GUI executable itself, never a `.cmd`: cmd.exe reads `&` or `|` in a folder name as
+     * a second command. The window never sees it; it names an editor by id only. */
+    #[serde(skip)]
+    exe: PathBuf,
+    /** When the editor last wrote its own state (unix seconds, 0 = unknown): Windows' launch
+     * counter (UserAssist) reads 0 runs for every editor on Windows 11 (measured 09/11/26), so
+     * the last time the editor was used is the best sign of which one the user works in */
+    last_used: u64,
+}
+
+fn modified_secs(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs())
+}
+
+/** The newest modification time among the files right inside each folder */
+fn newest_inside(dirs: &[PathBuf]) -> u64 {
+    dirs.iter()
+        .filter_map(|dir| fs::read_dir(dir).ok())
+        .flatten()
+        .flatten()
+        .map(|entry| modified_secs(&entry.path()))
+        .max()
+        .unwrap_or(0)
+}
+
 /**
- * VS Code's executable: next to the `bin\code.cmd` on PATH (the installer puts it there), or in
- * the default per-user and machine install folders
+ * A VS Code fork installed in `dir` (VS Code, Insiders, Cursor, Windsurf, VSCodium, Antigravity,
+ * …): every one carries `resources\app\product.json`, at the top or one versioned folder down,
+ * and its executable is `<nameShort>.exe`. Its state is in `<appdata>\<nameShort>\User`.
  */
-fn vscode_exe() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            if dir.join("code.cmd").is_file() {
-                if let Some(install) = dir.parent() {
-                    candidates.push(install.join("Code.exe"));
-                }
-            }
+fn vscode_fork_in(dir: &Path, appdata: &Path) -> Option<Editor> {
+    let product = std::iter::once(dir.to_path_buf())
+        .chain(fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir()))
+        .map(|root| root.join("resources").join("app").join("product.json"))
+        .find(|p| p.is_file())?;
+    let product: Value = serde_json::from_str(&fs::read_to_string(product).ok()?).ok()?;
+    // dataFolderName is VS Code's own field: an Electron app that only looks alike has none
+    product.get("dataFolderName")?;
+    let short = product["nameShort"].as_str()?;
+    let exe = Some(dir.join(format!("{short}.exe"))).filter(|p| p.is_file()).or_else(|| {
+        // Not named after nameShort: the one executable there that is not its uninstaller
+        let mut found = fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| {
+            let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+            name.ends_with(".exe") && !name.starts_with("unins")
+        });
+        let only = found.next()?;
+        found.next().is_none().then_some(only)
+    })?;
+    let user = appdata.join(short).join("User");
+    let global = user.join("globalStorage");
+    Some(Editor {
+        id: product["applicationName"].as_str().unwrap_or(short).to_lowercase(),
+        name: product["nameLong"].as_str().unwrap_or(short).to_string(),
+        exe,
+        last_used: [modified_secs(&global.join("storage.json")), modified_secs(&global.join("state.vscdb")), modified_secs(&user.join("workspaceStorage"))]
+            .into_iter()
+            .max()
+            .unwrap_or(0),
+    })
+}
+
+/** The folders the editors are looked for in, and where they keep their state */
+struct EditorRoots {
+    /** Install folders' parents: %LOCALAPPDATA%\Programs, %ProgramFiles%, %ProgramFiles(x86)% */
+    installs: Vec<PathBuf>,
+    /** Install folders named directly: the parent of each `bin` folder on PATH */
+    on_path: Vec<PathBuf>,
+    appdata: PathBuf,
+    local_appdata: PathBuf,
+}
+
+impl EditorRoots {
+    fn of_this_computer() -> Self {
+        let env = |name: &str| std::env::var_os(name).map(PathBuf::from);
+        let local_appdata = env("LOCALAPPDATA").unwrap_or_default();
+        let installs = [Some(local_appdata.join("Programs")), env("ProgramFiles"), env("ProgramFiles(x86)")]
+            .into_iter()
+            .flatten()
+            .collect();
+        let on_path = std::env::var_os("PATH")
+            .map(|paths| {
+                std::env::split_paths(&paths)
+                    .filter(|dir| dir.file_name().is_some_and(|n| n.eq_ignore_ascii_case("bin")))
+                    .filter_map(|dir| dir.parent().map(Path::to_path_buf))
+                    .collect()
+            })
+            .unwrap_or_default();
+        EditorRoots { installs, on_path, appdata: appdata(), local_appdata }
+    }
+}
+
+/** Every editor installed, each once, in no particular order */
+fn find_editors(roots: &EditorRoots) -> Vec<Editor> {
+    let mut found: Vec<Editor> = Vec::new();
+    let mut add = |editor: Editor| {
+        if !found.iter().any(|e| e.id == editor.id) {
+            found.push(editor);
+        }
+    };
+    let dirs = roots
+        .installs
+        .iter()
+        .filter_map(|parent| fs::read_dir(parent).ok())
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .chain(roots.on_path.iter().cloned())
+        .filter(|p| p.is_dir());
+    for dir in dirs {
+        if let Some(editor) = vscode_fork_in(&dir, &roots.appdata) {
+            add(editor);
         }
     }
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        candidates.push(PathBuf::from(local).join("Programs").join("Microsoft VS Code").join("Code.exe"));
+    // Two editors that are not VS Code underneath, each in its installer's default folder
+    let zed_data = roots.local_appdata.join("Zed").join("db");
+    let zed_used = fs::read_dir(&zed_data).map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>()).unwrap_or_default();
+    let others = [
+        ("zed", "Zed", vec![roots.local_appdata.join("Programs").join("Zed").join("Zed.exe")], newest_inside(&zed_used)),
+        (
+            "sublime_text",
+            "Sublime Text",
+            roots.installs.iter().map(|p| p.join("Sublime Text").join("sublime_text.exe")).collect(),
+            modified_secs(&roots.appdata.join("Sublime Text").join("Local").join("Session.sublime_session")),
+        ),
+    ];
+    for (id, name, candidates, last_used) in others {
+        if let Some(exe) = candidates.into_iter().find(|p| p.is_file()) {
+            add(Editor { id: id.into(), name: name.into(), exe, last_used });
+        }
     }
-    if let Some(program_files) = std::env::var_os("ProgramFiles") {
-        candidates.push(PathBuf::from(program_files).join("Microsoft VS Code").join("Code.exe"));
-    }
-    candidates.into_iter().find(|path| path.is_file())
+    found
+}
+
+/** The user's pick first (when still installed), then the one used last, then by name */
+fn rank_editors(mut editors: Vec<Editor>, preferred: Option<&str>) -> Vec<Editor> {
+    editors.sort_by(|a, b| {
+        let picked = |e: &Editor| Some(e.id.as_str()) == preferred;
+        picked(b).cmp(&picked(a)).then(b.last_used.cmp(&a.last_used)).then_with(|| a.name.cmp(&b.name))
+    });
+    editors
+}
+
+fn editors_for(app: &AppHandle) -> Vec<Editor> {
+    let preferred = app.state::<Shared>().settings.lock().unwrap().editor.clone();
+    rank_editors(find_editors(&EditorRoots::of_this_computer()), preferred.as_deref())
+}
+
+/** The editors on this computer, the one "Open in …" uses first */
+#[tauri::command]
+fn editors(app: AppHandle) -> Vec<Editor> {
+    editors_for(&app)
 }
 
 #[tauri::command]
@@ -790,10 +1019,8 @@ fn open_path(app: AppHandle, path: String, editor: bool) -> Result<(), String> {
         return Err("only a registered game's folder can be opened".into());
     }
     let result = if editor {
-        // Code.exe itself, never `code.cmd` through cmd.exe: cmd would read a `&` or `|` in a
-        // folder name as a second command
-        let Some(code) = vscode_exe() else { return Err("VS Code was not found".into()) };
-        Command::new(code).arg(&path).spawn()
+        let Some(editor) = editors_for(&app).into_iter().next() else { return Err("no code editor was found".into()) };
+        Command::new(editor.exe).arg(&path).spawn()
     } else {
         Command::new("explorer").arg(&path).spawn()
     };
@@ -1019,11 +1246,73 @@ mod tests {
     }
 
     #[test]
-    fn vscode_is_launched_as_an_executable_never_through_a_script() {
+    fn every_editor_found_here_is_launched_as_an_executable_never_through_a_script() {
         // cmd.exe would read & or | in a folder name as a second command
-        if let Some(code) = vscode_exe() {
-            assert!(code.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")), "{code:?}");
+        for editor in find_editors(&EditorRoots::of_this_computer()) {
+            assert!(editor.exe.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")), "{editor:?}");
+            assert!(editor.exe.is_file(), "{editor:?}");
         }
+    }
+
+    fn fake_fork(dir: &Path, exe: &str, product: Value) {
+        fs::create_dir_all(dir.join("resources").join("app")).unwrap();
+        fs::write(dir.join("resources").join("app").join("product.json"), product.to_string()).unwrap();
+        fs::write(dir.join(exe), "").unwrap();
+        fs::write(dir.join("unins000.exe"), "").unwrap();
+    }
+
+    #[test]
+    fn the_editors_installed_are_found_with_the_time_each_was_last_used() {
+        let root = std::env::temp_dir().join(format!("quack-editors-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let programs = root.join("Local").join("Programs");
+        let program_files = root.join("Program Files");
+        let appdata = root.join("Roaming");
+        let fork = |short: &str, app: &str| json!({ "nameShort": short, "nameLong": format!("{short} Long"), "applicationName": app, "dataFolderName": format!(".{app}") });
+        // Per-user, with the state it writes when used
+        fake_fork(&programs.join("Antigravity IDE"), "Antigravity IDE.exe", fork("Antigravity IDE", "antigravity-ide"));
+        let global = appdata.join("Antigravity IDE").join("User").join("globalStorage");
+        fs::create_dir_all(&global).unwrap();
+        fs::write(global.join("storage.json"), "{}").unwrap();
+        // Machine-wide, the product.json one versioned folder down
+        let code = program_files.join("Microsoft VS Code");
+        fake_fork(&code.join("abc123"), "unused.exe", fork("Code", "code"));
+        fs::write(code.join("Code.exe"), "").unwrap();
+        // The same editor again in a second place is listed once
+        fake_fork(&program_files.join("Antigravity IDE"), "Antigravity IDE.exe", fork("Antigravity IDE", "antigravity-ide"));
+        // An Electron app with a product.json that is not VS Code's
+        fs::create_dir_all(programs.join("Notion").join("resources").join("app")).unwrap();
+        fs::write(programs.join("Notion").join("resources").join("app").join("product.json"), r#"{"nameShort":"Notion"}"#).unwrap();
+        fs::write(programs.join("Notion").join("Notion.exe"), "").unwrap();
+        // Zed, used through its database
+        fs::create_dir_all(programs.join("Zed")).unwrap();
+        fs::write(programs.join("Zed").join("Zed.exe"), "").unwrap();
+        fs::create_dir_all(root.join("Local").join("Zed").join("db").join("0-stable")).unwrap();
+        fs::write(root.join("Local").join("Zed").join("db").join("0-stable").join("db.sqlite"), "").unwrap();
+
+        let roots = EditorRoots { installs: vec![programs.clone(), program_files.clone()], on_path: vec![], appdata, local_appdata: root.join("Local") };
+        let mut found = find_editors(&roots);
+        found.sort_by(|a, b| a.id.cmp(&b.id));
+        let ids: Vec<_> = found.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["antigravity-ide", "code", "zed"]);
+        assert_eq!(found[0].exe, programs.join("Antigravity IDE").join("Antigravity IDE.exe"), "the first place found wins");
+        assert_eq!(found[0].name, "Antigravity IDE Long");
+        assert!(found[0].last_used > 0, "its storage.json dates its last use");
+        assert_eq!(found[1].exe, code.join("Code.exe"));
+        assert_eq!(found[1].last_used, 0, "never opened: no state");
+        assert!(found[2].last_used > 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_editor_picked_comes_first_then_the_one_used_last() {
+        let editor = |id: &str, last_used: u64| Editor { id: id.into(), name: id.to_uppercase(), exe: PathBuf::new(), last_used };
+        let all = vec![editor("code", 100), editor("zed", 300), editor("cursor", 0), editor("antigravity-ide", 0)];
+        let order = |preferred| rank_editors(all.clone(), preferred).into_iter().map(|e| e.id).collect::<Vec<_>>();
+        assert_eq!(order(None), ["zed", "code", "antigravity-ide", "cursor"]);
+        assert_eq!(order(Some("cursor")), ["cursor", "zed", "code", "antigravity-ide"]);
+        // A pick that was uninstalled since falls back to the one used last
+        assert_eq!(order(Some("sublime_text"))[0], "zed");
     }
 }
 
@@ -1316,6 +1605,8 @@ fn main() {
             read_daemon_config,
             ai_clients,
             ai_rule,
+            cloud_settings,
+            editors,
             open_path,
             show_main,
             tray_fit,

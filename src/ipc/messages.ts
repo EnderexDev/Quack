@@ -2,6 +2,8 @@
  * Types for communication protocol between Studio and Daemon
  */
 
+import type { LogLevel } from "../util/log.js";
+
 export type InstanceClassName =
   | "Script"
   | "LocalScript"
@@ -55,7 +57,8 @@ export type StudioPayloadMessage =
   | HandshakeMessageStudio
   | PlayOverlayResultMessage
   | PlayVerifyMessage
-  | ToolResultMessage;
+  | ToolResultMessage
+  | DaemonLogOptionsMessage;
 
 export interface BatchMessage {
   type: "batch";
@@ -122,6 +125,8 @@ export interface HandshakeAckMessage {
   version: string;
   /** The daemon has this session's tree: no snapshot follows, the plugin sends what it queued */
   resumed?: boolean;
+  /** This daemon can send its log to Studio's Output (`daemonLog`); older ones never say so */
+  daemonLog?: boolean;
 }
 
 export interface HandshakeMessageStudio {
@@ -139,6 +144,28 @@ export interface HandshakeMessageStudio {
    * daemon that already has this session's tree can skip the full snapshot (Quack 1.0.11 on)
    */
   resume?: boolean;
+  /** "Quack log in Output" is on: the daemon sends its log lines (`daemonLog`) */
+  daemonLog?: boolean;
+}
+
+/** The plugin's "Quack log in Output" switch changed while connected (sent only to a daemon whose ack said `daemonLog`) */
+export interface DaemonLogOptionsMessage {
+  type: "daemonLogOptions";
+  enabled: boolean;
+}
+
+/** One line of the daemon's log, as Studio's Output shows it */
+export interface DaemonLogLine {
+  level: LogLevel;
+  text: string;
+}
+
+/** The daemon's log lines since the last one of these; sent only to a Studio that asked */
+export interface DaemonLogMessage {
+  type: "daemonLog";
+  lines: DaemonLogLine[];
+  /** Lines left out of this message (a burst past the cap); the app's log has them */
+  dropped?: number;
 }
 
 /**
@@ -159,7 +186,8 @@ export type DaemonMessage =
   | DeleteInstanceMessage
   | MoveInstanceMessage
   | PlayOverlayMessage
-  | ToolRequestMessage;
+  | ToolRequestMessage
+  | DaemonLogMessage;
 
 export interface PatchScriptMessage {
   type: "patchScript";

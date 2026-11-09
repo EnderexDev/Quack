@@ -8,7 +8,7 @@ import { PassThrough } from "node:stream";
 import { runControl } from "../control/commands.js";
 import { flavorInfo, HubClient } from "../control/hubClient.js";
 import { serveMcp } from "../control/mcp.js";
-import { assetThumbnail, docSecurity, robloxDocs, robloxEnv, searchAssets, uploadAsset, type RobloxEnv } from "../control/roblox.js";
+import { assetThumbnail, cloudSettings, docSecurity, saveCloudSettings, robloxDocs, robloxEnv, searchAssets, uploadAsset, type RobloxEnv } from "../control/roblox.js";
 
 /** A fake web: each call is logged; `route` answers by URL (a thrown error is a network failure) */
 function fakeWeb(route: (url: URL, init: any, n: number) => Response | Promise<Response>) {
@@ -462,6 +462,46 @@ test("mcp: get_roblox_docs, search_assets and get_asset_thumbnail run with no hu
     assert.match(insert.content[0].text, /no hub answers/, "a negative position is a value, not an option; with no hub the place cannot be found");
     input.end();
     await done;
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+// Review of 09/11/26: a short key is never shown whole, an unreadable file is never replaced, and
+// the temporary file is a new one of its own (no leftovers)
+test("cloud settings: a short key shows no end, an unreadable open-cloud.env is left alone, no temp file stays", () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-cloud-review-"));
+  try {
+    const env = robloxEnv(dataDir, { env: {} });
+    const short = saveCloudSettings(env, { key: "abcd1234" });
+    assert.equal(short.hasKey, true);
+    assert.equal(short.keyEnd, undefined, "8 characters: no end shown");
+    assert.equal(saveCloudSettings(env, { key: "0123456789abcdefWXYZ" }).keyEnd, "WXYZ");
+    assert.deepEqual(fs.readdirSync(dataDir).filter((f) => f.endsWith(".tmp")), [], "no temporary file left");
+
+    // A folder where the file goes: reading fails with something other than "not there"
+    const blocked = path.join(dataDir, "blocked");
+    fs.mkdirSync(path.join(blocked, "open-cloud.env"), { recursive: true });
+    const blockedEnv = robloxEnv(blocked, { env: {} });
+    assert.throws(() => saveCloudSettings(blockedEnv, { key: "0123456789abcdefWXYZ" }), /could not be read, so it was left as it is/);
+    assert.ok(fs.statSync(path.join(blocked, "open-cloud.env")).isDirectory(), "what was there stays");
+    assert.equal(cloudSettings(blockedEnv).hasKey, false);
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("cloud: a short saved key reads as saved, never as ending in undefined", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-cloud-short-"));
+  try {
+    saveCloudSettings(robloxEnv(dataDir, { env: {} }), { key: "abcd1234" });
+    const out: string[] = [];
+    await runControl(["cloud"], {
+      info: flavorInfo("dev"), client: new HubClient(1), out: (l) => out.push(l), err: (l) => out.push(l),
+      confirm: async () => false, interactive: false, color: false, cwd: dataDir, openUri: async () => {}, roblox: { dataDir, env: {} },
+    });
+    assert.match(out[0], /^Key saved, no creator: /);
+    assert.ok(!out.join("\n").includes("undefined"));
   } finally {
     fs.rmSync(dataDir, { recursive: true, force: true });
   }

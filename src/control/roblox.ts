@@ -505,6 +505,90 @@ export function cloudCredentials(env: RobloxEnv, given: { userId?: string; group
   return { key, userId, groupId, fileName };
 }
 
+const CLOUD_KEYS = ["ROBLOX_OPEN_CLOUD_API_KEY", "ROBLOX_CREATOR_USER_ID", "ROBLOX_CREATOR_GROUP_ID"] as const;
+
+/**
+ * What the app's Open Cloud setting shows: whether a key is saved and its last 4 characters (never
+ * the key), the creator, and which values the environment sets instead (the environment wins).
+ */
+export function cloudSettings(env: RobloxEnv) {
+  const fileName = path.join(env.dataDir, "open-cloud.env");
+  let file: Record<string, string> = {};
+  try {
+    file = parseEnvFile(fs.readFileSync(fileName, "utf8"));
+  } catch {
+    // no file yet
+  }
+  const key = file.ROBLOX_OPEN_CLOUD_API_KEY?.trim() || undefined;
+  return {
+    file: fileName,
+    hasKey: Boolean(key),
+    // The last 4 only of a key long enough that they say nothing of the rest
+    keyEnd: key && key.length > 12 ? key.slice(-4) : undefined,
+    userId: file.ROBLOX_CREATOR_USER_ID?.trim() || undefined,
+    groupId: file.ROBLOX_CREATOR_GROUP_ID?.trim() || undefined,
+    fromEnvironment: CLOUD_KEYS.filter((k) => Boolean(env.env[k]?.trim())),
+  };
+}
+
+/**
+ * Writes the key and the creator into open-cloud.env, keeping every other line (comments, other
+ * names) as it was. key: a new key ("" removes it); undefined leaves it. A user id removes the
+ * group id and the other way round: one creator at a time, as the upload takes it.
+ */
+export function saveCloudSettings(env: RobloxEnv, change: { key?: string; userId?: string; groupId?: string }) {
+  for (const [name, value] of [["user", change.userId], ["group", change.groupId]] as const) {
+    if (value !== undefined && value !== "" && !/^\d+$/.test(value)) throw new RobloxError(`the creator ${name} id must be a number, not "${value}"`);
+  }
+  if (change.userId && change.groupId) throw new RobloxError("one creator: a user id or a group id, not both");
+  const key = change.key?.trim();
+  if (key !== undefined && /\s/.test(key)) throw new RobloxError("an Open Cloud key has no spaces or line breaks");
+  const fileName = path.join(env.dataDir, "open-cloud.env");
+  let lines: string[] = [];
+  try {
+    lines = fs.readFileSync(fileName, "utf8").split(/\r?\n/);
+    if (lines.at(-1) === "") lines.pop();
+  } catch (error) {
+    // Only a missing file starts a new one: a file that is there but unreadable is never replaced
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new RobloxError(`${fileName} could not be read, so it was left as it is: ${(error as Error).message}`);
+    lines = ["# Open Cloud for Quack's upload_asset (the app's Settings write this file)"];
+  }
+  const wanted = new Map<string, string | null>();
+  if (key !== undefined) wanted.set("ROBLOX_OPEN_CLOUD_API_KEY", key || null);
+  if (change.userId !== undefined) {
+    wanted.set("ROBLOX_CREATOR_USER_ID", change.userId || null);
+    if (change.userId) wanted.set("ROBLOX_CREATOR_GROUP_ID", null);
+  }
+  if (change.groupId !== undefined) {
+    wanted.set("ROBLOX_CREATOR_GROUP_ID", change.groupId || null);
+    if (change.groupId) wanted.set("ROBLOX_CREATOR_USER_ID", null);
+  }
+  const out: string[] = [];
+  const written = new Set<string>();
+  for (const line of lines) {
+    const name = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/.exec(line)?.[1];
+    if (name && wanted.has(name)) {
+      const value = wanted.get(name);
+      if (value !== null && !written.has(name)) out.push(`${name}=${value}`);
+      written.add(name);
+      continue;
+    }
+    out.push(line);
+  }
+  for (const [name, value] of wanted) if (value !== null && !written.has(name)) out.push(`${name}=${value}`);
+  fs.mkdirSync(env.dataDir, { recursive: true });
+  // A new file of its own (wx: never one already there), then one rename over the old
+  const temp = `${fileName}.${randomBytes(8).toString("hex")}.tmp`;
+  try {
+    fs.writeFileSync(temp, `${out.join("\n")}\n`, { mode: 0o600, flag: "wx" });
+    fs.renameSync(temp, fileName);
+  } catch (error) {
+    fs.rmSync(temp, { force: true });
+    throw error;
+  }
+  return cloudSettings(env);
+}
+
 interface UploadEntry {
   state: "posting" | "pending" | "done" | "failed";
   at: string;
@@ -581,8 +665,8 @@ export async function uploadAsset(env: RobloxEnv, args: { file: string; assetTyp
     throw new RobloxError(`cannot read ${args.file}: ${(error as Error).message}`);
   }
   const creds = cloudCredentials(env, { userId: args.userId, groupId: args.groupId });
-  if (!creds.key) throw new RobloxError(`no Open Cloud key: set ROBLOX_OPEN_CLOUD_API_KEY (a key with asset:read and asset:write), or put ROBLOX_OPEN_CLOUD_API_KEY=... in ${creds.fileName}`);
-  if (!creds.userId && !creds.groupId) throw new RobloxError(`no creator: set ROBLOX_CREATOR_USER_ID or ROBLOX_CREATOR_GROUP_ID (in the environment or ${creds.fileName}), or give a user or group id`);
+  if (!creds.key) throw new RobloxError(`no Open Cloud key: the user saves one (asset:read and asset:write) in Quack's Settings, Open Cloud; or ROBLOX_OPEN_CLOUD_API_KEY in the environment or in ${creds.fileName}`);
+  if (!creds.userId && !creds.groupId) throw new RobloxError(`no creator: give a user or group id, or the user sets the owner of uploads in Quack's Settings, Open Cloud (or ROBLOX_CREATOR_USER_ID / ROBLOX_CREATOR_GROUP_ID in the environment or ${creds.fileName})`);
   const apiKey = creds.key;
   const scrub = (text: string) => text.split(apiKey).join("***");
   const creator = creds.groupId ? `group ${creds.groupId}` : `user ${creds.userId}`;

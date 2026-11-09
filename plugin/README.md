@@ -28,3 +28,6 @@ reopen the place to run a new build. Check the Luau first with `luau-lsp analyze
 - A place the hub does not know shows a pop-up with "Ignore this place"; registering it is done
   in the Quack app (Settings > Add folder).
 - Playtest output reaches the app's Playtest tab with "Playtest output" on.
+- "Quack log in Output" (off by default) prints the app's log in Studio's Output too: scripts
+  written, merges, refusals. Warnings show even with "Silent" on; a burst past 200 lines (the
+  first sync of a big place) is cut, and the app's log keeps all of it.

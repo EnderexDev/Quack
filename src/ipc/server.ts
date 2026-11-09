@@ -1,6 +1,6 @@
 import { WebSocketServer, WebSocket } from "ws";
-import { log } from "../util/log.js";
-import type { StudioMessage, DaemonMessage } from "./messages.js";
+import { log, addLogSink, type LogLevel } from "../util/log.js";
+import type { StudioMessage, DaemonMessage, DaemonLogLine, DaemonLogMessage } from "./messages.js";
 import { isStudioOutputMessage } from "../studioOutput.js";
 import type { SnapshotRequestOptions, PlayVerifyMessage, ToolResultMessage, ToolRequestMessage, StudioOutputMessage } from "./messages.js";
 
@@ -34,6 +34,15 @@ import {
 } from "../util/versionUtils.js";
 
 const DAEMON_VERSION = getCurrentVersion();
+
+/** Log lines go to Studio together, one message per this many ms */
+const LOG_FLUSH_MS = 50;
+/**
+ * Most lines in one message: the first sync of a place writes a line per script (1618 in the
+ * Anime Astral copy) and Studio's Output would scroll past everything else. The rest is
+ * counted and stays in the app's log.
+ */
+const LOG_BATCH_MAX = 200;
 
 export type MessageHandler = (message: StudioMessage) => void;
 
@@ -91,6 +100,12 @@ export class IPCServer {
   /** A successor on standby answers no handshake until it has taken over (holdHandshakes) */
   private handshakeGate: Promise<void> | null = null;
   private openGate: (() => void) | null = null;
+  /** The connected Studio asked for this daemon's log in its Output ("Quack log in Output") */
+  private logToStudio = false;
+  private logLines: DaemonLogLine[] = [];
+  private logDropped = 0;
+  private logFlush: NodeJS.Timeout | null = null;
+  private removeLogSink: () => void;
 
   constructor(port?: number, server?: HttpServer, options?: IPCServerOptions) {
     this.requestSnapshotOnConnect = options?.requestSnapshotOnConnect !== false;
@@ -112,6 +127,42 @@ export class IPCServer {
       });
     }
     this.setupServer();
+    this.removeLogSink = addLogSink((level, text) => this.queueLogLine(level, text));
+  }
+
+  /** Keeps a log line for the next `daemonLog`, when the connected Studio asked for them */
+  private queueLogLine(level: LogLevel, text: string): void {
+    // Debug lines (every ping and pong) stay in the app's log: the plugin has its own debug switch
+    if (level === "debug") return;
+    if (!this.logToStudio || !this.handshakeComplete || this.client?.readyState !== WebSocket.OPEN) return;
+    if (this.logLines.length >= LOG_BATCH_MAX) this.logDropped++;
+    else this.logLines.push({ level, text });
+    this.logFlush ??= setTimeout(() => this.flushLogLines(), LOG_FLUSH_MS);
+  }
+
+  /** Sends the kept lines straight on the socket: `send` logs its failures, which would queue more */
+  private flushLogLines(): void {
+    this.logFlush = null;
+    const lines = this.logLines;
+    const dropped = this.logDropped;
+    this.logLines = [];
+    this.logDropped = 0;
+    const client = this.client;
+    if (lines.length === 0 || !this.logToStudio || !client || client.readyState !== WebSocket.OPEN) return;
+    const message: DaemonLogMessage = { type: "daemonLog", lines, ...(dropped > 0 ? { dropped } : {}) };
+    try {
+      client.send(JSON.stringify(message));
+    } catch {
+      // The socket closed under it: the lines stay in the app's log
+    }
+  }
+
+  private setLogToStudio(enabled: boolean): void {
+    this.logToStudio = enabled;
+    if (!enabled) {
+      this.logLines = [];
+      this.logDropped = 0;
+    }
   }
 
   private setupServer(): void {
@@ -145,6 +196,7 @@ export class IPCServer {
 
       this.client = ws;
       this.handshakeComplete = false;
+      this.setLogToStudio(false);
       this.resumed = false;
       this.studioSession = undefined;
       this.studioSince = Date.now();
@@ -161,10 +213,16 @@ export class IPCServer {
 
           if (message.type === "handshakeStudio") {
             if (typeof message.session === "string" && message.session.length <= 100) this.studioSession = message.session;
+            this.setLogToStudio(message.daemonLog === true);
             const handshake = () => this.handleHandshake(message.version, { session: this.studioSession, resume: message.resume === true });
             // On standby: answered once this daemon has taken over, the moment it can resume
             if (this.handshakeGate) void this.handshakeGate.then(() => (this.client === ws ? handshake() : undefined));
             else void handshake();
+            return;
+          }
+
+          if (message.type === "daemonLogOptions") {
+            this.setLogToStudio(message.enabled === true);
             return;
           }
 
@@ -198,6 +256,7 @@ export class IPCServer {
         log.info("Studio client disconnected");
         this.client = null;
         this.handshakeComplete = false;
+        this.setLogToStudio(false);
         this.studioSession = undefined;
         this.studioSince = undefined;
         this.closeOutputClients();
@@ -285,6 +344,8 @@ export class IPCServer {
       type: "handshakeAck",
       version: versionToAnnounce(pluginVersion, DAEMON_VERSION),
       ...(this.resumed ? { resumed: true } : {}),
+      // A plugin may send daemonLogOptions; an older daemon would log it as unknown
+      daemonLog: true,
     });
     // Resumed: the disk edits this Studio missed follow the ack, the latest text of each script
     if (this.resumed && this.missedPatches.size > 0) {
@@ -656,6 +717,10 @@ export class IPCServer {
       clearInterval(interval);
     }
     this.pingIntervals.clear();
+    this.removeLogSink();
+    if (this.logFlush) clearTimeout(this.logFlush);
+    this.logFlush = null;
+    this.setLogToStudio(false);
 
     if (this.client) {
       this.client.terminate();

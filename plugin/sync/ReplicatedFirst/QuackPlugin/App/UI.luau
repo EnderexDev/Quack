@@ -97,6 +97,7 @@ type QuackUI = {
 	autoOpenModal: fusion.Value<boolean>,
 	syncReminders: fusion.Value<boolean>,
 	streamSoloOutput: fusion.Value<boolean>,
+	daemonOutput: fusion.Value<boolean>,
 	settingsScopeValue: fusion.Value<string>,
 	listTypeValue: fusion.Value<string>,
 
@@ -806,6 +807,7 @@ local function buildContent(self, scope: Scope, helpers)
 			if self.callbacks.onAutoConnectChanged then self.callbacks.onAutoConnectChanged(v) end
 		end)),
 		settingRow(scope, "Playtest output", "Shown in the Quack app's Playtest tab.", switch(self.streamSoloOutput, "STREAM_SOLO_OUTPUT")),
+		settingRow(scope, "Quack log in Output", "The app's log also in Studio's Output.", switch(self.daemonOutput, "DAEMON_OUTPUT")),
 		settingRow(scope, "Notifications", "Pop-ups for connects, refusals and merges.", switch(self.notifications, "NOTIFICATIONS")),
 	})
 
@@ -1019,6 +1021,7 @@ function UI.new(plugin, callbacks, settingsScope, helpers): QuackUI
 	self.autoOpenModal = scope:Value(Config.AUTO_OPEN_MODAL)
 	self.syncReminders = scope:Value(Config.SYNC_REMINDERS)
 	self.streamSoloOutput = scope:Value(Config.STREAM_SOLO_OUTPUT)
+	self.daemonOutput = scope:Value(Config.DAEMON_OUTPUT)
 	self.settingsScopeValue = scope:Value(settingsScope == Enums.scope.GLOBAL and "Global" or "Project")
 	self.listTypeValue = scope:Value(Config.LIST_TYPE == Enums.listType.WHITELIST and "Whitelist" or "Blacklist")
 
@@ -1138,6 +1141,7 @@ function UI:UpdateConfig()
 	self.autoOpenModal:set(Config.AUTO_OPEN_MODAL)
 	self.syncReminders:set(Config.SYNC_REMINDERS)
 	self.streamSoloOutput:set(Config.STREAM_SOLO_OUTPUT)
+	self.daemonOutput:set(Config.DAEMON_OUTPUT)
 	self.settingsScopeValue:set(if self.settingsScope == Enums.scope.GLOBAL then "Global" else "Project")
 	self.listTypeValue:set(if Config.LIST_TYPE == Enums.listType.WHITELIST then "Whitelist" else "Blacklist")
 

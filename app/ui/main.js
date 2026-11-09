@@ -13,6 +13,8 @@ const CONTEXT_LINES = 3;
 const ui = {
   /** A new version of the app, downloaded and waiting for the click */
   update: null,
+  /** The rule for AI this install ships ({ version, text }), for the notice */
+  rule: null,
   /** The app's version and the build of the hub it ships (null in a debug run) */
   app: { version: "", build: null },
   settings: { hubPort: 3826, language: "en" },
@@ -21,6 +23,8 @@ const ui = {
   view: "output",
   conflictId: null,
   register: null,
+  /** The code editors on this computer, the one "Open in …" uses first (Rust ranks them) */
+  editors: [],
 };
 const logs = new Map(); // placeId -> { next, lines, reading }
 let contentKey = "";
@@ -170,7 +174,82 @@ function renderNav() {
   const place = placeOf(ui.placeId);
   mergeBadge.textContent = place?.conflicts ?? "";
   mergeBadge.classList.toggle("hidden", !place?.conflicts);
-  openCode.classList.toggle("hidden", !place || ui.view === "settings");
+  // Rebuilt only when it changes: the nav renders on every state poll
+  const key = place && ui.view !== "settings" && ui.editors.length ? `${place.folder}\n${ui.editors.map((e) => e.id)}\n${getLanguage()}` : "";
+  if (key !== openCodeKey) {
+    openCodeKey = key;
+    openCode.replaceChildren(key ? editorButtons(place.folder, "yellow chunk-bright") : "");
+  }
+}
+
+let openCodeKey = "";
+
+/**
+ * Asks the app for the editors again; the views redraw only when the order changed. Coming back
+ * from the editor changes its lastUsed every time, and a redraw for that alone would rebuild the
+ * view (and a half-typed form) on each return.
+ */
+async function loadEditors() {
+  const editors = await invoke("editors").catch(() => []);
+  const order = (list) => list.map((e) => `${e.id}:${e.name}`).join();
+  if (order(editors) === order(ui.editors)) return;
+  ui.editors = editors;
+  contentKey = "";
+  renderMain();
+}
+
+/**
+ * "Open in {editor}", the one picked or else the one used last, and a ▾ with the others when
+ * there are any. An editor picked in that list stays the one this button opens (Settings goes
+ * back to the one used last).
+ */
+function editorButtons(path, look) {
+  const [first] = ui.editors;
+  if (!first) return h("button", { class: `btn ${look} press`, disabled: true }, t("noEditor"));
+  const open = h("button", { class: `btn ${look} press`, onclick: () => invoke("open_path", { path, editor: true }).catch(fail) }, t("openIn", { name: first.name }));
+  if (ui.editors.length < 2) return open;
+  const more = h("button", { class: `btn ${look} press more`, title: t("otherEditor"), "aria-label": t("otherEditor"), "aria-haspopup": "menu" }, "▾");
+  more.addEventListener("click", () => editorMenu(more, path));
+  return h("span", { class: "split" }, open, more);
+}
+
+function editorMenu(anchor, path) {
+  const open = document.querySelector(".menu");
+  open?.remove();
+  if (open?.dataset.path === path) return; // a second click on ▾ closes it
+  const close = () => {
+    menu.remove();
+    removeEventListener("pointerdown", outside, true);
+    removeEventListener("keydown", escape, true);
+  };
+  const outside = (event) => {
+    if (!menu.contains(event.target) && !anchor.contains(event.target)) close();
+  };
+  const escape = (event) => {
+    if (event.key === "Escape") {
+      close();
+      anchor.focus();
+    }
+  };
+  const pick = (editor) => async () => {
+    close();
+    try {
+      await invoke("set_settings", { editor: editor.id });
+      await invoke("open_path", { path, editor: true });
+    } catch (error) {
+      fail(error);
+    }
+  };
+  const menu = h("div", { class: "menu chunk", role: "menu", dataset: { path } },
+    h("span", { class: "label" }, t("openWith")),
+    ui.editors.map((editor, i) => h("button", { role: "menuitem", class: i === 0 ? "on" : "", onclick: pick(editor) }, editor.name)));
+  const at = anchor.getBoundingClientRect();
+  menu.style.top = `${at.bottom + 12}px`;
+  menu.style.right = `${Math.max(8, innerWidth - at.right)}px`;
+  document.body.append(menu);
+  addEventListener("pointerdown", outside, true);
+  addEventListener("keydown", escape, true);
+  menu.querySelector("button")?.focus();
 }
 
 function header(place) {
@@ -302,6 +381,7 @@ function renderAppUpdate() {
 
 function renderMain() {
   renderAppUpdate();
+  renderRuleNotice();
   renderUpdate();
   renderNav();
   renderSide();
@@ -566,7 +646,7 @@ function renderFolder(target) {
     h("p", { class: "note" }, t("folderTab")),
     h("div", { class: "actions", style: "margin-top:14px" },
       h("button", { class: "btn yellow chunk-bright press", onclick: () => invoke("open_path", { path: place.folder, editor: false }).catch(fail) }, t("openFolder")),
-      h("button", { class: "btn dark chunk press", onclick: () => invoke("open_path", { path: place.folder, editor: true }).catch(fail) }, t("openVsc")),
+      editorButtons(place.folder, "dark chunk"),
       h("span", { class: "grow" }), remove)));
 }
 
@@ -682,7 +762,7 @@ async function renderConflict(target) {
     h("div", { class: "actions" },
       h("button", { class: "btn yellow chunk-bright press", onclick: resolve("useDisk") }, t("useDisk")),
       h("button", { class: "btn dark chunk press", onclick: resolve("keep") }, t("keep")),
-      h("button", { class: "btn dark chunk press", onclick: () => invoke("open_path", { path: view.path, editor: true }).catch(fail) }, t("openVsc")),
+      editorButtons(view.path, "dark chunk"),
       h("button", { class: "btn dark chunk press", onclick: () => show("merges") }, t("back")),
       h("span", { class: "grow" }),
       h("span", { class: "mono muted", style: "font-size:10.5px" }, id))));
@@ -811,6 +891,91 @@ function ruleButton() {
   return button;
 }
 
+/**
+ * Open Cloud for upload_asset: the key and the creator, written to open-cloud.env by the shipped
+ * `cloud` command. The key field is always empty: a saved key shows only its last 4 characters.
+ */
+function cloudCard() {
+  const card = h("div", { class: "card chunk" }, h("span", { class: "label" }, t("cloudCard")), h("p", { class: "note" }, t("cloudNote")));
+  const status = h("p", { class: "note mono" }, t("cloudLoading"));
+  const keyInput = h("input", { class: "field-input mono grow", type: "password", autocomplete: "off", spellcheck: "false", placeholder: t("cloudKeyNew") });
+  let kind = "user";
+  const idInput = h("input", { class: "field-input mono", style: "width:150px", inputmode: "numeric", placeholder: t("cloudIdPlaceholder") });
+  const kindButton = (value) => {
+    const button = h("button", { onclick: () => { kind = value; paintKind(); } }, t(value === "user" ? "cloudUser" : "cloudGroup"));
+    button.dataset.kind = value;
+    return button;
+  };
+  const kinds = h("span", { class: "seg" }, kindButton("user"), kindButton("group"));
+  const paintKind = () => kinds.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.kind === kind));
+  const save = h("button", { class: "btn yellow chunk-bright press" }, t("cloudSave"));
+  const remove = h("button", { class: "btn press hidden" }, t("cloudRemove"));
+  const show = (s) => {
+    keyInput.value = "";
+    keyInput.placeholder = s.hasKey ? (s.keyEnd ? t("cloudKeySaved", { end: s.keyEnd }) : t("cloudKeySavedShort")) : t("cloudKeyNew");
+    kind = s.groupId ? "group" : "user";
+    idInput.value = s.groupId ?? s.userId ?? "";
+    paintKind();
+    remove.classList.toggle("hidden", !s.hasKey);
+    status.textContent = [t("cloudFile", { file: s.file }), s.fromEnvironment?.length ? t("cloudEnv", { names: s.fromEnvironment.join(", ") }) : ""].filter(Boolean).join(" ");
+  };
+  const run = async (args, done) => {
+    save.disabled = remove.disabled = true;
+    try {
+      show(await invoke("cloud_settings", args));
+      if (done) toast(t(done));
+    } catch (error) {
+      fail(error);
+    } finally {
+      save.disabled = remove.disabled = false;
+    }
+  };
+  save.addEventListener("click", () => {
+    const id = idInput.value.trim();
+    if (id && !/^\d+$/.test(id)) return fail(t("cloudIdNumber"));
+    const args = { key: keyInput.value.trim() || null, userId: null, groupId: null, clear: null };
+    if (kind === "user") args.userId = id; else args.groupId = id;
+    run(args, "cloudSaved");
+  });
+  remove.addEventListener("click", () => run({ key: null, userId: null, groupId: null, clear: true }, "cloudRemoved"));
+  paintKind();
+  run({ key: null, userId: null, groupId: null, clear: null });
+  card.append(
+    h("div", { class: "field" }, h("span", {}, t("cloudKey")), keyInput),
+    h("div", { class: "field" }, h("span", { class: "grow" }, t("cloudCreator")), kinds, idInput),
+    status,
+    h("div", { class: "row", style: "margin-top:8px;gap:8px" }, h("span", { class: "grow" }), remove, save));
+  return card;
+}
+
+// ---------- The rule for AI: a notice until the user says they gave it to their AI ----------
+
+let ruleKey = "";
+function renderRuleNotice() {
+  const bar = document.getElementById("ruleUpdate");
+  if (!bar) return;
+  const version = ui.rule?.version;
+  const seen = ui.settings.ruleSeen ?? null;
+  const visible = Boolean(version && seen !== version);
+  const key = JSON.stringify([visible, version, seen, getLanguage()]);
+  if (key === ruleKey) return;
+  ruleKey = key;
+  bar.classList.toggle("hidden", !visible);
+  if (!visible) return;
+  const copy = h("button", { class: "btn yellow chunk-bright press" }, t("ruleCopy"));
+  copy.addEventListener("click", async () => {
+    try {
+      await copyText(ui.rule.text);
+      toast(t("ruleCopied", { version }));
+    } catch (error) {
+      fail(error);
+    }
+  });
+  const done = h("button", { class: "btn press" }, t("ruleDone"));
+  done.addEventListener("click", () => invoke("set_settings", { ruleSeen: version }).catch(fail));
+  bar.replaceChildren(h("span", { class: "pill brand" }, t("ruleLabel")), h("span", { class: "grow" }, t(seen ? "ruleChanged" : "ruleFirst", { version })), copy, done);
+}
+
 async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
@@ -902,6 +1067,14 @@ async function renderSettings(target) {
     }
   });
   const notifyToggle = toggle(ui.settings.notify, () => invoke("set_settings", { notify: !ui.settings.notify }).catch(fail));
+  // "" is the one used last, which the list in Rust's order cannot show once one is picked
+  const lastUsed = [...ui.editors].sort((a, b) => b.lastUsed - a.lastUsed || (a.name < b.name ? -1 : 1))[0];
+  const picked = ui.editors.some((e) => e.id === ui.settings.editor) ? ui.settings.editor : "";
+  const editorSelect = ui.editors.length
+    ? h("select", { class: "field-input", "aria-label": t("editorSetting"), onchange: (event) => invoke("set_settings", { editor: event.target.value }).catch(fail) },
+      h("option", { value: "", selected: picked === "" }, t("editorAuto", { name: lastUsed.name })),
+      [...ui.editors].sort((a, b) => (a.name < b.name ? -1 : 1)).map((e) => h("option", { value: e.id, selected: picked === e.id }, e.name)))
+    : h("span", { class: "muted" }, t("noEditor"));
   // The background check runs every 6 hours: a release published right after the app opened waited that long
   const checkUpdate = h("button", { class: "btn dark chunk press" }, t("checkUpdate"));
   checkUpdate.addEventListener("click", async () => {
@@ -944,12 +1117,14 @@ async function renderSettings(target) {
           h("div", { class: "field" }, h("span", { class: "grow" }, t("language")), h("span", { class: "seg" }, lang("en", "English"), lang("pt", "Português"))),
           h("div", { class: "field" }, h("span", { class: "grow" }, t("startWin")), autostartToggle),
           h("div", { class: "field" }, h("span", { class: "grow" }, t("notify")), notifyToggle),
+          h("div", { class: "field" }, h("span", { class: "grow" }, t("editorSetting"), h("span", { class: "hint" }, t("editorHint"))), editorSelect),
           h("div", { class: "field" }, h("span", { class: "grow" }, t("version")),
             h("span", { class: "mono muted", title: `hub ${s?.build ?? "?"}` }, `${ui.app.version}${ui.app.build ? ` · ${ui.app.build}` : ""}`),
             checkUpdate)),
         aiCard(ai),
         queueCard(queueSettings),
         mcpCard(),
+        cloudCard(),
         h("div", { class: "card chunk" },
           h("span", { class: "label" }, t("daemonSettings")),
           ro(t("mergeCrossed"), cfg.merge?.enabled !== false),
@@ -1025,10 +1200,8 @@ function openRegister(refusal) {
 }
 
 for (const link of document.querySelectorAll(".navlink")) link.addEventListener("click", () => show(link.dataset.view));
-openCode.addEventListener("click", () => {
-  const place = placeOf(ui.placeId);
-  if (place) invoke("open_path", { path: place.folder, editor: true }).catch(fail);
-});
+// An editor installed or used while the window was away changes the list
+addEventListener("focus", loadEditors);
 
 // ---------- A connection waiting for the user's choice ----------
 
@@ -1203,11 +1376,15 @@ await listen("update-ready", (event) => {
   renderAppUpdate();
 });
 ui.update = (await invoke("update_status").catch(() => ({}))).ready ?? ui.update;
+// The rule this install ships: its version against the one the user last gave their AI
+ui.rule = await invoke("ai_rule").then((r) => (typeof r?.version === "string" && typeof r?.text === "string" ? r : null)).catch(() => null);
 await start({
   onSettings: (settings) => {
     ui.settings = settings;
     contentKey = "";
     renderMain();
+    // The editor picked changes which one opens first
+    loadEditors();
     // An open dialog is redrawn in the new language
     choiceShown = null;
     renderChoice();
