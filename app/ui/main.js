@@ -779,7 +779,51 @@ function mcpCard() {
     }
   });
   card.append(list, h("div", { class: "row", style: "margin-top:8px" }, h("span", { class: "grow" }), button));
+  card.append(h("p", { class: "note", style: "margin-top:12px" }, t("ruleNote")), h("div", { class: "row", style: "margin-top:8px" }, h("span", { class: "grow" }), ruleButton()));
   return card;
+}
+
+/**
+ * Copy rule for AI: `rule --prompt` to the clipboard. The text is fetched when the card is drawn,
+ * so the click writes it at once, while the click still counts as the user's own gesture.
+ */
+function ruleButton() {
+  const button = h("button", { class: "btn chunk-bright press" }, t("ruleCopy"));
+  const fetchRule = () => {
+    const pending = invoke("ai_rule").then((result) => {
+      if (typeof result?.text !== "string") throw new Error(result?.error ?? "no rule");
+      return result;
+    });
+    pending.catch(() => {});
+    return pending;
+  };
+  let ready = fetchRule();
+  button.addEventListener("click", async () => {
+    try {
+      const { version, text } = await ready;
+      await copyText(text);
+      toast(t("ruleCopied", { version }));
+    } catch (error) {
+      ready = fetchRule();
+      fail(error);
+    }
+  });
+  return button;
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // An older WebView without the async clipboard: a hidden field and the copy command
+    const field = h("textarea", { style: "position:fixed;opacity:0" });
+    field.value = text;
+    document.body.append(field);
+    field.select();
+    const ok = document.execCommand("copy");
+    field.remove();
+    if (!ok) throw new Error("the clipboard refused the text");
+  }
 }
 
 async function renderSettings(target) {

@@ -1092,3 +1092,302 @@ test("new errors: a caller's first call during a long play still sees the errors
     await d.close();
   }
 });
+
+test("inspect and set: edit mode with no play, the play server during one, the client for a PlayerGui path; an attribute's null goes as Remove; a property's null is refused", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    const seen: any[] = [];
+    const answerAs = (peer: string) => (tool: string, args: any) => {
+      seen.push({ peer, tool, args });
+      return tool === "inspect" ? { path: args.path, className: "Part", properties: [], attributes: [], tags: [], children: [], childCount: 0 } : { path: args.path, changed: [] };
+    };
+    const edit = await editStudio(d.url, answerAs("edit"));
+    await d.tools.call("inspect", { path: "Workspace.Door" });
+    assert.equal(seen.at(-1).peer, "edit");
+    const server = await playPeer(d.url, "server", answerAs("server"));
+    const client = await playPeer(d.url, "client", answerAs("client"));
+    await waitFor(() => d.ipc.playPeers().client === "ready" && d.ipc.playPeers().server === "ready");
+    await d.tools.call("inspect", { path: "Workspace.Door", all: true });
+    assert.deepEqual(seen.at(-1), { peer: "server", tool: "inspect", args: { path: "Workspace.Door", all: true, hidden: false } });
+    await d.tools.call("inspect", { path: "PlayerGui.Shop" });
+    assert.equal(seen.at(-1).peer, "client");
+    await d.tools.call("inspect", { path: "Workspace.Door", peer: "edit" });
+    assert.equal(seen.at(-1).peer, "edit");
+    await d.tools.call("setProps", { path: "Workspace.Door", properties: { Transparency: 0.5 }, attributes: { Locked: null, Level: 3 } });
+    assert.deepEqual(seen.at(-1).args, { path: "Workspace.Door", properties: { Transparency: 0.5 }, attributes: { Locked: { Remove: true }, Level: 3 } });
+    await assert.rejects(d.tools.call("setProps", { path: "Workspace.Door", properties: { Parent: null } }), /null clears only an attribute/);
+    await assert.rejects(d.tools.call("setProps", { path: "Workspace.Door" }), /give properties or attributes/);
+    await assert.rejects(d.tools.call("inspect", { path: "Workspace.Door", peer: "studio" }), /peer must be edit, server or client/);
+    for (const ws of [client, server, edit]) ws.close();
+  } finally {
+    await d.close();
+  }
+});
+
+test("simulate: a preset and one side's numbers become the six NetworkSettings values, the play client gets them too, and the engine's 0.5% loss cap is checked first", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    const seen: any[] = [];
+    const edit = await editStudio(d.url, (_tool, args) => {
+      seen.push({ peer: "edit", args });
+      return { before: {}, after: {} };
+    });
+    const state: any = await d.tools.call("simulate", {});
+    assert.deepEqual(seen.at(-1).args, {}, "nothing to set: only the state");
+    assert.equal(state.client, undefined);
+    await d.tools.call("simulate", { network: "good", inbound: { latencyMs: 80 }, quality: 3, memoryMb: 2048 });
+    assert.deepEqual(seen.at(-1).args, {
+      network: { InboundNetworkMinDelayMs: 80, OutboundNetworkMinDelayMs: 50, InboundNetworkJitterMs: 10, OutboundNetworkJitterMs: 10, InboundNetworkLossPercent: 0, OutboundNetworkLossPercent: 0 },
+      quality: 3,
+      memoryMb: 2048,
+    });
+    const client = await playPeer(d.url, "client", (_tool, args) => {
+      seen.push({ peer: "client", args });
+      return { before: {}, after: {} };
+    });
+    await playPeer(d.url, "server", () => ({}));
+    await waitFor(() => d.ipc.playPeers().client === "ready");
+    const both: any = await d.tools.call("simulate", { network: "poor" });
+    assert.equal(seen.at(-1).peer, "client");
+    assert.ok(both.client && both.edit);
+    await assert.rejects(d.tools.call("simulate", { outbound: { lossPercent: 2 } }), /at most 0\.5% packet loss/);
+    await assert.rejects(d.tools.call("simulate", { network: "awful" }), /network must be one of off, great, good, poor/);
+    await assert.rejects(d.tools.call("simulate", { quality: 30 }), /quality must be auto or a level from 1 to 21/);
+    const { simulationText } = await import("../control/commands.js");
+    assert.equal(
+      simulationText({ InboundNetworkMinDelayMs: 15, InboundNetworkJitterMs: 0, InboundNetworkLossPercent: 0, OutboundNetworkMinDelayMs: 15, OutboundNetworkJitterMs: 0, OutboundNetworkLossPercent: 0, QualityLevel: "Automatic", EmulatedTotalMemoryInMB: 63090 }),
+      "inbound 15 ms, jitter 0 ms, loss 0%; outbound 15 ms, jitter 0 ms, loss 0%; graphics Automatic; device memory 61.6 GB",
+    );
+    client.close();
+    edit.close();
+  } finally {
+    await d.close();
+  }
+});
+
+test("devices: the simulator goes to each device, a screenshot of each, one picture of all, and back to how it was even when one fails", { timeout: 30000 }, async () => {
+  const d = await daemon();
+  try {
+    const deviceCalls: any[] = [];
+    let current = "default";
+    let failOn: string | undefined;
+    const pixels = (w: number, h: number, value: number) => Buffer.alloc(w * h * 4, value);
+    const edit = await editStudio(d.url, (tool, args) => {
+      if (tool === "device") {
+        deviceCalls.push(args);
+        if (args.stop) current = "default";
+        else if (args.settings?.deviceId) current = args.settings.deviceId;
+        return { activeDeviceId: current, isSimulating: current !== "default", ...(current !== "default" ? { orientation: "LandscapeLeft" } : {}) };
+      }
+      if (tool === "capture") {
+        if (current === failOn) throw new Error("the Studio window is minimized");
+        return current === "default" ? { width: 8, height: 4, data: pixels(8, 4, 200).toString("base64") } : { width: 4, height: 4, data: pixels(4, 4, 100).toString("base64") };
+      }
+      throw new Error(tool);
+    });
+    const result: any = await d.tools.call("devices", { devices: ["iphone_14", "none"] });
+    assert.deepEqual(result.shots.map((s: any) => s.device), ["iphone_14", "none"]);
+    assert.deepEqual(result.places.map((p: any) => [p.width, p.height]), [[360, 360], [720, 360]], "each scaled to 360 tall, keeping its shape");
+    assert.equal(fs.readFileSync(result.sheet).subarray(1, 4).toString(), "PNG");
+    assert.equal(current, "default", "no simulation before: none after");
+    // A device was on before, and a capture fails midway: the simulator still goes back to it
+    current = "ipad_10th_generation";
+    failOn = "iphone_14";
+    await assert.rejects(d.tools.call("devices", { devices: ["iphone_14"] }), /minimized/);
+    assert.equal(current, "ipad_10th_generation");
+    assert.deepEqual(deviceCalls.at(-1), { settings: { deviceId: "ipad_10th_generation", orientation: "LandscapeLeft" }, stop: false, list: false });
+    await assert.rejects(d.tools.call("devices", { devices: [] }), /1 to 8 device ids/);
+    edit.close();
+  } finally {
+    await d.close();
+  }
+});
+
+test("profile: save runs the prelude's __quackSaveProfile and keeps its JSON, restore sends it back; without the functions it says what to add", { timeout: 20000 }, async () => {
+  const preludeDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-profile-"));
+  const d = await daemon({ preludeDir });
+  try {
+    const edit = await editStudio(d.url, () => ({}));
+    const codes: string[] = [];
+    const server = await playPeer(d.url, "server", (_tool, args) => {
+      codes.push(args.code);
+      return args.code.includes("JSONEncode(__quackSaveProfile") ? { ok: true, values: ['{"Coins":5,"Name":"olá"}'], output: [] } : { ok: true, values: ["true"], output: [] };
+    });
+    await waitFor(() => d.ipc.playPeers().server === "ready");
+    await assert.rejects(d.tools.call("profile", { action: "save" }), /has no __quackSaveProfile/);
+    fs.writeFileSync(path.join(preludeDir, "server.luau"), "local function __quackSaveProfile(p) return {} end\nlocal function __quackRestoreProfile(p, d) end\n");
+    const saved: any = await d.tools.call("profile", { action: "save", name: "before-shop" });
+    assert.equal(JSON.parse(fs.readFileSync(saved.file, "utf8")).Coins, 5);
+    assert.match(codes.at(-1)!, /GetPlayers\(\)\[1\]/);
+    await d.tools.call("profile", { action: "restore", name: "before-shop" });
+    assert.match(codes.at(-1)!, /__quackRestoreProfile\(__p, game:GetService\("HttpService"\):JSONDecode\("\{\\"Coins\\":5,\\"Name\\":\\"olá\\"\}"\)\)/);
+    assert.deepEqual(((await d.tools.call("profile", { action: "list" })) as any).profiles, ["before-shop"]);
+    await assert.rejects(d.tools.call("profile", { action: "restore", name: "nope" }), /no profile kept as nope/);
+    await assert.rejects(d.tools.call("profile", { action: "save", name: "../x" }), /name must be letters/);
+    server.close();
+    edit.close();
+  } finally {
+    await d.close();
+    fs.rmSync(preludeDir, { recursive: true, force: true });
+  }
+});
+
+test("png: resize averages the area each pixel covers, and a mosaic wraps rows at the width it is given", async () => {
+  const { resize, mosaic } = await import("../util/png.js");
+  const two = Buffer.from([0, 0, 0, 255, 200, 100, 50, 255]);
+  assert.deepEqual([...resize(two, 2, 1, 1, 1).rgba], [100, 50, 25, 255]);
+  const square = { rgba: Buffer.alloc(4 * 4 * 4, 9), width: 4, height: 4 };
+  const laid = mosaic([square, square, square], 10, 25, 2);
+  assert.deepEqual(laid.places.map((p) => [p.x, p.y]), [[0, 0], [12, 0], [0, 12]]);
+  assert.equal(laid.width, 22);
+  assert.equal(laid.height, 22);
+});
+
+test("assets: preview and insert go to edit mode with the id checked first; a position becomes x, y, z; the answers name the scripts and what insert removed", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    await assert.rejects(d.tools.call("assetPreview", { assetId: 5 }), /Studio is not connected/);
+    const seen: any[] = [];
+    const edit = await editStudio(d.url, (tool, args) => {
+      seen.push({ tool, args });
+      if (tool === "assetPreview") {
+        return { assetId: args.assetId, total: 3, classes: [{ class: "Script", count: 1 }, { class: "Part", count: 2 }], nodes: [{ d: 0, n: "Sword", c: "Tool" }, { d: 1, n: "Handle", c: "Part", more: 2 }], truncated: false, scripts: [{ path: "Sword.Loader", className: "Script", lines: 4, enabled: true, uses: ["require(<asset id>)"] }], packageLinks: [], sounds: [] };
+      }
+      return { assetId: args.assetId, parent: "Workspace", inserted: [{ path: "Workspace.Sword", className: "Tool" }], removedScripts: ["Sword.Loader (Script)"], removedPackageLinks: [], moved: args.position };
+    });
+    for (const bad of [0, -1, 1.5, "x"]) await assert.rejects(d.tools.call("assetPreview", { assetId: bad }), /assetId must be a whole number above 0/);
+    await assert.rejects(d.tools.call("assetPreview", { assetId: 5, depth: 99 }), /depth must be a whole number from 0 to 20/);
+    assert.equal(seen.length, 0, "refused before Studio");
+    const preview: any = await d.tools.call("assetPreview", { assetId: "47433" });
+    assert.deepEqual(seen.at(-1), { tool: "assetPreview", args: { assetId: 47433, depth: 4 } });
+    const { previewText, insertText } = await import("../control/commands.js");
+    assert.match(previewText(preview), /^Asset 47433: 3 instances \(Script 1, Part 2\), \d+ ms\nScripts \(1; insert_asset removes every one\):\n  Sword\.Loader \[Script\], 4 lines, uses require\(<asset id>\)\nTree:\n  Sword \[Tool\]\n    Handle \[Part\] \+2 inside$/);
+
+    const inserted: any = await d.tools.call("assetInsert", { assetId: 47433, position: { x: -10, y: 2.5, z: 0 }, parent: "Workspace.Map" });
+    assert.deepEqual(seen.at(-1).args, { assetId: 47433, parent: "Workspace.Map", position: [-10, 2.5, 0] });
+    await d.tools.call("assetInsert", { assetId: 47433, position: [1, 2, 3] });
+    assert.deepEqual(seen.at(-1).args, { assetId: 47433, position: [1, 2, 3] });
+    await assert.rejects(d.tools.call("assetInsert", { assetId: 47433, position: { x: 1 } }), /position must be x, y and z/);
+    assert.match(insertText(inserted), /^Inserted Workspace\.Sword \(Tool\) under Workspace at -10, 2\.5, 0, one undo step, selected \(\d+ ms\)\.\nRemoved before the insert: 1 script\(s\): Sword\.Loader \(Script\)\. Quack never inserts a Store asset's scripts/);
+    edit.close();
+  } finally {
+    await d.close();
+  }
+});
+
+test("memory: edit mode alone with no play, every peer at once during one, one peer when named, tags checked; a peer that fails says so beside the others", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    const asked: { peer: string; args: any; at: number }[] = [];
+    const answerAs = (peer: string) => async (_tool: string, args: any) => {
+      asked.push({ peer, args, at: Date.now() });
+      await wait(200);
+      if (peer === "client") throw new Error("no Stats here");
+      return { totalMb: 1500, trackingEnabled: true, tags: [{ tag: "Script", mb: 100 }, { tag: "Instances", mb: 50 }] };
+    };
+    const edit = await editStudio(d.url, answerAs("edit"));
+    const alone: any = await d.tools.call("memory", {});
+    assert.deepEqual(Object.keys(alone).filter((k) => k !== "ms"), ["edit"]);
+    await assert.rejects(d.tools.call("memory", { peer: "server" }), /no play is running/);
+    const server = await playPeer(d.url, "server", answerAs("server"));
+    const client = await playPeer(d.url, "client", answerAs("client"));
+    await waitFor(() => d.ipc.playPeers().client === "ready" && d.ipc.playPeers().server === "ready");
+    asked.length = 0;
+    const all: any = await d.tools.call("memory", { tags: ["Script"] });
+    assert.deepEqual(asked.map((a) => a.peer).sort(), ["client", "edit", "server"]);
+    assert.ok(Math.max(...asked.map((a) => a.at)) - Math.min(...asked.map((a) => a.at)) < 150, "asked together");
+    assert.deepEqual(asked[0].args, { tags: ["Script"] });
+    assert.equal(all.client.error, "no Stats here");
+    assert.match(all.note, /one process/);
+    const one: any = await d.tools.call("memory", { peer: "server" });
+    assert.deepEqual(Object.keys(one).filter((k) => k !== "ms"), ["server"]);
+    await assert.rejects(d.tools.call("memory", { tags: "Script" }), /tags must be a list/);
+    await assert.rejects(d.tools.call("memory", { peer: "studio" }), /peer must be edit, server or client/);
+    const { memoryText } = await import("../control/commands.js");
+    assert.match(memoryText(all), /^edit: 1500 MB in all; Script 100, Instances 50\nserver: 1500 MB in all; Script 100, Instances 50\nclient: no Stats here\n\(Studio's edit mode/);
+    for (const ws of [client, server, edit]) ws.close();
+  } finally {
+    await d.close();
+  }
+});
+
+test("profiler: the play server by default or the client, its numbers bounded before Studio, and the raw profile saved when asked", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    const edit = await editStudio(d.url, () => ({}));
+    await assert.rejects(d.tools.call("profiler", {}), /no play is running/);
+    const seen: any[] = [];
+    const answerAs = (peer: string) => (_tool: string, args: any) => {
+      seen.push({ peer, args });
+      return {
+        durationMs: args.durationMs, frequency: args.frequency, counted: 40, kept: 2, omitted: { native: 30, plugin: 0, quack: 8, filtered: 0 },
+        functions: [{ rank: 1, name: "step", source: "ServerScriptService.Loop", line: 12, totalUs: 52000, pct: 5.2 }],
+        ...(args.raw ? { raw: '{"Functions":[]}' } : {}),
+      };
+    };
+    const server = await playPeer(d.url, "server", answerAs("server"));
+    const client = await playPeer(d.url, "client", answerAs("client"));
+    await waitFor(() => d.ipc.playPeers().client === "ready" && d.ipc.playPeers().server === "ready");
+    const result: any = await d.tools.call("profiler", {});
+    assert.deepEqual(seen.at(-1), { peer: "server", args: { durationMs: 1000, frequency: 1000, maxFunctions: 20, includeNative: false, includePlugin: false, raw: false } });
+    assert.equal(result.file, undefined);
+    await d.tools.call("profiler", { peer: "client", durationMs: 200, filter: "Loop", includePlugin: true });
+    assert.deepEqual(seen.at(-1), { peer: "client", args: { durationMs: 200, frequency: 1000, maxFunctions: 20, filter: "Loop", includeNative: false, includePlugin: true, raw: false } });
+    const refused: [Record<string, unknown>, RegExp][] = [
+      [{ durationMs: 50 }, /durationMs must be a whole number from 100 to 15000/],
+      [{ frequency: 0 }, /frequency must be/],
+      [{ maxFunctions: 500 }, /maxFunctions must be/],
+      [{ peer: "edit" }, /peer must be server or client/],
+      [{ out: "relative.json" }, /out must be an absolute path/],
+    ];
+    for (const [args, why] of refused) await assert.rejects(d.tools.call("profiler", args), why);
+    const saved: any = await d.tools.call("profiler", { save: true });
+    assert.equal(seen.at(-1).args.raw, true);
+    assert.equal(saved.raw, undefined, "the raw profile goes to a file, not the answer");
+    assert.equal(fs.readFileSync(saved.file, "utf8"), '{"Functions":[]}');
+    assert.match(saved.file, /profiler[\\/]profile-server-.*\.json$/);
+    const { profilerText } = await import("../control/commands.js");
+    assert.match(profilerText(saved), /^the play server: 1000 ms at 1000 samples a second; 40 functions, 2 kept \(left out: 30 native, 8 Quack's own\)\n  1\.    5\.2%      52\.00 ms  step  ServerScriptService\.Loop:12\nRaw profile: /);
+    for (const ws of [client, server, edit]) ws.close();
+  } finally {
+    await d.close();
+  }
+});
+
+test("scene: edit mode with no play, the play server during one, mode and topN checked first; each mode's error stays its own", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    const seen: any[] = [];
+    const answerAs = (peer: string) => (_tool: string, args: any) => {
+      seen.push({ peer, args });
+      return {
+        order: ["instance_composition", "triangle_composition"],
+        modes: {
+          instance_composition: { method: "GetInstanceCompositionAsync", ms: 40, root: { name: "game", size: 2000, leaves: 2 }, top: [{ name: "Part", size: 1500 }, { name: "Model", size: 500 }] },
+          triangle_composition: { method: "GetTriangleCompositionAsync", ms: 3, error: 'SceneAnalysisService is not enabled (turn on the beta feature "Scene Analysis" in File > Beta Features and restart Studio)' },
+        },
+      };
+    };
+    const edit = await editStudio(d.url, answerAs("edit"));
+    const result: any = await d.tools.call("scene", {});
+    assert.deepEqual(seen.at(-1), { peer: "edit", args: { mode: "all", topN: 10 } });
+    await assert.rejects(d.tools.call("scene", { mode: "everything" }), /mode must be all or one of instance_composition/);
+    await assert.rejects(d.tools.call("scene", { topN: 0 }), /topN must be a whole number from 1 to 100/);
+    const server = await playPeer(d.url, "server", answerAs("server"));
+    await waitFor(() => d.ipc.playPeers().server === "ready");
+    await d.tools.call("scene", { mode: "script_memory", topN: 3 });
+    assert.deepEqual(seen.at(-1), { peer: "server", args: { mode: "script_memory", topN: 3 } });
+    await d.tools.call("scene", { peer: "edit" });
+    assert.equal(seen.at(-1).peer, "edit");
+    // The caller's timeoutMs is the wait (the CLI sends 300 s for all, which the hub honors too)
+    const slow = await playPeer(d.url, "client", async () => wait(2000));
+    await waitFor(() => d.ipc.playPeers().client === "ready");
+    await assert.rejects(d.tools.call("scene", { peer: "client", timeoutMs: 200 }), /the play client did not answer in 0 s/);
+    slow.close();
+    const { sceneText } = await import("../control/commands.js");
+    assert.match(sceneText(result), /^Scene analysis of the edit plugin \(\d+ ms\):\ninstance_composition: 2 entries, 2000 in all \(40 ms\)\n  Part  1500\n  Model  500\ntriangle_composition: SceneAnalysisService is not enabled \(turn on the beta feature "Scene Analysis"/);
+    for (const ws of [server, edit]) ws.close();
+  } finally {
+    await d.close();
+  }
+});

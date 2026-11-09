@@ -291,6 +291,8 @@ export interface PlayOverlayResultMessage {
   failed?: string[];
   /** The edit DataModel's stalls the restore rule saw, for the log */
   stalls?: string[];
+  /** Tabs of swapped scripts the plugin closed first (an edited open tab beats the swap) */
+  closedTabs?: string[];
 }
 
 /** Sent from the play session's server through the output relay */

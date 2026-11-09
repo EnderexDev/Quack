@@ -5,7 +5,7 @@ import path from "node:path";
 import type { StudioOutputMessage, ToolRequestMessage, ToolResultMessage } from "./ipc/messages.js";
 import type { IPCServer, PeerRole, PlayRole } from "./ipc/server.js";
 import { encodeGif } from "./util/gif.js";
-import { encodePng, halve, sheet } from "./util/png.js";
+import { encodePng, halve, mosaic, sheet } from "./util/png.js";
 
 /**
  * Quack: the Studio tools an AI uses most (08/11/26, a month of chrrxs calls): evals in the play
@@ -13,7 +13,9 @@ import { encodePng, halve, sheet } from "./util/png.js";
  * key presses and the device simulator; then a click on a GUI button by its path, a wait until
  * Luau turns truthy or an output line shows up, and a short recording of the play view; then a
  * GUI's tree, the mouse by pixel, a performance sample, logpoints, .rbxm files both ways and
- * multiplayer tests, plus two read in the daemon itself: whether Studio holds each script's disk
+ * multiplayer tests; then a Creator Store asset previewed or inserted with its scripts stripped,
+ * memory by tag, the script profiler and Studio's scene analysis; plus two read in the daemon
+ * itself: whether Studio holds each script's disk
  * text (verify) and instances of the synced tree (find). Every answer carries the play errors the
  * caller has not seen, and evals get the place's quack-prelude/<peer>.luau first. Each one
  * is a toolRequest to the right DataModel's Quack plugin: the edit one on its sync socket, a
@@ -325,10 +327,32 @@ export class StudioTools {
         return this.exportRbxm(args);
       case "importRbxm":
         return this.importRbxm(args);
+      case "inspect":
+        return this.inspect(args);
+      case "setProps":
+        return this.setProps(args);
+      case "simulate":
+        return this.simulate(args);
+      case "tabs":
+        return this.tabs(args);
+      case "devices":
+        return this.devices(args);
+      case "profile":
+        return this.profile(args);
       case "find":
         return this.find(args);
       case "mouse":
         return this.mouse(args);
+      case "assetPreview":
+        return this.assetPreview(args);
+      case "assetInsert":
+        return this.assetInsert(args);
+      case "memory":
+        return this.memory(args);
+      case "profiler":
+        return this.profiler(args);
+      case "scene":
+        return this.scene(args);
     }
     throw new ToolError(`unknown Studio tool ${tool}`);
   }
@@ -608,6 +632,7 @@ export class StudioTools {
     fs.writeFileSync(file, png);
     this.pruneScreenshots();
     this.lastShot = peer === "client" ? { width: image.width, height: image.height, ...(rect ? { crop: rect } : {}) } : undefined;
+    this.lastPixels = image;
     return {
       file, peer, width: image.width, height: image.height, nativeWidth: read.nativeWidth ?? read.width, nativeHeight: read.nativeHeight ?? read.height,
       ...(focus ? { focus } : {}), ...(rect ? { crop: rect } : {}), bytes: png.length, ms: this.now() - started,
@@ -1127,6 +1152,341 @@ export class StudioTools {
     const started = this.now();
     const result = await this.request("edit", "importRbxm", { data: data.toString("base64"), parent: typeof args.parent === "string" && args.parent ? args.parent : undefined }, 120_000);
     return { file, bytes: data.length, ...result, ms: this.now() - started };
+  }
+
+  /** The last screenshot's pixels, for a picture made of several (devices) */
+  private lastPixels: { rgba: Buffer; width: number; height: number } | undefined;
+
+  /**
+   * Where a read or a change of one instance goes: the peer named; else, during a play, the play
+   * client for a PlayerGui path and the play server for the rest (the running game's state);
+   * with no play, edit mode.
+   */
+  private instancePeer(args: Record<string, any>): PeerRole {
+    if (args.peer !== undefined && !["edit", "server", "client"].includes(args.peer)) throw new ToolError("peer must be edit, server or client");
+    if (args.peer) return args.peer;
+    const path = String(args.path ?? "");
+    if (/^(game\.)?(PlayerGui|Players\.LocalPlayer)\b/.test(path)) return "client";
+    return this.link.playPeers().server === "ready" ? "server" : "edit";
+  }
+
+  /** One instance read whole: the properties that differ from a new one of its class (or all), attributes, tags, children */
+  private async inspect(args: Record<string, any>) {
+    if (typeof args.path !== "string" || !args.path.trim()) throw new ToolError("path is required: the instance's path, like Workspace.Map.Door");
+    const peer = this.instancePeer(args);
+    const started = this.now();
+    const result = await this.request(peer, "inspect", { path: args.path.trim(), all: args.all === true, hidden: args.hidden === true }, 15_000);
+    return { peer, ...result, ms: this.now() - started };
+  }
+
+  /**
+   * Properties and attributes of one instance changed together (each value checked first, all or
+   * nothing; one undo step in edit mode). A value takes the type of what is there now, or names
+   * its type: { "Vector3": [1, 2, 3] }. An attribute set to null is removed.
+   */
+  private async setProps(args: Record<string, any>) {
+    if (typeof args.path !== "string" || !args.path.trim()) throw new ToolError("path is required");
+    const isObject = (v: unknown) => v !== undefined && v !== null && typeof v === "object" && !Array.isArray(v);
+    if (args.properties !== undefined && !isObject(args.properties)) throw new ToolError("properties must be an object of name: value");
+    if (args.attributes !== undefined && !isObject(args.attributes)) throw new ToolError("attributes must be an object of name: value");
+    const properties = args.properties ?? {};
+    const attributes: Record<string, unknown> = {};
+    for (const [name, value] of Object.entries(args.attributes ?? {})) attributes[name] = value === null ? { Remove: true } : value;
+    for (const [name, value] of Object.entries(properties)) if (value === null) throw new ToolError(`${name}: null clears only an attribute; a property takes a value (an Instance property takes { "Instance": "" } to clear it)`);
+    if (!Object.keys(properties).length && !Object.keys(attributes).length) throw new ToolError("give properties or attributes to set");
+    const peer = this.instancePeer(args);
+    const started = this.now();
+    const result = await this.request(peer, "setProps", { path: args.path.trim(), properties, attributes }, 15_000);
+    return { peer, ...result, ms: this.now() - started };
+  }
+
+  /** Studio's network presets (the Network simulation panel's numbers; chrrxs's great/good/poor) */
+  static readonly NETWORK_PRESETS: Record<string, Record<string, number>> = {
+    off: { InboundNetworkMinDelayMs: 0, OutboundNetworkMinDelayMs: 0, InboundNetworkJitterMs: 0, OutboundNetworkJitterMs: 0, InboundNetworkLossPercent: 0, OutboundNetworkLossPercent: 0 },
+    great: { InboundNetworkMinDelayMs: 15, OutboundNetworkMinDelayMs: 15, InboundNetworkJitterMs: 0, OutboundNetworkJitterMs: 0, InboundNetworkLossPercent: 0, OutboundNetworkLossPercent: 0 },
+    good: { InboundNetworkMinDelayMs: 50, OutboundNetworkMinDelayMs: 50, InboundNetworkJitterMs: 10, OutboundNetworkJitterMs: 10, InboundNetworkLossPercent: 0, OutboundNetworkLossPercent: 0 },
+    poor: { InboundNetworkMinDelayMs: 150, OutboundNetworkMinDelayMs: 150, InboundNetworkJitterMs: 100, OutboundNetworkJitterMs: 100, InboundNetworkLossPercent: 0.5, OutboundNetworkLossPercent: 0.5 },
+  };
+
+  /**
+   * Studio's network and performance simulation: a network preset or the six numbers, the
+   * graphics quality level, the memory the device has. Set in edit mode (a solo play shares it)
+   * and in the play client when one runs (a multiplayer client keeps its own after it starts).
+   * With nothing to set it reports the state.
+   */
+  private async simulate(args: Record<string, any>) {
+    const network: Record<string, number> = {};
+    if (args.network !== undefined) {
+      if (typeof args.network !== "string" || !StudioTools.NETWORK_PRESETS[args.network]) throw new ToolError(`network must be one of ${Object.keys(StudioTools.NETWORK_PRESETS).join(", ")}`);
+      Object.assign(network, StudioTools.NETWORK_PRESETS[args.network]);
+    }
+    const side = (key: "inbound" | "outbound", prefix: "Inbound" | "Outbound") => {
+      const given = args[key];
+      if (given === undefined || given === null) return;
+      if (typeof given !== "object") throw new ToolError(`${key} must be { latencyMs, jitterMs, lossPercent }`);
+      const pairs: [string, string][] = [["latencyMs", "NetworkMinDelayMs"], ["jitterMs", "NetworkJitterMs"], ["lossPercent", "NetworkLossPercent"]];
+      for (const [field, suffix] of pairs) {
+        if (given[field] === undefined) continue;
+        const n = Number(given[field]);
+        if (!Number.isFinite(n) || n < 0) throw new ToolError(`${key}.${field} must be a number, 0 or more`);
+        if (field === "lossPercent" && n > 0.5) throw new ToolError(`${key}.lossPercent: the engine simulates at most 0.5% packet loss`);
+        network[`${prefix}${suffix}`] = n;
+      }
+    };
+    side("inbound", "Inbound");
+    side("outbound", "Outbound");
+    const request: Record<string, unknown> = {};
+    if (Object.keys(network).length) request.network = network;
+    if (args.quality !== undefined) {
+      const q = args.quality;
+      if (!(q === "auto" || (Number.isInteger(q) && q >= 1 && q <= 21))) throw new ToolError("quality must be auto or a level from 1 to 21");
+      request.quality = q;
+    }
+    if (args.memoryMb !== undefined) {
+      if (!Number.isInteger(args.memoryMb) || args.memoryMb < 256) throw new ToolError("memoryMb must be a whole number of megabytes, 256 or more");
+      request.memoryMb = args.memoryMb;
+    }
+    const result: Record<string, unknown> = { edit: await this.request("edit", "simulate", request, 10_000) };
+    if (Object.keys(request).length && this.missing("client") === undefined) {
+      result.client = await this.request("client", "simulate", request, 10_000).catch((error: Error) => ({ error: error.message }));
+    }
+    return result;
+  }
+
+  /**
+   * Script tabs open in this Studio, and which were edited (their text is not the script's
+   * .Source). A tab edited in the Studio that starts a play gives the play its own text instead
+   * of the swapped script's. close: the tabs of these script paths; closeEdited: every edited one.
+   */
+  private async tabs(args: Record<string, any>) {
+    if (args.close !== undefined && (!Array.isArray(args.close) || args.close.some((p: unknown) => typeof p !== "string" || !p))) throw new ToolError("close must be a list of script paths");
+    return this.request("edit", "tabs", { close: args.close, closeEdited: args.closeEdited === true }, 30_000);
+  }
+
+  /** The devices a UI is checked on by default: a small Android phone, an iPhone, an iPad, then no simulation */
+  static readonly DEFAULT_DEVICES = ["samsung_galaxy_a06", "iphone_14", "ipad_10th_generation", "none"];
+
+  /**
+   * The play view on several devices in one call: the simulator set to each one in turn, a
+   * screenshot, then back to how it was. Answers one picture with all of them side by side (the
+   * same height each) and each screenshot's file. Sessions paired a simulator change with a
+   * screenshot 259 times in a month.
+   */
+  private async devices(args: Record<string, any>) {
+    const devices: string[] = args.devices === undefined ? StudioTools.DEFAULT_DEVICES : args.devices;
+    if (!Array.isArray(devices) || !devices.length || devices.length > 8 || devices.some((d) => typeof d !== "string" || !d)) throw new ToolError("devices must be a list of 1 to 8 device ids (none: no simulation)");
+    const orientation = args.orientation ?? "LandscapeLeft";
+    if (typeof orientation !== "string") throw new ToolError("orientation must be an Enum.ScreenOrientation name");
+    const before: any = await this.device({});
+    const started = this.now();
+    const shots: { device: string; file: string; width: number; height: number }[] = [];
+    const tiles: { rgba: Buffer; width: number; height: number }[] = [];
+    try {
+      for (const device of devices) {
+        if (device === "none") await this.device({ stop: true });
+        else await this.device({ deviceId: device, orientation });
+        // The view takes a frame or two to lay out at the new size
+        await new Promise((r) => setTimeout(r, 1000));
+        const shot: any = await this.screenshot({ width: typeof args.width === "number" ? args.width : 900 });
+        shots.push({ device, file: shot.file, width: shot.width, height: shot.height });
+        if (this.lastPixels) tiles.push(this.lastPixels);
+      }
+    } finally {
+      // Back to the simulator as it was, whatever failed
+      if (before?.isSimulating && before.activeDeviceId) {
+        await this.device({ deviceId: before.activeDeviceId, ...(before.orientation ? { orientation: before.orientation } : {}) }).catch(() => undefined);
+      } else await this.device({ stop: true }).catch(() => undefined);
+    }
+    const picture = mosaic(tiles, 360, 1600);
+    const png = encodePng(picture.rgba, picture.width, picture.height);
+    fs.mkdirSync(this.screenshotDir, { recursive: true });
+    const sheetFile = path.join(this.screenshotDir, `devices-${new Date(this.now()).toISOString().replace(/[:.]/g, "-")}.png`);
+    fs.writeFileSync(sheetFile, png);
+    this.lastShot = undefined;
+    return { sheet: sheetFile, shots, places: picture.places, width: picture.width, height: picture.height, ms: this.now() - started };
+  }
+
+  /**
+   * The player's test profile kept and put back, through the game's own functions: the place's
+   * quack-prelude/server.luau defines __quackSaveProfile(player) (returns a table) and
+   * __quackRestoreProfile(player, data). Quack cannot know a game's data layer; this only runs
+   * those two and keeps what the first returns under .quack/profiles.
+   */
+  private async profile(args: Record<string, any>) {
+    const action = args.action;
+    if (!["save", "restore", "list"].includes(action)) throw new ToolError("action must be save, restore or list");
+    const dir = path.join(path.dirname(this.screenshotDir), "profiles");
+    if (action === "list") {
+      let names: string[] = [];
+      try {
+        names = fs.readdirSync(dir).filter((f) => f.endsWith(".json")).map((f) => f.slice(0, -5)).sort();
+      } catch {
+        // none kept yet
+      }
+      return { profiles: names };
+    }
+    const name = typeof args.name === "string" && /^[\w-]{1,60}$/.test(args.name) ? args.name : args.name === undefined ? "default" : undefined;
+    if (!name) throw new ToolError("name must be letters, digits, - or _ (default: default)");
+    const prelude = this.prelude("server", {}).args.prelude ?? "";
+    const needs = action === "save" ? "__quackSaveProfile" : "__quackRestoreProfile";
+    if (!prelude.includes(needs)) {
+      throw new ToolError(`the place's quack-prelude/server.luau has no ${needs}: define __quackSaveProfile(player) returning the profile as a table and __quackRestoreProfile(player, data) there (Quack does not know a game's data layer)`);
+    }
+    const file = path.join(dir, `${name}.json`);
+    const player = typeof args.player === "string" && args.player ? args.player : undefined;
+    const who = player ? `game:GetService("Players"):FindFirstChild(${JSON.stringify(player)})` : `game:GetService("Players"):GetPlayers()[1]`;
+    if (action === "save") {
+      const code = `local __p = ${who}\nif not __p then error("no player in the play") end\nreturn game:GetService("HttpService"):JSONEncode(__quackSaveProfile(__p))`;
+      const result: any = await this.callPlayer.run(undefined, () => this.evalRuntime({ code, peer: "server", timeoutMs: 30_000 }));
+      if (!result?.ok) throw new ToolError(`__quackSaveProfile failed: ${result?.error ?? "no answer"}`);
+      const json = String(result.values?.[0] ?? "");
+      JSON.parse(json);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(file, json);
+      return { action, name, file, bytes: Buffer.byteLength(json) };
+    }
+    let json: string;
+    try {
+      json = fs.readFileSync(file, "utf8");
+    } catch {
+      throw new ToolError(`no profile kept as ${name} (save one first)`);
+    }
+    const code = `local __p = ${who}\nif not __p then error("no player in the play") end\n__quackRestoreProfile(__p, game:GetService("HttpService"):JSONDecode(${JSON.stringify(json)}))\nreturn true`;
+    const result: any = await this.evalRuntime({ code, peer: "server", timeoutMs: 30_000 });
+    if (!result?.ok) throw new ToolError(`__quackRestoreProfile failed: ${result?.error ?? "no answer"}`);
+    return { action, name, file, bytes: Buffer.byteLength(json) };
+  }
+
+  /** A Creator Store asset id from the caller */
+  private static assetId(args: Record<string, any>): number {
+    const id = Number(args.assetId);
+    if (!Number.isSafeInteger(id) || id <= 0) throw new ToolError("assetId must be a whole number above 0");
+    return id;
+  }
+
+  /**
+   * A Creator Store asset loaded in edit mode (AssetService:LoadAssetAsync) and read without
+   * being put in the place: its classes, a tree of up to 100 objects, every script and
+   * PackageLink in it (a backdoor hides in a script deep inside), its sounds. Then destroyed.
+   */
+  private async assetPreview(args: Record<string, any>) {
+    const assetId = StudioTools.assetId(args);
+    const depth = args.depth === undefined || args.depth === null ? 4 : Number(args.depth);
+    if (!Number.isInteger(depth) || depth < 0 || depth > 20) throw new ToolError("depth must be a whole number from 0 to 20");
+    const started = this.now();
+    const result = await this.request("edit", "assetPreview", { assetId, depth }, StudioTools.timeout(args, 60_000));
+    return { ...result, ms: this.now() - started };
+  }
+
+  /**
+   * A Creator Store asset put in the place (edit mode, one undo step): every script and
+   * PackageLink in it destroyed first, the rest checked again, and nothing inserted when any is
+   * left. Scripts would sync to disk and run in the game: they never come in this way.
+   */
+  private async assetInsert(args: Record<string, any>) {
+    const assetId = StudioTools.assetId(args);
+    let position: number[] | undefined;
+    if (args.position !== undefined && args.position !== null) {
+      const p = args.position;
+      position = Array.isArray(p) ? p.map(Number) : [Number(p?.x), Number(p?.y), Number(p?.z)];
+      if (position.length !== 3 || !position.every(Number.isFinite)) throw new ToolError("position must be x, y and z (studs)");
+    }
+    const parent = typeof args.parent === "string" && args.parent.trim() ? args.parent.trim() : undefined;
+    const started = this.now();
+    const result = await this.request("edit", "assetInsert", { assetId, ...(parent ? { parent } : {}), ...(position ? { position } : {}) }, StudioTools.timeout(args, 60_000));
+    return { ...result, ms: this.now() - started };
+  }
+
+  /** The peers a read goes to: the one named, else every one connected now (edit first) */
+  private readPeers(args: Record<string, any>, allowed: PeerRole[]): PeerRole[] {
+    if (args.peer !== undefined && args.peer !== null) {
+      if (!allowed.includes(args.peer)) throw new ToolError(`peer must be ${allowed.join(", ").replace(/, ([^,]+)$/, " or $1")}`);
+      const why = this.missing(args.peer);
+      if (why) throw new ToolError(why);
+      return [args.peer];
+    }
+    const peers = allowed.filter((p) => this.missing(p) === undefined);
+    if (!peers.length) throw new ToolError(this.missing(allowed.includes("edit") ? "edit" : "server")!);
+    return peers;
+  }
+
+  /**
+   * Memory by Enum.DeveloperMemoryTag (Stats:GetMemoryUsageMbForTag) and the total, in edit
+   * mode and each play peer at once (or the one named). A solo play runs all of them in one
+   * Studio process: the totals are that process's, the same number each.
+   */
+  private async memory(args: Record<string, any>) {
+    let tags: string[] | undefined;
+    if (args.tags !== undefined && args.tags !== null) {
+      if (!Array.isArray(args.tags) || args.tags.some((t: unknown) => typeof t !== "string" || !t)) throw new ToolError("tags must be a list of Enum.DeveloperMemoryTag names");
+      tags = args.tags.length ? args.tags : undefined;
+    }
+    const peers = this.readPeers(args, ["edit", "server", "client"]);
+    const started = this.now();
+    const results = await Promise.all(peers.map((peer) => this.request(peer, "memory", { ...(tags ? { tags } : {}) }, 15_000).catch((error: Error) => ({ error: error.message }))));
+    const answer: Record<string, unknown> = { ms: this.now() - started };
+    peers.forEach((peer, i) => (answer[peer] = results[i]));
+    if (peers.length > 1 && this.multiplayer === undefined && peers.some((p) => p !== "edit")) answer.note = "Studio's edit mode and a solo play's server and client are one process: each total is that whole process's";
+    return answer;
+  }
+
+  /**
+   * ScriptProfilerService on the play server (default) or the play client for durationMs: the
+   * functions that took the most time, with their share of the capture. Quack's own plugin and
+   * eval functions are left out unless includePlugin. `save` keeps the raw JSON (the profiler's
+   * own format) under .quack/profiler.
+   */
+  private async profiler(args: Record<string, any>) {
+    const peer: PlayRole = args.peer === undefined || args.peer === null ? "server" : args.peer;
+    if (peer !== "server" && peer !== "client") throw new ToolError("peer must be server or client");
+    const whole = (key: string, fallback: number, min: number, max: number) => {
+      if (args[key] === undefined || args[key] === null) return fallback;
+      const n = Number(args[key]);
+      if (!Number.isInteger(n) || n < min || n > max) throw new ToolError(`${key} must be a whole number from ${min} to ${max}`);
+      return n;
+    };
+    const durationMs = whole("durationMs", 1000, 100, 15_000);
+    const frequency = whole("frequency", 1000, 1, 10_000);
+    const maxFunctions = whole("maxFunctions", 20, 1, 100);
+    const filter = typeof args.filter === "string" && args.filter ? args.filter : undefined;
+    const save = args.save === true || (typeof args.out === "string" && args.out !== "");
+    if (typeof args.out === "string" && args.out && !path.isAbsolute(args.out)) throw new ToolError("out must be an absolute path");
+    const started = this.now();
+    // The capture, then up to 5 s for the profiler's data, then the decode in a big game
+    const result = await this.request<any>(peer, "profiler", {
+      durationMs, frequency, maxFunctions, ...(filter ? { filter } : {}), includeNative: args.includeNative === true, includePlugin: args.includePlugin === true, raw: save,
+    }, durationMs + 20_000);
+    const answer: Record<string, unknown> = { peer, ...result, ms: this.now() - started };
+    if (typeof result?.raw === "string") {
+      delete answer.raw;
+      const file = typeof args.out === "string" && args.out
+        ? args.out
+        : path.join(path.dirname(this.screenshotDir), "profiler", `profile-${peer}-${new Date(this.now()).toISOString().replace(/[:.]/g, "-")}.json`);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, result.raw);
+      answer.file = file;
+    }
+    return answer;
+  }
+
+  static readonly SCENE_MODES = ["instance_composition", "script_memory", "unparented_instances", "triangle_composition", "animation_memory", "audio_memory"];
+
+  /**
+   * SceneAnalysisService (Studio's Scene Analysis beta): the biggest entries of one breakdown or
+   * all six, each a tree flattened to its leaves and sorted by size (triangles by their count).
+   * Edit mode with no play, the play server during one, or the peer named. In mode all, a mode
+   * that fails says its own error and the rest still answer.
+   */
+  private async scene(args: Record<string, any>) {
+    const mode = args.mode === undefined || args.mode === null ? "all" : String(args.mode);
+    if (mode !== "all" && !StudioTools.SCENE_MODES.includes(mode)) throw new ToolError(`mode must be all or one of ${StudioTools.SCENE_MODES.join(", ")}`);
+    const topN = args.topN === undefined || args.topN === null ? 10 : Number(args.topN);
+    if (!Number.isInteger(topN) || topN < 1 || topN > 100) throw new ToolError("topN must be a whole number from 1 to 100");
+    if (args.peer !== undefined && args.peer !== null && !["edit", "server", "client"].includes(args.peer)) throw new ToolError("peer must be edit, server or client");
+    const peer: PeerRole = args.peer ?? (this.link.playPeers().server === "ready" ? "server" : "edit");
+    const started = this.now();
+    const result = await this.request(peer, "scene", { mode, topN }, StudioTools.timeout(args, mode === "all" ? 300_000 : 120_000));
+    return { peer, ...result, ms: this.now() - started };
   }
 
   /** The image the last screenshot answered with, to read a mouse point given on it */

@@ -10,6 +10,7 @@ import { WebSocket } from "ws";
 import { PassThrough } from "node:stream";
 import { runControl, type ControlContext } from "../control/commands.js";
 import { serveMcp } from "../control/mcp.js";
+import { instructions, rule } from "../control/rule.js";
 import { flavorInfo, HubClient, type Flavor } from "../control/hubClient.js";
 import { QuackHub } from "../hub/hub.js";
 import { removeDir } from "./removeDir.js";
@@ -429,7 +430,7 @@ function mcpSession(port: number, cwd = os.tmpdir()) {
 }
 
 /** The eight Studio calls an AI makes most (a month of chrrxs use, 08/11/26), by the same names, then a click by path, a wait and a recording */
-const STUDIO_TOOLS = ["eval_server_runtime", "eval_client_runtime", "execute_luau", "solo_playtest", "capture_screenshot", "get_runtime_logs", "simulate_keyboard_input", "set_device_simulator", "click_gui", "wait_for", "record", "inspect_gui", "verify_sync", "perf_sample", "set_logpoint", "export_rbxm", "import_rbxm", "find_instances", "simulate_mouse_input"];
+const STUDIO_TOOLS = ["eval_server_runtime", "eval_client_runtime", "execute_luau", "solo_playtest", "capture_screenshot", "get_runtime_logs", "simulate_keyboard_input", "set_device_simulator", "click_gui", "wait_for", "record", "inspect_gui", "verify_sync", "perf_sample", "set_logpoint", "export_rbxm", "import_rbxm", "find_instances", "inspect_instance", "set_properties", "simulate_conditions", "script_tabs", "capture_devices", "test_profile", "simulate_mouse_input", "get_roblox_docs", "search_assets", "get_asset_details", "get_asset_thumbnail", "preview_asset", "insert_asset", "upload_asset", "get_memory_breakdown", "capture_script_profiler", "get_scene_analysis"];
 
 test("mcp: initialize carries the instructions, and the tools are the reading ones, wait, play and the Studio tools", { timeout: 15000 }, async () => {
   const mcp = mcpSession(await freePort());
@@ -437,7 +438,9 @@ test("mcp: initialize carries the instructions, and the tools are the reading on
   assert.equal(init.result.protocolVersion, "2025-03-26");
   assert.equal(init.result.serverInfo.name, "quack-dev");
   assert.match(init.result.instructions, /git add/);
-  assert.match(init.result.instructions, /Never switch branches/);
+  assert.match(init.result.instructions, /never checkout, reset or stash/);
+  const ruleVersion = rule(flavorInfo("dev")).version;
+  assert.ok(init.result.instructions.includes(`quackdev rule\`, version ${ruleVersion}`), "the instructions name the rule's command and version");
   mcp.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }));
   assert.equal((await mcp.call("initialize", { protocolVersion: "1999-01-01" })).result.protocolVersion, "2025-06-18", "an unknown version gets the newest");
   const names = (await mcp.call("tools/list")).result.tools.map((t: any) => t.name);
@@ -449,6 +452,39 @@ test("mcp: initialize carries the instructions, and the tools are the reading on
   assert.equal((await mcp.call("resources/list")).error.code, -32601);
   assert.deepEqual((await mcp.call("ping")).result, {});
   await mcp.close();
+});
+
+test("rule: one text for the CLI, the app and the MCP, between markers carrying a version that follows the text", async () => {
+  const run = control(await freePort());
+  const plain = await run("rule");
+  assert.equal(plain.code, 0);
+  const dev = rule(flavorInfo("dev"));
+  assert.equal(plain.out, dev.text, "no hub needed");
+  assert.match(dev.text, new RegExp(`^<!-- quack-rule ${dev.version} -->\\n[\\s\\S]+\\n<!-- /quack-rule -->$`));
+  assert.match(dev.version, /^[0-9a-f]{8}$/);
+  // An AI that swaps the block cuts at the first end marker: the body must not hold either marker
+  assert.equal(dev.text.split("<!-- /quack-rule -->").length, 2, "one end marker, the last line");
+  assert.equal(dev.text.split("<!-- quack-rule").length, 2, "one start marker, the first line");
+  assert.equal(rule({ ...flavorInfo("dev"), port: 1 }).version, dev.version, "the port is not part of the rule");
+  const official = rule(flavorInfo("official"));
+  assert.notEqual(official.version, dev.version);
+  assert.match(official.text, /`quack --help`/);
+  assert.ok(!/quackdev/.test(official.text), "Official names only its own command");
+  for (const tool of ["status", "wait", "verify_sync", "conflicts", "solo_playtest", "eval_server_runtime", "execute_luau", "click_gui", "wait_for", "set_logpoint", "perf_sample", "play", "test_profile", "get_roblox_docs", "search_assets", "preview_asset", "insert_asset", "upload_asset", "capture_script_profiler", "get_memory_breakdown", "get_scene_analysis"]) {
+    assert.ok(dev.text.includes(`\`${tool}\``), `the rule names ${tool}`);
+  }
+
+  const prompt = (await run("rule", "--prompt", "--json")).json();
+  assert.equal(prompt.version, dev.version);
+  assert.ok(prompt.text.endsWith(dev.text), "the prompt ends with the rule itself");
+  assert.match(prompt.text, /replace that whole block/);
+
+  // Claude Code cut the old instructions at ~4 KB, mid-sentence: the short form stays well under
+  for (const flavor of ["official", "dev"] as const) {
+    const text = instructions(flavorInfo(flavor));
+    assert.ok(text.length < 3000, `${flavor} instructions are ${text.length} characters`);
+    assert.ok(text.endsWith("installs or updates it."), "the pointer to the rule is the last line");
+  }
 });
 
 test("mcp: the tools answer what the commands print, and refuse a value that would read as an option", { timeout: 60000 }, async () => {
@@ -750,6 +786,53 @@ test("Studio tools: the terminal and the MCP reach the play peers and edit mode 
     assert.match(rec.content[0].text, /^Recorded 2 frames of the play client in 0\.4 s: 5 fps real \(asked 5; the game drew 60 fps meanwhile\), 2x2 GIF, .* GIF: .*\.gif Sheet: .*-sheet\.png\. The sheet shows the frames at 0\.0, 0\.2 s\.$/);
     assert.equal(rec.content[1].type, "image");
     assert.equal(Buffer.from(rec.content[1].data, "base64").subarray(1, 4).toString(), "PNG");
+    await mcp.close();
+    fake.close();
+  });
+});
+
+test("Studio tools on assets, memory, the profiler and scene analysis: the terminal and the MCP reach the right peer through the hub, and a refusal comes before Studio", { timeout: 60000 }, async () => {
+  await withHub(async ({ port, folders }) => {
+    const seen: { role: string; tool: string; args: any }[] = [];
+    const fake = toolStudio(port, 111, async (role, tool, args) => {
+      seen.push({ role, tool, args });
+      if (tool === "assetInsert") return { assetId: args.assetId, parent: "Workspace", inserted: [{ path: "Workspace.Tree", className: "Model" }], removedScripts: [], removedPackageLinks: [], moved: args.position };
+      if (tool === "memory") return { totalMb: 800, trackingEnabled: true, tags: [{ tag: "Script", mb: 12 }] };
+      if (tool === "scene") {
+        await wait(300);
+        return { order: ["script_memory"], modes: { script_memory: { method: "GetScriptMemoryAsync", ms: 300, root: { leaves: 1 }, top: [{ name: "Main", size: 4.5 }] } } };
+      }
+      if (tool === "profiler") return { durationMs: args.durationMs, frequency: 1000, counted: 1, kept: 1, omitted: {}, functions: [] };
+      throw new Error(`${tool} is not faked`);
+    });
+    const run = control(port, { cwd: path.join(folders["111"], "sync") });
+    await waitFor(async () => (await run("status", "--json")).json().sessions[0]?.instances === 3);
+
+    const inserted = await run("asset", "insert", "123", "--at=-5,0,2.5", "--parent", "Workspace");
+    assert.equal(inserted.code, 0, inserted.err);
+    assert.deepEqual(seen.at(-1), { role: "edit", tool: "assetInsert", args: { assetId: 123, parent: "Workspace", position: [-5, 0, 2.5] } });
+    assert.match(inserted.out, /^Inserted Workspace\.Tree \(Model\) under Workspace at -5, 0, 2\.5, one undo step/);
+    assert.match((await run("asset", "insert", "123", "--at=1,2")).err, /--at is <x>,<y>,<z>/);
+    const mem = await run("memory");
+    assert.equal(mem.code, 0, mem.err);
+    assert.equal(mem.out, "edit: 800 MB in all; Script 12");
+    const scene = await run("scene", "--mode", "script_memory", "--json");
+    assert.equal(scene.code, 0, scene.err);
+    assert.equal(scene.json().modes.script_memory.top[0].name, "Main");
+    assert.match((await run("profiler")).err, /no play is running/);
+
+    const mcp = mcpSession(port, path.join(folders["111"], "sync"));
+    const insert = await mcp.tool("insert_asset", { assetId: 7, position: { x: -1, y: 2, z: -3 } });
+    assert.equal(insert.isError, undefined, insert.content[0].text);
+    assert.deepEqual(seen.at(-1)!.args.position, [-1, 2, -3]);
+    await fake.play("server");
+    await waitFor(async () => (await run("memory", "--peer", "server")).code === 0);
+    const profiled = await mcp.tool("capture_script_profiler", { durationMs: 300 });
+    assert.equal(profiled.isError, undefined, profiled.content[0].text);
+    assert.equal(seen.at(-1)!.role, "server");
+    assert.equal(seen.at(-1)!.args.durationMs, 300);
+    assert.match(profiled.content[0].text, /^the play server: 300 ms at 1000 samples a second/);
+    assert.match((await mcp.tool("get_scene_analysis", { mode: "nope" })).content[0].text, /mode must be all or one of the six breakdowns/);
     await mcp.close();
     fake.close();
   });

@@ -75,3 +75,16 @@ test("a play DataModel is told apart from the edit one by IsEdit, not IsRunning 
     assert.match(branch[1], /not RunService:IsEdit\(\)/);
   }
 });
+
+// 09/11/26, the Astral copy: AssetService:LoadAssetAsync and InsertService:LoadAsset both answered
+// "User is not authorized to access Asset" for a free Creator Store model (183435411) the user does
+// not own, while game:GetObjects (what the Toolbox uses) loaded it from the plugin, 329 instances.
+test("preview_asset and insert_asset fall back to game:GetObjects when LoadAssetAsync refuses a free model", () => {
+  const source = fs.readFileSync(path.join(here, "..", "..", "plugin", "sync", "ReplicatedFirst", "QuackPlugin", "StudioTools.luau"), "utf8");
+  const start = source.indexOf("local function loadAsset(");
+  const body = source.slice(start, source.indexOf("\nend", start));
+  assert.ok(start > 0, "loadAsset exists");
+  assert.match(body, /LoadAssetAsync/);
+  assert.match(body, /GetObjects\(`rbxassetid:\/\/\{assetId\}`\)/, "the fallback loads by rbxassetid");
+  assert.ok(body.indexOf("GetObjects") > body.indexOf("LoadAssetAsync"), "LoadAssetAsync first, GetObjects when it fails");
+});

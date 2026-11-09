@@ -5,6 +5,11 @@ import { parseArgs } from "node:util";
 import { CLIENTS, connectClients, defaultClientsEnv, listClients, serverName, type ClientsEnv, type ClientStatus, type ServerCommand } from "./connect.js";
 import { HubClient, HubError, HubOffline, type FlavorInfo } from "./hubClient.js";
 import { PLAY_TAB_HINT } from "../play/overlay.js";
+import { rule, rulePrompt } from "./rule.js";
+import {
+  assetDetails, assetThumbnail, detailsText, docsText, imageIdLua, rememberImageId, RobloxError, robloxDocs, robloxEnv, searchAssets, searchText,
+  uploadAsset, type RobloxEnv,
+} from "./roblox.js";
 
 /**
  * `quack` / `quackdev`: the hub from a terminal. Every command is one or a few calls to the
@@ -36,6 +41,8 @@ export interface ControlContext {
   server?: ServerCommand;
   /** Where the AI clients are; tests point it at a scratch home */
   clients?: ClientsEnv;
+  /** The Roblox web tools' fetch, data folder and environment; tests replace them */
+  roblox?: Partial<RobloxEnv>;
 }
 
 class UsageError extends Error {}
@@ -113,6 +120,37 @@ interface Options {
   /** A multiplayer test: which player's client; and how many players a start makes */
   player?: string;
   players?: string;
+  /** inspect, set, simulate, tabs, devices, profile */
+  all: boolean;
+  props?: string;
+  attrs?: string;
+  network?: string;
+  quality?: string;
+  memory?: string;
+  inbound?: string;
+  outbound?: string;
+  close?: string;
+  closeEdited: boolean;
+  devices?: string;
+  /** rule: the rule with how an AI installs or updates it (what the app copies) */
+  prompt: boolean;
+  /** docs, asset, memory, profiler, scene */
+  type?: string;
+  section?: string;
+  size?: string;
+  at?: string;
+  description?: string;
+  user?: string;
+  group?: string;
+  force: boolean;
+  roblox: boolean;
+  tags?: string;
+  frequency?: string;
+  ms?: string;
+  native: boolean;
+  plugin: boolean;
+  mode?: string;
+  sort?: string;
 }
 
 function parse(argv: string[]): { command?: string; args: string[]; options: Options } {
@@ -178,6 +216,34 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       parent: { type: "string" },
       player: { type: "string" },
       players: { type: "string" },
+      all: { type: "boolean" },
+      props: { type: "string" },
+      attrs: { type: "string" },
+      network: { type: "string" },
+      quality: { type: "string" },
+      memory: { type: "string" },
+      inbound: { type: "string" },
+      outbound: { type: "string" },
+      close: { type: "string" },
+      "close-edited": { type: "boolean" },
+      devices: { type: "string" },
+      prompt: { type: "boolean" },
+      type: { type: "string" },
+      section: { type: "string" },
+      size: { type: "string" },
+      at: { type: "string" },
+      description: { type: "string" },
+      user: { type: "string" },
+      group: { type: "string" },
+      force: { type: "boolean" },
+      roblox: { type: "boolean" },
+      tags: { type: "string" },
+      frequency: { type: "string" },
+      ms: { type: "string" },
+      native: { type: "boolean" },
+      plugin: { type: "boolean" },
+      mode: { type: "string" },
+      sort: { type: "string" },
     },
   });
   const number = (name: "idle" | "timeout"): number | undefined => {
@@ -248,6 +314,34 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       parent: values.parent,
       player: values.player,
       players: values.players,
+      all: values.all === true,
+      props: values.props,
+      attrs: values.attrs,
+      network: values.network,
+      quality: values.quality,
+      memory: values.memory,
+      inbound: values.inbound,
+      outbound: values.outbound,
+      close: values.close,
+      closeEdited: values["close-edited"] === true,
+      devices: values.devices,
+      prompt: values.prompt === true,
+      type: values.type,
+      section: values.section,
+      size: values.size,
+      at: values.at,
+      description: values.description,
+      user: values.user,
+      group: values.group,
+      force: values.force === true,
+      roblox: values.roblox === true,
+      tags: values.tags,
+      frequency: values.frequency,
+      ms: values.ms,
+      native: values.native === true,
+      plugin: values.plugin === true,
+      mode: values.mode,
+      sort: values.sort,
     },
   };
 }
@@ -336,10 +430,55 @@ Studio (through the ${info.appName} plugin; the code goes as --code=<luau> or --
   find [place] [--name <pattern>] [--class <A,B>] [--under <path>] [--limit <n>]
                             Instances of the synced tree (edit mode, as of the last sync) by
                             name (* and ?), class and where; scripts with their file
+  inspect <path> [place] [--peer edit|server|client] [--all] [--hidden]
+                            One instance read whole: properties that differ from a new one of
+                            its class (--all: every one), attributes, tags, children
+  set <path> [place] [--props=<json>] [--attrs=<json>] [--peer edit|server|client]
+                            Change properties and attributes together, all or nothing; a value
+                            takes the type there now, or names it: {"Vector3":[1,2,3]}
+  simulate [place] [--network off|great|good|poor] [--inbound=<ms>,<jitter ms>,<loss %>]
+           [--outbound=...] [--quality auto|1..21] [--memory <MB>]
+                            Studio's network and performance simulation; nothing to set shows it
+  tabs [place] [--close=<path>,<path>] [--close-edited]   Script tabs open in Studio, and the
+                            edited ones (an edited tab gives a play its own text)
+  devices [place] [--devices=<id>,<id>] [--orientation <o>] [--width <px>]
+                            The view on several devices in one picture (default a small phone,
+                            an iPhone, an iPad and no simulation), the simulator put back after
+  profile save|restore [name] [place] | profile list [place]   The player's test profile kept and
+                            put back through the prelude's __quackSaveProfile / __quackRestoreProfile
   mouse <x> <y> [place] | mouse --path=<path> [place] [--action click|double|down|up]
         [--button left|right|middle] [--space screen]
                             The play client's mouse at a point on the last screenshot (or the
                             screen's own pixels), or at a GuiObject's or a part's center
+  memory [place] [--peer edit|server|client] [--tags <A,B>]
+                            Memory by DeveloperMemoryTag and the total, in edit mode and each
+                            play peer (a solo play is one process: the same total in each)
+  profiler [place] [--peer server|client] [--ms <n>] [--frequency <n>] [--limit <n>]
+           [--filter <text>] [--native] [--plugin] [--out <file.json>]
+                            The script profiler on the play server (or client) for --ms (default
+                            1000, at most 15000): the functions that took the most time
+  scene [place] [--mode all|instance_composition|script_memory|unparented_instances|
+        triangle_composition|animation_memory|audio_memory] [--peer edit|server|client] [--limit <n>]
+                            Studio's Scene Analysis (a beta feature): the biggest entries of each
+  asset preview <id> [place] [--depth <n>]   A Creator Store asset loaded and read, not inserted:
+                            its classes, scripts (and what they call), PackageLinks, sounds, tree
+  asset insert <id> [place] [--parent <path>] [--at=<x>,<y>,<z>]   The asset put in the place
+                            (edit mode, one undo step) with every script and PackageLink removed
+
+Roblox (no hub needed)
+  docs <Name> [--type classes|enums|datatypes|libraries|globals] [--section <name>]
+                            The engine reference's page (TweenService, Enum.KeyCode, Color3),
+                            each member's security level first; cached a day
+  asset search [query] [--type Model|Decal|Image|Audio|MeshPart|Video|Plugin|FontFamily|Particle|VFX]
+               [--limit <n>] [--sort <category>] [--roblox]   The Creator Store; --roblox: made by Roblox
+  asset details <id>        One asset on the Creator Store: creator, scripts, mesh size, votes
+  asset thumbnail <id> [--size 150x150|420x420|768x432] [--out <file.png>]   Its thumbnail as a PNG
+  asset upload <file> [place] --type Decal|Audio|Model|Animation|Video --name <name>
+               [--description <text>] [--user <id> | --group <id>] [--force]
+                            Open Cloud: the key and creator from ROBLOX_OPEN_CLOUD_API_KEY,
+                            ROBLOX_CREATOR_USER_ID / _GROUP_ID or open-cloud.env next to the
+                            registry; the same file uploaded again answers the asset it made
+                            (--force posts anyway); a Decal also gets its image id
 
 Studio queue (one per place: test jobs, the Studio lock and who waits for it)
   queue [place]             Who holds Studio and for how long, who waits (level, wait), the jobs
@@ -365,6 +504,9 @@ AI
   mcp                       An MCP server on stdio for Claude Code, Cursor, Codex: status, wait, log,
                             conflicts, doctor, play and the Studio commands as tools, with how
                             to use ${info.appName} as its instructions
+  rule [--prompt]           How an AI uses ${info.appName}, for its instructions file (CLAUDE.md, AGENTS.md);
+                            --prompt adds how the AI puts it there or swaps an older copy
+                            (the app's "Copy rule for AI" copies that)
   ai-clients                Claude Code, Cursor and Codex on this computer, and whether each has the MCP
   connect-ai [claude|cursor|codex|<id>]...   Add the MCP to each one named (default: every one installed).
                             Every config folder counts: CLAUDE_CONFIG_DIR / CODEX_HOME, ~/.claude-*,
@@ -408,6 +550,7 @@ export async function runControl(argv: string[], ctx: ControlContext): Promise<n
       return EXIT.offline;
     }
     if (error instanceof Timeout) return EXIT.timeout;
+    if (error instanceof RobloxError && error.pending) return EXIT.timeout;
     if (error instanceof UsageError) return EXIT.error;
     return EXIT.error;
   }
@@ -550,6 +693,12 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
       return restartHub(ctx, options);
     case "play":
       return play(ctx, options, args[0]);
+    case "rule": {
+      const { version, text } = rule(ctx.info);
+      const body = options.prompt ? rulePrompt(ctx.info) : text;
+      ctx.out(options.json ? JSON.stringify({ version, text: body }, null, 2) : body);
+      return EXIT.ok;
+    }
     case "ai-clients":
     case "connect-ai":
       return aiClients(ctx, options, command === "connect-ai", args);
@@ -589,8 +738,30 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
       return exportRbxm(ctx, options, args);
     case "import":
       return importRbxm(ctx, options, args);
+    case "inspect":
+      return inspectInstance(ctx, options, args);
+    case "set":
+      return setProperties(ctx, options, args);
+    case "simulate":
+      return simulate(ctx, options, args[0]);
+    case "tabs":
+      return tabs(ctx, options, args[0]);
+    case "devices":
+      return devices(ctx, options, args[0]);
+    case "profile":
+      return profile(ctx, options, args);
     case "find":
       return findInstances(ctx, options, args[0]);
+    case "docs":
+      return docs(ctx, options, args);
+    case "asset":
+      return asset(ctx, options, args);
+    case "memory":
+      return memory(ctx, options, args[0]);
+    case "profiler":
+      return profiler(ctx, options, args[0]);
+    case "scene":
+      return scene(ctx, options, args[0]);
   }
   throw new UsageError(`unknown command ${command}. Run ${ctx.info.command} --help.`);
 }
@@ -1033,6 +1204,7 @@ async function play(ctx: ControlContext, options: Options, query: string | undef
   } else if (parts.length) {
     ctx.out(`Playing ${parts.length} worktrees in ${placeLabel(place)}: ${state.patches} changed, ${state.creates} new, ${state.disables} turned off.`);
     ctx.out(`The place in edit mode held the branches for ${Math.round(state.result.windowMs ?? 0)} ms, and has its own scripts again.`);
+    if (state.result.closedTabs?.length) ctx.out(`Closed the Studio tab of ${state.result.closedTabs.join(", ")} first, so the play takes the branch's text.`);
     if (!state.verify) ctx.err("The play session did not report its check (closed early, or a plugin without play support).");
     for (const part of parts) {
       ctx.out(`${part.worktree}: ${part.patches} changed, ${part.creates} new, ${part.disables} turned off.`);
@@ -1051,6 +1223,7 @@ async function play(ctx: ControlContext, options: Options, query: string | undef
     ctx.out(`Playing ${state.worktree} in ${placeLabel(place)}: ${state.patches} changed, ${state.creates} new, ${state.disables} turned off.`);
     if (state.checks === 0) ctx.out("The branch brings no script change since it forked from the place's folder: this play runs the place as Studio has it.");
     ctx.out(`The place in edit mode held the branch for ${Math.round(state.result.windowMs ?? 0)} ms, and has its own scripts again.`);
+    if (state.result.closedTabs?.length) ctx.out(`Closed the Studio tab of ${state.result.closedTabs.join(", ")} first, so the play takes the branch's text.`);
     for (const line of state.skipped ?? []) ctx.out(`  not carried: ${line}`);
     for (const line of state.conflicts ?? []) ctx.out(`  conflict: ${line}`);
     // A hub from before 25/10/26 does not say how many checks it sent
@@ -1475,6 +1648,145 @@ async function importRbxm(ctx: ControlContext, options: Options, args: string[])
   return EXIT.ok;
 }
 
+function jsonOption(value: string | undefined, name: string): Record<string, unknown> | undefined {
+  if (value === undefined) return undefined;
+  try {
+    const parsed = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+    return parsed;
+  } catch (error) {
+    throw new UsageError(`--${name} must be a JSON object of name: value (${(error as Error).message})`);
+  }
+}
+
+/** inspect's answer: the instance, then a line a property, attribute and tag */
+export function inspectText(result: any): string {
+  const lines = [`${result.path} [${result.className}] in ${PEER_NAME[result.peer] ?? result.peer}`];
+  if (result.pivot) lines.push(`  pivot: ${result.pivot}`);
+  if (result.boundingBox) lines.push(`  bounding box: ${result.boundingBox}`);
+  if (result.properties?.length) {
+    lines.push(result.defaultsLeftOut ? "Properties (the ones not at their default):" : "Properties:");
+    for (const p of result.properties) lines.push(`  ${p.name} = ${p.value}  (${p.type})`);
+  }
+  if (result.attributes?.length) {
+    lines.push("Attributes:");
+    for (const a of result.attributes) lines.push(`  ${a.name} = ${a.value}  (${a.type})`);
+  }
+  if (result.tags?.length) lines.push(`Tags: ${result.tags.join(", ")}`);
+  if (result.childCount) lines.push(`Children (${result.childCount}): ${result.children.join(", ")}${result.childCount > result.children.length ? ", ..." : ""}`);
+  if (result.unread) lines.push(`(${result.unread} properties a plugin cannot read were left out)`);
+  return lines.join("\n");
+}
+
+async function inspectInstance(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const target = need(args[0], "inspect <path> [place]");
+  const place = await resolvePlace(ctx, args[1]);
+  const result = await studio(ctx, place, "inspect", { path: target, peer: options.peer, all: options.all, hidden: options.hidden }, 20_000);
+  if (options.json) ctx.out(JSON.stringify(result, null, 2));
+  else ctx.out(inspectText(result));
+  return EXIT.ok;
+}
+
+async function setProperties(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const target = need(args[0], "set <path> [place] --props=<json> --attrs=<json>");
+  const properties = jsonOption(options.props, "props");
+  const attributes = jsonOption(options.attrs, "attrs");
+  if (!properties && !attributes) throw new UsageError("give --props=<json> and/or --attrs=<json>");
+  const place = await resolvePlace(ctx, args[1]);
+  const result = await studio(ctx, place, "setProps", { path: target, peer: options.peer, properties, attributes }, 20_000);
+  if (options.json) ctx.out(JSON.stringify(result, null, 2));
+  else {
+    ctx.out(`${result.path} in ${PEER_NAME[result.peer] ?? result.peer}:`);
+    for (const c of result.changed) ctx.out(`  ${c.kind === "attribute" ? "attribute " : ""}${c.name}: ${c.before} -> ${c.after}`);
+  }
+  return EXIT.ok;
+}
+
+function sideOption(value: string | undefined, name: string): Record<string, number> | undefined {
+  if (value === undefined) return undefined;
+  const [latencyMs, jitterMs, lossPercent] = value.split(",").map((v) => (v.trim() === "" ? undefined : Number(v)));
+  const side: Record<string, number> = {};
+  for (const [key, n] of Object.entries({ latencyMs, jitterMs, lossPercent })) {
+    if (n === undefined) continue;
+    if (!Number.isFinite(n) || n < 0) throw new UsageError(`--${name} is <latency ms>,<jitter ms>,<loss %>, each a number 0 or more`);
+    side[key] = n;
+  }
+  return side;
+}
+
+/** simulate's answer: the network both ways, the quality, the memory */
+export function simulationText(state: any): string {
+  if (!state) return "(no state)";
+  const side = (prefix: string) => `${state[`${prefix}NetworkMinDelayMs`]} ms, jitter ${state[`${prefix}NetworkJitterMs`]} ms, loss ${state[`${prefix}NetworkLossPercent`]}%`;
+  const memory = typeof state.EmulatedTotalMemoryInMB === "number" ? `${Math.round(state.EmulatedTotalMemoryInMB / 1024 * 10) / 10} GB` : "?";
+  return `inbound ${side("Inbound")}; outbound ${side("Outbound")}; graphics ${state.QualityLevel}; device memory ${memory}`;
+}
+
+async function simulate(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  const place = await resolvePlace(ctx, query);
+  const quality = options.quality === undefined ? undefined : options.quality === "auto" ? "auto" : Number(options.quality);
+  const memoryMb = options.memory === undefined ? undefined : Number(options.memory);
+  const result = await studio(ctx, place, "simulate", {
+    network: options.network, inbound: sideOption(options.inbound, "inbound"), outbound: sideOption(options.outbound, "outbound"), quality, memoryMb,
+  }, 20_000);
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  const changed = JSON.stringify(result.edit?.before) !== JSON.stringify(result.edit?.after);
+  ctx.out(`${changed ? "Now" : "Simulation"}: ${simulationText(result.edit?.after)}`);
+  if (changed) ctx.out(`Was: ${simulationText(result.edit?.before)}`);
+  if (result.client?.error) ctx.out(`The play client did not take it: ${result.client.error}`);
+  else if (result.client) ctx.out("The play client has it too.");
+  return EXIT.ok;
+}
+
+async function tabs(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  const place = await resolvePlace(ctx, query);
+  const close = options.close === undefined ? undefined : options.close.split(",").map((p) => p.trim()).filter(Boolean);
+  const result = await studio(ctx, place, "tabs", { close, closeEdited: options.closeEdited }, 40_000);
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  for (const c of result.closed ?? []) ctx.out(`closed ${c.path}${c.edited ? " (it was edited)" : ""}${c.ok ? "" : `: failed, ${c.error}`}`);
+  for (const t of result.tabs ?? []) ctx.out(`${t.edited ? "EDITED " : ""}${t.path}`);
+  if (!result.tabs?.length && !result.closed?.length) ctx.out("No script tab is open in this Studio.");
+  return EXIT.ok;
+}
+
+async function devices(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  const place = await resolvePlace(ctx, query);
+  const list = options.devices === undefined ? undefined : options.devices.split(",").map((d) => d.trim()).filter(Boolean);
+  const width = positiveInt(options.width, "width");
+  const result = await studio(ctx, place, "devices", { devices: list, orientation: options.orientation, ...(width ? { width } : {}) }, 120_000);
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  ctx.out(`${result.shots.length} devices in one picture, ${result.width}x${result.height}, left to right: ${result.shots.map((s: any) => `${s.device} (${s.width}x${s.height})`).join(", ")} (${result.ms} ms)`);
+  ctx.out(result.sheet);
+  return EXIT.ok;
+}
+
+async function profile(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const action = need(args[0], "profile save|restore [name] [place] | profile list [place]");
+  if (!["save", "restore", "list"].includes(action)) throw new UsageError("profile save|restore [name] [place] | profile list [place]");
+  // profile save [name] [place]: one argument is the name when no place answers to it
+  let name = action === "list" ? undefined : args[1];
+  let query = action === "list" ? args[1] : args[2];
+  if (name !== undefined && query === undefined && (await resolvePlace(ctx, name).then(() => true, () => false))) {
+    query = name;
+    name = undefined;
+  }
+  const place = await resolvePlace(ctx, query);
+  const result = await studio(ctx, place, "profile", { action, ...(name ? { name } : {}) }, 60_000);
+  if (options.json) ctx.out(JSON.stringify(result, null, 2));
+  else if (action === "list") ctx.out(result.profiles.length ? result.profiles.join("\n") : "No profile kept yet.");
+  else ctx.out(`${action === "save" ? "Kept" : "Put back"} the profile ${result.name} (${result.bytes} bytes): ${result.file}`);
+  return EXIT.ok;
+}
+
 async function findInstances(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
   const place = await resolvePlace(ctx, query);
   const limit = positiveInt(options.limit, "limit");
@@ -1564,6 +1876,233 @@ export function recordSummary(result: any): string {
   const source = result.peer === "client" ? "the play client" : "Studio in edit mode";
   const skipped = result.skipped ? `, ${result.skipped} unreadable` : "";
   return `Recorded ${result.frames} frames of ${source} in ${result.seconds} s: ${result.fps} fps real (asked ${result.targetFps}${skipped}; ${result.peer === "client" ? "the game" : "Studio"} drew ${result.gameFps} fps meanwhile), ${result.width}x${result.height} GIF, ${(result.bytes / 1024).toFixed(0)} KB, ${result.ms} ms in all.`;
+}
+
+// ---------------------------------------------------------------------------------------
+// Roblox: the engine reference and the Creator Store (no hub), and the Studio tools on assets,
+// memory, the script profiler and scene analysis
+
+/** The Roblox web tools' world: %APPDATA%\quack (next to the registry) unless a test says otherwise */
+function rbx(ctx: ControlContext): RobloxEnv {
+  return robloxEnv(ctx.roblox?.dataDir ?? path.dirname(ctx.info.registry), ctx.roblox);
+}
+
+async function docs(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const name = need(args[0], "docs <Name> [--type classes|enums|datatypes|libraries|globals] [--section <name>]");
+  const answer = await robloxDocs(rbx(ctx), { name, type: options.type, section: options.section });
+  ctx.out(options.json ? JSON.stringify(answer, null, 2) : docsText(answer));
+  return answer.suggestions ? EXIT.error : EXIT.ok;
+}
+
+const ASSET_USAGE = "asset search|details|thumbnail|preview|insert|upload ... (see --help)";
+
+async function asset(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const action = need(args[0], ASSET_USAGE);
+  const print = (value: unknown, text: () => string) => ctx.out(options.json ? JSON.stringify(value, null, 2) : text());
+  switch (action) {
+    case "search": {
+      const limit = positiveInt(options.limit, "limit");
+      const result = await searchAssets(rbx(ctx), { type: options.type, query: args.slice(1).join(" "), limit, sort: options.sort, robloxOnly: options.roblox });
+      print(result, () => searchText(result));
+      return EXIT.ok;
+    }
+    case "details": {
+      const result = await assetDetails(rbx(ctx), need(args[1], "asset details <id>"));
+      print(result, () => detailsText(result));
+      return EXIT.ok;
+    }
+    case "thumbnail": {
+      const result: Record<string, unknown> = await assetThumbnail(rbx(ctx), { id: need(args[1], "asset thumbnail <id> [--size 150x150|420x420|768x432] [--out <file.png>]"), size: options.size });
+      if (options.out) {
+        if (!/\.png$/i.test(options.out)) throw new UsageError("--out must be a .png file");
+        const target = path.resolve(ctx.cwd, options.out);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.copyFileSync(String(result.file), target);
+        result.file = target;
+      }
+      print(result, () => `Thumbnail of asset ${result.assetId} (${result.size}), ${Math.round(Number(result.bytes) / 1024)} KB PNG:\n${result.file}`);
+      return EXIT.ok;
+    }
+    case "preview": {
+      const id = need(args[1], "asset preview <id> [place] [--depth <n>]");
+      const place = await resolvePlace(ctx, args[2]);
+      const result = await studio(ctx, place, "assetPreview", { assetId: Number(id), depth: wholeOption(options.depth, "depth") }, 60_000);
+      print(result, () => previewText(result));
+      return EXIT.ok;
+    }
+    case "insert": {
+      const id = need(args[1], "asset insert <id> [place] [--parent <path>] [--at=<x>,<y>,<z>]");
+      let position: number[] | undefined;
+      if (options.at !== undefined) {
+        position = options.at.split(",").map((v) => Number(v.trim()));
+        if (position.length !== 3 || !position.every(Number.isFinite)) throw new UsageError("--at is <x>,<y>,<z> in studs, as --at=0,5,-10");
+      }
+      const place = await resolvePlace(ctx, args[2]);
+      const result = await studio(ctx, place, "assetInsert", { assetId: Number(id), parent: options.parent, ...(position ? { position } : {}) }, 60_000);
+      print(result, () => insertText(result));
+      return EXIT.ok;
+    }
+    case "upload":
+      return uploadCommand(ctx, options, args);
+  }
+  throw new UsageError(`usage: ${ASSET_USAGE}`);
+}
+
+async function uploadCommand(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const file = path.resolve(ctx.cwd, need(args[1], "asset upload <file> [place] --type Decal|Audio|Model|Animation|Video --name <display name> [--description <text>] [--user <id> | --group <id>] [--force]"));
+  if (!options.type) throw new UsageError("--type is required: Decal, Audio, Model, Animation or Video");
+  if (!options.name) throw new UsageError("--name is required: the asset's display name on Roblox");
+  if (options.user !== undefined && options.group !== undefined) throw new UsageError("give --user or --group, not both");
+  const env = rbx(ctx);
+  const result: Record<string, any> = await uploadAsset(env, {
+    file, assetType: options.type, displayName: options.name, description: options.description, userId: options.user, groupId: options.group, force: options.force,
+  });
+  // A Decal's own id is not the image's: scripts and ImageLabels need the image id inside it
+  if (options.type === "Decal" && result.assetId && !result.imageId) {
+    const found = await decalImageId(ctx, env, String(result.assetId), args[2]);
+    if (found.imageId) {
+      result.imageId = found.imageId;
+      rememberImageId(env, result.key, found.imageId);
+    } else result.imageIdHow = found.how;
+  }
+  delete result.key;
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  const what = `${result.assetType} "${result.displayName}" for ${result.creator}`;
+  if (result.reused === "done") ctx.out(`Already uploaded (the upload log knows this file as ${what}): asset ${result.assetId}. --force uploads it again.`);
+  else ctx.out(`Uploaded ${path.basename(file)} as ${what}${result.reused === "resumed" ? " (an earlier upload of it finished processing)" : ""}: asset ${result.assetId} (operation ${result.operationId}).`);
+  if (options.type === "Decal") {
+    ctx.out(result.imageId
+      ? `Image id ${result.imageId} (rbxassetid://${result.imageId}): what an ImageLabel or a Decal's Texture takes; ${result.assetId} is the Decal.`
+      : `The image id is not known yet (${result.imageIdHow}). With the place open in Studio, run the same upload again (it is not posted twice), or read InsertService:LoadAsset(${result.assetId})'s Decal.Texture.`);
+  }
+  return EXIT.ok;
+}
+
+/** A decal's image id: the Creator Store says it for a public one, else the place's Studio loads the decal */
+async function decalImageId(ctx: ControlContext, env: RobloxEnv, decalId: string, query: string | undefined): Promise<{ imageId?: string; how: string }> {
+  try {
+    const details = await assetDetails(env, decalId);
+    if (details.imageId) return { imageId: String(details.imageId), how: "the Creator Store" };
+  } catch {
+    // a fresh decal is often not on the store yet: Studio next
+  }
+  try {
+    const place = await resolvePlace(ctx, query);
+    const result = await studio(ctx, place, "exec", { code: imageIdLua(decalId), prelude: false, timeoutMs: 30_000 }, 30_000);
+    const value = result?.ok ? String(result.values?.[0] ?? "") : "";
+    if (/^\d+$/.test(value)) return { imageId: value, how: `Studio (${placeLabel(place)})` };
+    return { how: `Studio could not read it: ${result?.ok ? value.replace(/^error: /, "") : result?.error}` };
+  } catch (error) {
+    return { how: (error as Error).message.split("\n")[0] };
+  }
+}
+
+/** preview's answer: what the asset holds, its scripts first */
+export function previewText(r: any): string {
+  const classes = (r.classes ?? []).slice(0, 12).map((c: any) => `${c.class} ${c.count}`).join(", ");
+  const lines = [`Asset ${r.assetId}: ${r.total} instances (${classes}${(r.classes?.length ?? 0) > 12 ? ", ..." : ""}), ${r.ms} ms`];
+  if (r.scripts?.length) {
+    lines.push(`Scripts (${r.scripts.length}; insert_asset removes every one):`);
+    for (const s of r.scripts) lines.push(`  ${s.path} [${s.className}]${s.lines !== undefined ? `, ${s.lines} lines` : ""}${s.enabled === false ? ", disabled" : ""}${s.uses?.length ? `, uses ${s.uses.join(", ")}` : ""}`);
+  } else lines.push("No scripts.");
+  if (r.packageLinks?.length) lines.push(`PackageLinks (${r.packageLinks.length}; removed on insert): ${r.packageLinks.join(", ")}`);
+  if (r.sounds?.length) lines.push(`Sounds (${r.sounds.length}): ${r.sounds.slice(0, 10).map((s: any) => `${s.path} ${s.soundId}`).join(", ")}${r.sounds.length > 10 ? ", ..." : ""}`);
+  lines.push("Tree:");
+  for (const n of r.nodes ?? []) lines.push(`  ${"  ".repeat(n.d)}${n.n} [${n.c}]${n.more ? ` +${n.more} inside` : ""}`);
+  if (r.truncated) lines.push(`  (stopped at ${r.nodes.length} objects)`);
+  return lines.join("\n");
+}
+
+/** insert's answer: what came in, where, and what was taken out */
+export function insertText(r: any): string {
+  const inserted = (r.inserted ?? []).map((i: any) => `${i.path} (${i.className})`).join(", ");
+  const moved = Array.isArray(r.moved) ? ` at ${r.moved.join(", ")}` : "";
+  const removed = [r.removedScripts?.length ? `${r.removedScripts.length} script(s): ${r.removedScripts.join(", ")}` : "", r.removedPackageLinks?.length ? `${r.removedPackageLinks.length} PackageLink(s)` : ""].filter(Boolean).join("; ");
+  return `Inserted ${inserted} under ${r.parent}${moved}, one undo step, selected (${r.ms} ms).\n${removed ? `Removed before the insert: ${removed}. Quack never inserts a Store asset's scripts: they would sync to disk and run in the game.` : "It held no script."}`;
+}
+
+async function memory(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  if (options.peer !== undefined && !["edit", "server", "client"].includes(options.peer)) throw new UsageError("--peer must be edit, server or client");
+  const place = await resolvePlace(ctx, query);
+  const tags = options.tags === undefined ? undefined : options.tags.split(",").map((t) => t.trim()).filter(Boolean);
+  const result = await studio(ctx, place, "memory", { peer: options.peer, ...(tags?.length ? { tags } : {}) }, 20_000);
+  if (options.json) ctx.out(JSON.stringify(result, null, 2));
+  else ctx.out(memoryText(result));
+  return EXIT.ok;
+}
+
+export function memoryText(result: any): string {
+  const lines: string[] = [];
+  for (const peer of ["edit", "server", "client"]) {
+    const p = result[peer];
+    if (!p) continue;
+    if (p.error) {
+      lines.push(`${peer}: ${p.error}`);
+      continue;
+    }
+    const tracking = p.trackingEnabled === false ? " (memory tracking is off: tags may read 0)" : "";
+    lines.push(`${peer}: ${p.totalMb} MB in all${tracking}; ${(p.tags ?? []).slice(0, 12).map((t: any) => `${t.tag} ${t.mb}`).join(", ") || "no tag above 0"}`);
+  }
+  if (result.note) lines.push(`(${result.note})`);
+  return lines.join("\n");
+}
+
+async function profiler(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  if (options.peer !== undefined && options.peer !== "server" && options.peer !== "client") throw new UsageError("--peer must be server or client");
+  if (options.out !== undefined && !/\.json$/i.test(options.out)) throw new UsageError("--out must be a .json file");
+  const durationMs = positiveInt(options.ms, "ms") ?? 1000;
+  const place = await resolvePlace(ctx, query);
+  const result = await studio(ctx, place, "profiler", {
+    peer: options.peer, durationMs, frequency: positiveInt(options.frequency, "frequency"), maxFunctions: positiveInt(options.limit, "limit"),
+    filter: options.filter, includeNative: options.native, includePlugin: options.plugin, ...(options.out ? { out: path.resolve(ctx.cwd, options.out) } : {}),
+    timeoutMs: durationMs + 30_000,
+  }, durationMs + 30_000);
+  if (options.json) ctx.out(JSON.stringify(result, null, 2));
+  else ctx.out(profilerText(result));
+  return EXIT.ok;
+}
+
+export function profilerText(r: any): string {
+  const omitted = Object.entries(r.omitted ?? {}).filter(([, n]) => Number(n) > 0).map(([k, n]) => `${n} ${k === "quack" ? "Quack's own" : k}`).join(", ");
+  const lines = [`${PEER_NAME[r.peer] ?? r.peer}${r.player ? ` (${r.player})` : ""}: ${r.durationMs} ms at ${r.frequency} samples a second; ${r.counted} functions, ${r.kept} kept${omitted ? ` (left out: ${omitted})` : ""}`];
+  for (const f of r.functions ?? []) {
+    const where = f.source ? `  ${f.source}${f.line ? `:${f.line}` : ""}` : "";
+    lines.push(`${String(f.rank).padStart(3)}. ${String(f.pct).padStart(6)}%  ${(f.totalUs / 1000).toFixed(2).padStart(9)} ms  ${f.name}${f.native ? " (native)" : ""}${where}`);
+  }
+  if (!r.functions?.length) lines.push("  (no function sampled: the game ran almost no Luau, or the filter left none)");
+  if (r.file) lines.push(`Raw profile: ${r.file}`);
+  return lines.join("\n");
+}
+
+async function scene(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  if (options.peer !== undefined && !["edit", "server", "client"].includes(options.peer)) throw new UsageError("--peer must be edit, server or client");
+  const place = await resolvePlace(ctx, query);
+  const all = options.mode === undefined || options.mode === "all";
+  const timeoutMs = (options.timeout ?? (all ? 300 : 120)) * 1000;
+  const result = await studio(ctx, place, "scene", { mode: options.mode, peer: options.peer, topN: positiveInt(options.limit, "limit"), timeoutMs }, timeoutMs);
+  const failed = Object.values(result.modes ?? {}).some((m: any) => m?.error);
+  if (options.json) ctx.out(JSON.stringify(result, null, 2));
+  else ctx.out(sceneText(result));
+  return failed && Object.values(result.modes ?? {}).every((m: any) => m?.error) ? EXIT.error : EXIT.ok;
+}
+
+export function sceneText(r: any): string {
+  const lines = [`Scene analysis of ${PEER_NAME[r.peer] ?? r.peer} (${r.ms} ms):`];
+  const size = (s: any) => (typeof s === "number" ? `${Math.round(s * 100) / 100}` : s === undefined || s === null ? "" : JSON.stringify(s));
+  for (const mode of r.order ?? Object.keys(r.modes ?? {})) {
+    const m = r.modes?.[mode];
+    if (!m) continue;
+    if (m.error) {
+      lines.push(`${mode}: ${m.error}`);
+      continue;
+    }
+    lines.push(`${mode}: ${m.root?.leaves ?? 0} entries${m.root?.size !== undefined ? `, ${size(m.root.size)} in all` : ""}${m.root?.sizes ? ` ${size(m.root.sizes)}` : ""} (${m.ms} ms)`);
+    for (const e of m.top ?? []) lines.push(`  ${e.name ?? "?"}  ${mode === "triangle_composition" && e.sizes ? size(e.sizes) : size(e.size)}${e.assetId ? `  asset ${e.assetId}` : ""}`);
+  }
+  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------------------

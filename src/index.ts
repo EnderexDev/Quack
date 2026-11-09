@@ -50,7 +50,7 @@ export interface PlayState {
   conflicts: string[];
   /** Checks the play session runs: one per script the play carries */
   checks: number;
-  result?: { ok: boolean; error?: string; windowMs?: number; applied?: number; failed?: string[] };
+  result?: { ok: boolean; error?: string; windowMs?: number; applied?: number; failed?: string[]; closedTabs?: string[] };
   verify?: { ok: boolean; passed: number; failed: string[]; unverified: string[]; at: number };
   /** Each worktree of the play (one for a plain play), with its own share of the check */
   worktrees: PlayWorktreeState[];
@@ -2256,6 +2256,7 @@ export class SyncDaemon {
       ...(typeof result.windowMs === "number" ? { windowMs: result.windowMs } : {}),
       ...(typeof result.applied === "number" ? { applied: result.applied } : {}),
       ...(Array.isArray(result.failed) ? { failed: result.failed.slice(0, 50).map(String) } : {}),
+      ...(Array.isArray(result.closedTabs) && result.closedTabs.length ? { closedTabs: result.closedTabs.slice(0, 50).map(String) } : {}),
     };
     // Which worktree's scripts Studio refused: the others can play without it
     if (!state.result.ok && Array.isArray(result.failed) && result.failed.length) {

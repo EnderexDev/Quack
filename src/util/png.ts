@@ -101,3 +101,68 @@ export function sheet(images: Buffer[], width: number, height: number, columns: 
   });
   return { rgba: out, width: w, height: h };
 }
+
+/** Any size down (or up) to `width` x `height`, each pixel the mean of the source area it covers */
+export function resize(rgba: Buffer, width: number, height: number, toWidth: number, toHeight: number): { rgba: Buffer; width: number; height: number } {
+  const w = Math.max(1, Math.round(toWidth));
+  const h = Math.max(1, Math.round(toHeight));
+  if (rgba.length !== width * height * 4) throw new Error(`expected ${width * height * 4} bytes of RGBA, got ${rgba.length}`);
+  const out = Buffer.alloc(w * h * 4);
+  const sx = width / w;
+  const sy = height / h;
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.floor(y * sy);
+    const y1 = Math.max(y0 + 1, Math.min(height, Math.floor((y + 1) * sy)));
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.floor(x * sx);
+      const x1 = Math.max(x0 + 1, Math.min(width, Math.floor((x + 1) * sx)));
+      let r = 0, g = 0, b = 0, a = 0;
+      const count = (y1 - y0) * (x1 - x0);
+      for (let yy = y0; yy < y1; yy++) {
+        let i = (yy * width + x0) * 4;
+        for (let xx = x0; xx < x1; xx++, i += 4) {
+          r += rgba[i];
+          g += rgba[i + 1];
+          b += rgba[i + 2];
+          a += rgba[i + 3];
+        }
+      }
+      const o = (y * w + x) * 4;
+      out[o] = Math.round(r / count);
+      out[o + 1] = Math.round(g / count);
+      out[o + 2] = Math.round(b / count);
+      out[o + 3] = Math.round(a / count);
+    }
+  }
+  return { rgba: out, width: w, height: h };
+}
+
+/**
+ * Images of any size as one picture: each scaled to `tileHeight` tall (keeping its shape), placed
+ * left to right and wrapped at `maxWidth`, with a dark grey gap. Answers where each one went.
+ */
+export function mosaic(images: { rgba: Buffer; width: number; height: number }[], tileHeight: number, maxWidth: number, gap = 6): { rgba: Buffer; width: number; height: number; places: { x: number; y: number; width: number; height: number }[] } {
+  if (images.length === 0) throw new Error("a mosaic needs at least one image");
+  const tiles = images.map((image) => resize(image.rgba, image.width, image.height, (image.width * tileHeight) / image.height, tileHeight));
+  const places: { x: number; y: number; width: number; height: number }[] = [];
+  let x = 0;
+  let y = 0;
+  let width = 0;
+  for (const tile of tiles) {
+    if (x > 0 && x + tile.width > maxWidth) {
+      x = 0;
+      y += tileHeight + gap;
+    }
+    places.push({ x, y, width: tile.width, height: tile.height });
+    width = Math.max(width, x + tile.width);
+    x += tile.width + gap;
+  }
+  const height = y + tileHeight;
+  const out = Buffer.alloc(width * height * 4);
+  for (let i = 0; i < out.length; i += 4) out.set([40, 40, 40, 255], i);
+  tiles.forEach((tile, n) => {
+    const p = places[n];
+    for (let row = 0; row < tile.height; row++) tile.rgba.copy(out, ((p.y + row) * width + p.x) * 4, row * tile.width * 4, (row + 1) * tile.width * 4);
+  });
+  return { rgba: out, width, height, places };
+}

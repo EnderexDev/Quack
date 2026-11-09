@@ -695,6 +695,30 @@ async fn ai_clients(app: AppHandle, connect: bool) -> Result<Value, String> {
     .map_err(|e| e.to_string())?
 }
 
+/**
+ * The rule an AI keeps in its instructions file, with how it installs or updates it
+ * (`rule --prompt`): the shipped command writes it, so the button and `quack rule` never differ.
+ */
+#[tauri::command]
+async fn ai_rule(app: AppHandle) -> Result<Value, String> {
+    let node = app.state::<Shared>().settings.lock().unwrap().node.clone();
+    let cli = if cfg!(debug_assertions) {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("dist").join("control").join("main.js")
+    } else {
+        resource(&app, &["hub", "cli.mjs"]).ok_or("the app's files were not found")?
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let output = hidden_command(&node)
+            .arg(&cli)
+            .args(["--flavor", flavor::CLI_FLAVOR, "rule", "--prompt", "--json"])
+            .output()
+            .map_err(|e| format!("could not run {node}: {e}"))?;
+        serde_json::from_slice::<Value>(&output.stdout).map_err(|_| String::from_utf8_lossy(&output.stderr).trim().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /** The daemon settings, read only: one file for every game, shared by Quack and Quack Dev */
 #[tauri::command]
 fn read_daemon_config() -> Value {
@@ -1291,6 +1315,7 @@ fn main() {
             install_update,
             read_daemon_config,
             ai_clients,
+            ai_rule,
             open_path,
             show_main,
             tray_fit,

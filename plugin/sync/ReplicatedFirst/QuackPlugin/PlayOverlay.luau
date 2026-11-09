@@ -54,6 +54,7 @@ export type Result = {
 	applied: number?,
 	failed: { string }?,
 	stalls: { string }?,
+	closedTabs: { string }?,
 }
 
 --[=[
@@ -75,6 +76,27 @@ function PlayOverlay.run(message: any, guidMap: { [string]: Instance }): Result
 		local before = instance:GetAttribute(MARK)
 		instance:SetAttribute(MARK, tostring(checkIndex))
 		table.insert(restore, function() instance:SetAttribute(MARK, before) end)
+	end
+
+	-- A tab open in this Studio on a script the play swaps, once anything was typed in it (by hand,
+	-- or by the sync writing to the open tab), gives the play its own text instead of the branch's
+	-- (measured 25/10/26, "has the place's text": 31 plays in 18 sessions of a month). No API says
+	-- whether a tab was ever edited, so every open tab of a swapped script is closed first; a tab's
+	-- text is the script's own, so closing loses nothing
+	local closedTabs: { string } = {}
+	if message.keepTabs ~= true then
+		local okService, editor = pcall(function() return game:GetService("ScriptEditorService") end)
+		if okService then
+			for _, patch in message.patches or {} do
+				local instance = guidMap[patch.guid]
+				if instance and instance:IsA("LuaSourceContainer") then
+					local okDoc, doc = pcall(function() return (editor :: any):FindScriptDocument(instance) end)
+					if okDoc and doc and not doc:IsCommandBar() then
+						if pcall(function() doc:CloseAsync() end) then table.insert(closedTabs, instance:GetFullName()) end
+					end
+				end
+			end
+		end
 	end
 
 	for _, patch in message.patches or {} do
@@ -150,7 +172,7 @@ function PlayOverlay.run(message: any, guidMap: { [string]: Instance }): Result
 	-- A play with half a branch would test something that exists nowhere
 	if #failed > 0 then
 		undo()
-		return { ok = false, error = "the branch could not be swapped in", failed = failed, applied = applied }
+		return { ok = false, error = "the branch could not be swapped in", failed = failed, applied = applied, closedTabs = closedTabs }
 	end
 
 	local startedAt = os.clock()
@@ -190,7 +212,7 @@ function PlayOverlay.run(message: any, guidMap: { [string]: Instance }): Result
 	if not copied and not StudioTestService.EditModeActive then
 		-- The play started and no stall reached the threshold (a copy too quick to stall the
 		-- edit DataModel): after MAX_HOLD_SECONDS the copy is long done. The play's check decides
-		return { ok = true, windowMs = windowMs, applied = applied, stalls = stalls }
+		return { ok = true, windowMs = windowMs, applied = applied, stalls = stalls, closedTabs = closedTabs }
 	end
 	if not copied then
 		return {
@@ -200,7 +222,7 @@ function PlayOverlay.run(message: any, guidMap: { [string]: Instance }): Result
 			applied = applied,
 		}
 	end
-	return { ok = true, windowMs = windowMs, applied = applied, stalls = stalls }
+	return { ok = true, windowMs = windowMs, applied = applied, stalls = stalls, closedTabs = closedTabs }
 end
 
 --- Every instance at this path: same-named siblings are all candidates

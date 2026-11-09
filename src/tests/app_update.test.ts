@@ -43,3 +43,25 @@ test("Dev updates build without LTO, Official keeps the release profile", () => 
   assert.match(release, /^lto = true$/m, "Official still builds with LTO");
   assert.match(release, /^codegen-units = 1$/m);
 });
+
+// 09/11/26: the rule an AI keeps in its instructions file, copied from the app and pasted to the AI,
+// which puts it in place or swaps an older copy. The app runs the shipped `rule --prompt`.
+test("Settings copies the rule for AI from the shipped command", () => {
+  const main = read("src-tauri/src/main.rs");
+  assert.match(main, /#\[tauri::command\]\r?\nasync fn ai_rule\(/);
+  assert.match(main, /"rule", "--prompt", "--json"/);
+  const handlers = main.slice(main.indexOf("generate_handler!["), main.indexOf("])", main.indexOf("generate_handler![")));
+  assert.match(handlers, /\bai_rule,/, "ai_rule is registered as a command");
+
+  const ui = read("ui/main.js");
+  const card = ui.slice(ui.indexOf("function mcpCard("), ui.indexOf("async function renderSettings("));
+  assert.match(card, /ruleButton\(\)/);
+  assert.match(card, /invoke\("ai_rule"\)/);
+  assert.match(card, /navigator\.clipboard\.writeText/);
+
+  const i18n = read("ui/i18n.js");
+  for (const key of ["ruleNote", "ruleCopy", "ruleCopied"]) {
+    assert.equal([...i18n.matchAll(new RegExp(`\\n\\s+${key}: "`, "g"))].length, 2, key);
+  }
+  assert.equal([...i18n.matchAll(/ruleCopied: "[^"]*\{version\}/g)].length, 2, "ruleCopied names the version");
+});

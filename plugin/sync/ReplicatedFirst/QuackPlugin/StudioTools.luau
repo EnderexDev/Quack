@@ -4,9 +4,11 @@
 	answers the ones that run there:
 	  edit    exec, playStart (solo, Run mode, or a multiplayer test with players), playState,
 	          capture, captureRead, captureBurst, key, device, gui, sourceCheck, logpoint,
-	          exportRbxm, importRbxm
-	  server  eval, stop, perf
-	  client  eval, captureBegin, captureBurst, key, click, gui, mouse, perf
+	          exportRbxm, importRbxm, inspect, setProps, simulate, tabs, assetPreview, assetInsert,
+	          memory, scene
+	  server  eval, stop, perf, inspect, setProps, memory, profiler, scene
+	  client  eval, captureBegin, captureBurst, key, click, gui, mouse, perf, inspect, setProps,
+	          simulate, memory, profiler, scene
 
 	Evals run in the game VM with the game's require cache: a bridge Script (server) or
 	LocalScript (client) made at runtime in the play DataModel holds a BindableFunction that
@@ -1368,6 +1370,406 @@ local function importRbxm(args: { [string]: any }): { [string]: any }
 end
 
 --------------------------------------------------------------------------------------------
+-- One instance read whole, and its properties and attributes changed with the right types.
+-- Sessions read three or more properties of one thing in 231 execute_luau of a month and every
+-- attribute in 296 evals; the official server's inspect_instance had 7 calls. The property names
+-- come from the vendored rbx-dom database, the defaults from a fresh instance of the class.
+
+local rbxDatabase = require("./Vendor/rbx_dom_lua/database")
+
+local function short(n: number): string
+	if n ~= n then return "nan" end
+	if n == 0 then return "0" end
+	if math.abs(n) >= 1e15 or (n ~= 0 and math.abs(n) < 1e-4) then return string.format("%.4g", n) end
+	local text = string.format("%.4f", n)
+	text = string.gsub(text, "0+$", "")
+	return (string.gsub(text, "%.$", ""))
+end
+
+--- A value as a person reads it: 1, 2.5, 3 for a Vector3, #ff8800 for a Color3, an enum's name...
+local function describe(value: any): string
+	local kind = typeof(value)
+	if kind == "number" then return short(value) end
+	if kind == "string" then
+		local text = if #value > 200 then string.sub(value, 1, 197) .. "..." else value
+		return string.format("%q", text)
+	end
+	if kind == "Vector3" then return `{short(value.X)}, {short(value.Y)}, {short(value.Z)}` end
+	if kind == "Vector2" then return `{short(value.X)}, {short(value.Y)}` end
+	if kind == "Color3" then return "#" .. value:ToHex() end
+	if kind == "UDim2" then
+		return "{" .. short(value.X.Scale) .. ", " .. short(value.X.Offset) .. "}, {" .. short(value.Y.Scale) .. ", " .. short(value.Y.Offset) .. "}"
+	end
+	if kind == "UDim" then return `{short(value.Scale)}, {short(value.Offset)}` end
+	if kind == "CFrame" then
+		local rx, ry, rz = value:ToOrientation()
+		return `at {short(value.X)}, {short(value.Y)}, {short(value.Z)}, turned {short(math.deg(rx))}, {short(math.deg(ry))}, {short(math.deg(rz))}`
+	end
+	if kind == "EnumItem" then return value.Name end
+	if kind == "BrickColor" then return value.Name end
+	if kind == "Instance" then return value:GetFullName() end
+	if kind == "NumberRange" then return `{short(value.Min)} to {short(value.Max)}` end
+	if kind == "NumberSequence" or kind == "ColorSequence" then
+		local points = {}
+		for _, point in value.Keypoints do
+			table.insert(points, short(point.Time) .. "=" .. (if kind == "NumberSequence" then short(point.Value) else "#" .. point.Value:ToHex()))
+		end
+		return table.concat(points, " ")
+	end
+	if kind == "Content" then
+		local ok, uri = pcall(function() return (value :: any).Uri end)
+		return if ok and uri then tostring(uri) else tostring(value)
+	end
+	if kind == "Font" then return `{value.Family} {value.Weight.Name} {value.Style.Name}` end
+	return tostring(value)
+end
+
+--- Readable property names of a class (and its ancestors), minus deprecated and hidden ones unless asked
+local function propertyNames(className: string, includeHidden: boolean): { string }
+	local names, seen = {}, {}
+	local current: string? = className
+	while current do
+		local info = rbxDatabase.Classes[current]
+		if not info then break end
+		for name, data in info.Properties do
+			if seen[name] then continue end
+			seen[name] = true
+			-- Read-only ones are derived (AssemblyMass, ExtentsSize...): only with hidden
+			if data.Scriptability ~= "ReadWrite" and not (includeHidden and data.Scriptability == "Read") then continue end
+			if not data.Kind or not data.Kind.Canonical then continue end
+			local tags = data.Tags or {}
+			if not includeHidden and (table.find(tags, "Deprecated") or table.find(tags, "Hidden") or table.find(tags, "NotBrowsable")) then
+				continue
+			end
+			if name == "Source" or name == "Parent" then continue end
+			table.insert(names, name)
+		end
+		current = info.Superclass
+	end
+	table.sort(names)
+	return names
+end
+
+local function sameValue(a: any, b: any): boolean
+	if typeof(a) ~= typeof(b) then return false end
+	if typeof(a) == "number" then return a == b or (a ~= a and b ~= b) end
+	local ok, equal = pcall(function() return a == b end)
+	return ok and equal
+end
+
+local function inspectInstance(args: { [string]: any }): { [string]: any }
+	if type(args.path) ~= "string" or args.path == "" then error("path is required", 0) end
+	local target = resolvePath(args.path)
+	local all = args.all == true
+	local fresh: Instance? = nil
+	if not all then
+		local ok, made = pcall(Instance.new, target.ClassName)
+		if ok then fresh = made end
+	end
+	local properties = {}
+	local unread = 0
+	for _, name in propertyNames(target.ClassName, args.hidden == true) do
+		local ok, value = pcall(function() return (target :: any)[name] end)
+		if not ok then
+			unread += 1
+			continue
+		end
+		if fresh and name ~= "Name" then
+			local okDefault, default = pcall(function() return (fresh :: any)[name] end)
+			if okDefault and sameValue(value, default) then continue end
+		end
+		table.insert(properties, { name = name, value = describe(value), type = typeof(value) })
+	end
+	if fresh then fresh:Destroy() end
+	local attributes = {}
+	for name, value in target:GetAttributes() do
+		table.insert(attributes, { name = name, value = describe(value), type = typeof(value) })
+	end
+	table.sort(attributes, function(a, b) return a.name < b.name end)
+	local tags = game:GetService("CollectionService"):GetTags(target)
+	table.sort(tags)
+	local children = {}
+	local kids = target:GetChildren()
+	for i, child in kids do
+		if i > 40 then break end
+		table.insert(children, `{child.Name} [{child.ClassName}]`)
+	end
+	local result: { [string]: any } = {
+		path = target:GetFullName(),
+		className = target.ClassName,
+		properties = properties,
+		attributes = attributes,
+		tags = tags,
+		children = children,
+		childCount = #kids,
+		defaultsLeftOut = fresh ~= nil,
+		unread = unread,
+	}
+	if target:IsA("PVInstance") then
+		local ok, pivot = pcall(function() return (target :: any):GetPivot() end)
+		if ok then result.pivot = describe(pivot) end
+	end
+	if target:IsA("Model") then
+		local ok, cf, size = pcall(function() return (target :: any):GetBoundingBox() end)
+		if ok then result.boundingBox = `{describe(size)} around {describe(cf.Position)}` end
+	end
+	return result
+end
+
+--[=[
+	A value from JSON for a property or attribute: { Vector3 = {1, 2, 3} }, { Color3 = "#ff8800" },
+	{ UDim2 = {0, 10, 0.5, 0} }, { CFrame = {x, y, z} or {x, y, z, rx, ry, rz} }, { Enum = "Name" },
+	{ Instance = "Workspace.Part" }..., or a plain number, string, boolean or nil, which takes the
+	type of what is there now (a string on an enum property is that enum's item).
+]=]
+local function enumByName(enum: Enum, raw: string, label: string): EnumItem
+	local name = string.match(raw, "([^%.]+)$") or raw
+	local names = {}
+	for _, item in enum:GetEnumItems() do
+		if item.Name == name then return item end
+		table.insert(names, item.Name)
+	end
+	error(`{label} "{raw}" is not one of: {table.concat(names, ", ")}`, 0)
+end
+
+local function parseValue(raw: any, current: any, label: string): any
+	local function numbers(list: any, count: number, kind: string): { number }
+		if type(list) == "string" then
+			local parsed = {}
+			for piece in string.gmatch(list, "[^,%s]+") do
+				table.insert(parsed, tonumber(piece))
+			end
+			list = parsed
+		end
+		if type(list) ~= "table" or #list < count then error(`{label}: a {kind} takes {count} numbers`, 0) end
+		for i = 1, count do
+			if type(list[i]) ~= "number" then error(`{label}: a {kind} takes {count} numbers`, 0) end
+		end
+		return list
+	end
+	local function color(value: any): Color3
+		if type(value) == "string" then
+			local ok, made = pcall(Color3.fromHex, value)
+			if ok then return made end
+			local okBrick, brick = pcall(function() return BrickColor.new(value :: any).Color end)
+			if okBrick then return brick end
+		end
+		local n = numbers(value, 3, "Color3")
+		if n[1] > 1 or n[2] > 1 or n[3] > 1 then return Color3.fromRGB(n[1], n[2], n[3]) end
+		return Color3.new(n[1], n[2], n[3])
+	end
+	if type(raw) == "table" and next(raw) ~= nil and #raw == 0 then
+		local kind, value = next(raw)
+		-- JSON null does not survive JSONDecode: the daemon sends { Remove = true } for it
+		if kind == "Remove" then return nil end
+		if kind == "Vector3" then
+			local n = numbers(value, 3, kind)
+			return Vector3.new(n[1], n[2], n[3])
+		elseif kind == "Vector2" then
+			local n = numbers(value, 2, kind)
+			return Vector2.new(n[1], n[2])
+		elseif kind == "Color3" then
+			return color(value)
+		elseif kind == "UDim2" then
+			local n = numbers(value, 4, kind)
+			return UDim2.new(n[1], n[2], n[3], n[4])
+		elseif kind == "UDim" then
+			local n = numbers(value, 2, kind)
+			return UDim.new(n[1], n[2])
+		elseif kind == "NumberRange" then
+			local n = numbers(value, 2, kind)
+			return NumberRange.new(n[1], n[2])
+		elseif kind == "CFrame" then
+			local n = numbers(value, 3, kind)
+			local at = CFrame.new(n[1], n[2], n[3])
+			if type(n[6]) == "number" then return at * CFrame.fromOrientation(math.rad(n[4]), math.rad(n[5]), math.rad(n[6])) end
+			if typeof(current) == "CFrame" then return at * current.Rotation end
+			return at
+		elseif kind == "BrickColor" then
+			return BrickColor.new(value :: any)
+		elseif kind == "Instance" then
+			return if value == nil or value == "" then nil else resolvePath(tostring(value))
+		elseif kind == "Enum" then
+			if typeof(current) ~= "EnumItem" then error(`{label} is not an enum property`, 0) end
+			return enumByName(current.EnumType, tostring(value), label)
+		end
+		error(`{label}: unknown type {kind} (Vector3, Vector2, Color3, UDim2, UDim, CFrame, NumberRange, BrickColor, Enum, Instance)`, 0)
+	end
+	-- A plain value takes the type of what is there now
+	local kind = typeof(current)
+	if raw == nil then return nil end
+	if kind == "EnumItem" and type(raw) == "string" then return enumByName(current.EnumType, raw, label) end
+	if kind == "EnumItem" and type(raw) == "number" then
+		for _, item in current.EnumType:GetEnumItems() do
+			if item.Value == raw then return item end
+		end
+		error(`{label}: {raw} is not a value of {tostring(current.EnumType)}`, 0)
+	end
+	if kind == "Color3" then return color(raw) end
+	if kind == "BrickColor" and type(raw) == "string" then return BrickColor.new(raw :: any) end
+	if kind == "Vector3" then
+		local n = numbers(raw, 3, kind)
+		return Vector3.new(n[1], n[2], n[3])
+	end
+	if kind == "Vector2" then
+		local n = numbers(raw, 2, kind)
+		return Vector2.new(n[1], n[2])
+	end
+	if kind == "UDim2" then
+		local n = numbers(raw, 4, kind)
+		return UDim2.new(n[1], n[2], n[3], n[4])
+	end
+	if kind == "CFrame" then return parseValue({ CFrame = raw }, current, label) end
+	if kind == "Instance" or (current == nil and type(raw) == "string" and string.find(raw, ".", 1, true)) then
+		if kind == "Instance" then return resolvePath(tostring(raw)) end
+	end
+	return raw
+end
+
+local function setProperties(args: { [string]: any }): { [string]: any }
+	if type(args.path) ~= "string" or args.path == "" then error("path is required", 0) end
+	local target = resolvePath(args.path)
+	local props = if type(args.properties) == "table" then args.properties else {}
+	local attributes = if type(args.attributes) == "table" then args.attributes else {}
+	if next(props) == nil and next(attributes) == nil then error("give properties or attributes to set", 0) end
+	-- Every value parsed first: one bad value changes nothing
+	local planned = {}
+	for name, raw in props do
+		local ok, current = pcall(function() return (target :: any)[name] end)
+		if not ok then error(`{target:GetFullName()} has no property {name} that a plugin can read: {current}`, 0) end
+		table.insert(planned, { kind = "property", name = name, value = parseValue(raw, current, name), before = current })
+	end
+	for name, raw in attributes do
+		local current = target:GetAttribute(name)
+		local value = parseValue(raw, current, name)
+		table.insert(planned, { kind = "attribute", name = name, value = value, before = current })
+	end
+	local ChangeHistoryService = game:GetService("ChangeHistoryService")
+	local recording = if RunService:IsEdit() then ChangeHistoryService:TryBeginRecording("Quack: set properties") else nil
+	local done = {}
+	for _, change in planned do
+		local ok, err = pcall(function()
+			if change.kind == "property" then
+				(target :: any)[change.name] = change.value
+			else
+				target:SetAttribute(change.name, change.value)
+			end
+		end)
+		if not ok then
+			-- Put back what was changed before the failure
+			for i = #done, 1, -1 do
+				local undo = done[i]
+				pcall(function()
+					if undo.kind == "property" then
+						(target :: any)[undo.name] = undo.before
+					else
+						target:SetAttribute(undo.name, undo.before)
+					end
+				end)
+			end
+			if recording then ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Cancel) end
+			error(`{change.name}: {err} (nothing was changed)`, 0)
+		end
+		table.insert(done, change)
+	end
+	if recording then ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit) end
+	local changed = {}
+	for _, change in done do
+		local now = if change.kind == "property" then (target :: any)[change.name] else target:GetAttribute(change.name)
+		table.insert(changed, { kind = change.kind, name = change.name, before = describe(change.before), after = describe(now) })
+	end
+	return { path = target:GetFullName(), changed = changed }
+end
+
+--------------------------------------------------------------------------------------------
+-- Studio's network and performance simulation (the toolbar's Network simulation and
+-- Performance simulation panels): NetworkSettings' six delay, jitter and loss values,
+-- RenderSettings.QualityLevel and NetworkSettings.EmulatedTotalMemoryInMB, all plugin-writable.
+-- The engine caps simulated packet loss at 0.5%. A solo play shares the edit Studio's settings;
+-- a multiplayer client keeps its own after it starts (chrrxs's notes, 3.1.5).
+
+local NETWORK_KEYS = {
+	"InboundNetworkMinDelayMs", "InboundNetworkJitterMs", "InboundNetworkLossPercent",
+	"OutboundNetworkMinDelayMs", "OutboundNetworkJitterMs", "OutboundNetworkLossPercent",
+}
+
+local function simulationState(): { [string]: any }
+	local network = settings().Network
+	local out: { [string]: any } = {}
+	for _, key in NETWORK_KEYS do
+		local ok, value = pcall(function() return (network :: any)[key] end)
+		if ok then out[key] = value end
+	end
+	local okQuality, quality = pcall(function() return settings().Rendering.QualityLevel end)
+	if okQuality then out.QualityLevel = quality.Name end
+	local okMemory, memory = pcall(function() return (network :: any).EmulatedTotalMemoryInMB end)
+	if okMemory then out.EmulatedTotalMemoryInMB = memory end
+	return out
+end
+
+local function simulate(args: { [string]: any }): { [string]: any }
+	local network = settings().Network
+	local before = simulationState()
+	local values = if type(args.network) == "table" then args.network else {}
+	for key, value in values do
+		if not table.find(NETWORK_KEYS, key) then error(`{key} is not one of {table.concat(NETWORK_KEYS, ", ")}`, 0) end
+		if type(value) ~= "number" or value < 0 or value ~= value then error(`{key} must be a number, 0 or more`, 0) end
+		if string.find(key, "LossPercent") and value > 0.5 then error(`{key}: the engine simulates at most 0.5% packet loss`, 0) end
+	end
+	for key, value in values do
+		(network :: any)[key] = value
+	end
+	if args.quality ~= nil then
+		local level = if args.quality == "auto" or args.quality == 0 then Enum.QualityLevel.Automatic else nil
+		if not level then
+			local n = tonumber(args.quality)
+			if not n or n < 1 or n > 21 or n % 1 ~= 0 then error("quality must be auto or a level from 1 to 21", 0) end
+			level = (Enum.QualityLevel :: any)[string.format("Level%02d", n)]
+		end
+		(settings().Rendering :: any).QualityLevel = level
+	end
+	if args.memoryMb ~= nil then
+		local mb = tonumber(args.memoryMb)
+		if not mb or mb < 256 then error("memoryMb must be a number of megabytes, 256 or more", 0) end
+		(network :: any).EmulatedTotalMemoryInMB = mb
+	end
+	return { before = before, after = simulationState() }
+end
+
+--------------------------------------------------------------------------------------------
+-- Script tabs open in this Studio. A tab edited in the Studio that starts a play gives the play
+-- its own text instead of the swapped script's (Memória, 25/10/26: "has the place's text", 31
+-- plays in 18 sessions of a month); a collaborator's tab in Team Create does not, and a plugin
+-- sees only this Studio's tabs anyway.
+
+local function scriptTabs(args: { [string]: any }): { [string]: any }
+	local ScriptEditorService = game:GetService("ScriptEditorService")
+	local close = if type(args.close) == "table" then args.close else nil
+	local closeAll = args.closeEdited == true
+	local tabs = {}
+	local closed = {}
+	for _, doc in ScriptEditorService:GetScriptDocuments() do
+		local document = doc :: any
+		if document:IsCommandBar() then continue end
+		local script = document:GetScript()
+		if not script then continue end
+		local path = script:GetFullName()
+		local okText, text = pcall(function() return document:GetText() end)
+		local okSource, source = pcall(function() return (script :: any).Source end)
+		local edited = okText and okSource and text ~= source
+		local wanted = (close ~= nil and table.find(close, path) ~= nil) or (closeAll and edited)
+		if wanted then
+			local ok, err = pcall(function() return document:CloseAsync() end)
+			table.insert(closed, { path = path, edited = edited, ok = ok, error = if ok then nil else tostring(err) })
+		else
+			table.insert(tabs, { path = path, edited = edited, lines = if okText then select(2, string.gsub(text, "\n", "")) + 1 else nil })
+		end
+	end
+	table.sort(tabs, function(a, b) return a.path < b.path end)
+	return { tabs = tabs, closed = closed }
+end
+
+--------------------------------------------------------------------------------------------
 -- Keys (virtualInput is declared with the clicks)
 
 local function key(args: { [string]: any }): { [string]: any }
@@ -1498,6 +1900,451 @@ local function device(args: { [string]: any }): { [string]: any }
 end
 
 --------------------------------------------------------------------------------------------
+-- Creator Store assets, previewed and inserted in edit mode (AssetService:LoadAssetAsync). The
+-- loaded asset is a Model outside the DataModel until something is parented. Preview lists
+-- every LuaSourceContainer and PackageLink in it; insert destroys them all, scans again and
+-- refuses when any is left, before anything reaches the place: a free model's script is how a
+-- backdoor gets into a game, and here it would also sync to disk. chrrxs sanitizes the same way.
+
+local THIRD_PARTY_HINT =
+	' To load a public Creator Store asset you do not own, turn on "Allow Loading Third Party Assets" in Game Settings > Security.'
+
+local function loadAsset(assetId: number): Instance
+	local ok, loaded = pcall(function() return AssetService:LoadAssetAsync(assetId) end)
+	if ok and loaded then return loaded :: Instance end
+	-- LoadAssetAsync (and InsertService:LoadAsset) refuse a free model the user does not own
+	-- unless the game allows third-party assets ("User is not authorized to access Asset", the
+	-- Astral copy, 09/11/26). game:GetObjects, what the Toolbox uses, loads it from a plugin:
+	-- its roots go in a wrapper Model shaped like LoadAssetAsync's, outside the DataModel.
+	local okObjects, objects = pcall(function() return (game :: any):GetObjects(`rbxassetid://{assetId}`) end)
+	if okObjects and type(objects) == "table" and #objects > 0 then
+		local wrapper = Instance.new("Model")
+		wrapper.Name = `Asset{assetId}`
+		for _, object in objects do
+			(object :: Instance).Parent = wrapper
+		end
+		return wrapper
+	end
+	local readable, allowed = pcall(function() return (AssetService :: any).AllowInsertFreeAssets end)
+	local hint = if readable and allowed == true then "" else THIRD_PARTY_HINT
+	error(`AssetService:LoadAssetAsync({assetId}) failed: {loaded} (game:GetObjects too: {if okObjects then "no instances" else tostring(objects)}).{hint}`, 0)
+end
+
+local function isForbidden(instance: Instance): boolean
+	return instance:IsA("LuaSourceContainer") or instance:IsA("PackageLink")
+end
+
+--- A path inside the loaded asset, from below its wrapper
+local function insidePath(instance: Instance, root: Instance): string
+	local parts = {}
+	local node: Instance? = instance
+	while node and node ~= root do
+		table.insert(parts, 1, (node :: Instance).Name)
+		node = (node :: Instance).Parent
+	end
+	return table.concat(parts, ".")
+end
+
+-- What in a script's text a backdoor uses: a module required by id, code built at runtime
+local SUSPICIOUS = {
+	{ pattern = "require%s*%(%s*%d", label = "require(<asset id>)" },
+	{ pattern = "loadstring", label = "loadstring" },
+	{ pattern = "getfenv", label = "getfenv" },
+	{ pattern = "setfenv", label = "setfenv" },
+	{ pattern = "HttpService", label = "HttpService" },
+	{ pattern = "MarketplaceService", label = "MarketplaceService" },
+	{ pattern = "TeleportService", label = "TeleportService" },
+}
+
+local PREVIEW_NODES = 100
+
+local function assetIdOf(args: { [string]: any }): number
+	local id = tonumber(args.assetId)
+	if not id or id <= 0 or id ~= math.floor(id) then error("assetId must be a whole number above 0", 0) end
+	return id :: number
+end
+
+local function previewAsset(args: { [string]: any }): { [string]: any }
+	local assetId = assetIdOf(args)
+	local maxDepth = math.clamp(math.floor(tonumber(args.depth) or 4), 0, 20)
+	local root = loadAsset(assetId)
+	local ok, result = pcall(function()
+		pcall(function() root.Parent = nil end)
+		local classes: { [string]: number } = {}
+		local total = 0
+		local scripts, packageLinks, sounds = {}, {}, {}
+		for _, d in root:GetDescendants() do
+			total += 1
+			classes[d.ClassName] = (classes[d.ClassName] or 0) + 1
+			if d:IsA("LuaSourceContainer") then
+				local entry: { [string]: any } = { path = insidePath(d, root), className = d.ClassName }
+				local readable, source = pcall(function() return (d :: any).Source end)
+				if readable and type(source) == "string" then
+					entry.lines = countLines(source)
+					local found = {}
+					for _, s in SUSPICIOUS do
+						if string.find(source, s.pattern) then table.insert(found, s.label) end
+					end
+					if #found > 0 then entry.uses = found end
+				end
+				if d:IsA("BaseScript") then entry.enabled = (d :: BaseScript).Enabled end
+				table.insert(scripts, entry)
+			elseif d:IsA("PackageLink") then
+				table.insert(packageLinks, insidePath(d, root))
+			elseif d:IsA("Sound") then
+				table.insert(sounds, { path = insidePath(d, root), soundId = (d :: Sound).SoundId })
+			end
+		end
+		local nodes = {}
+		local truncated = false
+		local function walk(instance: Instance, depth: number)
+			for _, child in instance:GetChildren() do
+				if #nodes >= PREVIEW_NODES then
+					truncated = true
+					return
+				end
+				local node: { [string]: any } = { d = depth, n = child.Name, c = child.ClassName }
+				table.insert(nodes, node)
+				if depth >= maxDepth then
+					local below = #child:GetDescendants()
+					if below > 0 then node.more = below end
+				else
+					walk(child, depth + 1)
+				end
+			end
+		end
+		walk(root, 0)
+		local classList = {}
+		for name, count in classes do
+			table.insert(classList, { class = name, count = count })
+		end
+		table.sort(classList, function(a, b) return if a.count == b.count then a.class < b.class else a.count > b.count end)
+		return {
+			assetId = assetId,
+			total = total,
+			classes = classList,
+			nodes = nodes,
+			truncated = truncated,
+			scripts = scripts,
+			packageLinks = packageLinks,
+			sounds = sounds,
+		}
+	end)
+	pcall(function() root:Destroy() end)
+	if not ok then error(`could not read asset {assetId}: {result}`, 0) end
+	return result
+end
+
+local function insertAsset(args: { [string]: any }): { [string]: any }
+	if not RunService:IsEdit() then error("an asset is inserted in edit mode, not in a play", 0) end
+	local assetId = assetIdOf(args)
+	local parent = resolvePath(if type(args.parent) == "string" and args.parent ~= "" then args.parent else "Workspace")
+	local position: Vector3? = nil
+	if type(args.position) == "table" then
+		local p = args.position
+		position = Vector3.new(tonumber(p[1]) or 0, tonumber(p[2]) or 0, tonumber(p[3]) or 0)
+	end
+	local root = loadAsset(assetId)
+	pcall(function() root.Parent = nil end)
+	local removedScripts, removedLinks = {}, {}
+	-- Every one first, then each destroyed: destroying one also takes what it holds
+	local forbidden = {}
+	for _, d in root:GetDescendants() do
+		if isForbidden(d) then table.insert(forbidden, d) end
+	end
+	for _, d in forbidden do
+		local label = insidePath(d, root)
+		if d:IsA("LuaSourceContainer") then
+			table.insert(removedScripts, `{label} ({d.ClassName})`)
+		else
+			table.insert(removedLinks, label)
+		end
+		pcall(function() d:Destroy() end)
+	end
+	local left = {}
+	for _, d in root:GetDescendants() do
+		if isForbidden(d) then table.insert(left, insidePath(d, root)) end
+	end
+	local children = root:GetChildren()
+	if #left > 0 then
+		pcall(function() root:Destroy() end)
+		error(`asset {assetId} still holds {#left} script(s) or PackageLink(s) after they were removed ({table.concat(left, ", ")}): nothing was inserted`, 0)
+	end
+	if #children == 0 then
+		pcall(function() root:Destroy() end)
+		error(`nothing is left of asset {assetId} once its scripts are removed: nothing was inserted`, 0)
+	end
+	-- Moved together: the first model's or part's pivot goes to the position, the rest keep their offsets
+	local moved = false
+	if position then
+		for _, child in children do
+			if child:IsA("PVInstance") then
+				local delta = (position :: Vector3) - (child :: PVInstance):GetPivot().Position
+				for _, other in children do
+					if other:IsA("PVInstance") then
+						local pv = other :: PVInstance
+						pv:PivotTo(pv:GetPivot() + delta)
+					end
+				end
+				moved = true
+				break
+			end
+		end
+	end
+	local ChangeHistoryService = game:GetService("ChangeHistoryService")
+	local recording = ChangeHistoryService:TryBeginRecording(`Quack: insert asset {assetId}`)
+	local placed = {}
+	local failure: string? = nil
+	for _, child in children do
+		local parented, err = pcall(function() child.Parent = parent end)
+		if not parented then
+			failure = `could not put {child.Name} ({child.ClassName}) in {parent:GetFullName()}: {err}`
+			break
+		end
+		table.insert(placed, child)
+	end
+	if failure then
+		for _, instance in placed do
+			pcall(function() instance:Destroy() end)
+		end
+		if recording then ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Cancel) end
+		pcall(function() root:Destroy() end)
+		error(failure, 0)
+	end
+	if recording then ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit) end
+	pcall(function() root:Destroy() end)
+	pcall(function() game:GetService("Selection"):Set(placed) end)
+	local inserted = {}
+	for _, instance in placed do
+		table.insert(inserted, { path = instance:GetFullName(), className = instance.ClassName })
+	end
+	return {
+		assetId = assetId,
+		parent = parent:GetFullName(),
+		inserted = inserted,
+		removedScripts = removedScripts,
+		removedPackageLinks = removedLinks,
+		moved = if moved then { (position :: Vector3).X, (position :: Vector3).Y, (position :: Vector3).Z } else nil,
+	}
+end
+
+--------------------------------------------------------------------------------------------
+-- Memory by Enum.DeveloperMemoryTag, in whichever DataModel asks: what the Developer Console's
+-- Memory tab shows, read by Stats.
+
+local function memoryBreakdown(args: { [string]: any }): { [string]: any }
+	local Stats = game:GetService("Stats")
+	local wanted: { [string]: boolean }? = nil
+	if type(args.tags) == "table" and #args.tags > 0 then
+		local set: { [string]: boolean } = {}
+		for _, name in args.tags do
+			set[tostring(name)] = true
+		end
+		wanted = set
+	end
+	local tags = {}
+	local known: { [string]: boolean } = {}
+	for _, tag in Enum.DeveloperMemoryTag:GetEnumItems() do
+		known[tag.Name] = true
+		if wanted and not wanted[tag.Name] then continue end
+		local ok, mb = pcall(function() return Stats:GetMemoryUsageMbForTag(tag) end)
+		if ok and type(mb) == "number" and (wanted ~= nil or mb > 0) then table.insert(tags, { tag = tag.Name, mb = round(mb, 2) }) end
+	end
+	if wanted then
+		local unknown = {}
+		for name in wanted :: { [string]: boolean } do
+			if not known[name] then table.insert(unknown, name) end
+		end
+		if #unknown > 0 then error(`not an Enum.DeveloperMemoryTag: {table.concat(unknown, ", ")}`, 0) end
+	end
+	table.sort(tags, function(a, b) return a.mb > b.mb end)
+	local tracking, enabled = pcall(function() return Stats.MemoryTrackingEnabled end)
+	return {
+		totalMb = round(Stats:GetTotalMemoryUsageMb(), 1),
+		trackingEnabled = if tracking then enabled else nil,
+		tags = tags,
+	}
+end
+
+--------------------------------------------------------------------------------------------
+-- The script profiler of a play peer (ScriptProfilerService): a capture of durationMs at
+-- `frequency` samples a second, its data asked for and decoded here, the functions that took
+-- the most time kept. Flags bit 1 is a native function, bit 2 a plugin's; Quack's own eval
+-- payload and bridge run in the game VM unflagged, and are left out by their names.
+
+local function scriptProfiler(args: { [string]: any }): { [string]: any }
+	if not RunService:IsRunning() then error("the script profiler runs in a play's server or client", 0) end
+	local service = game:GetService("ScriptProfilerService")
+	local durationMs = math.clamp(math.floor(tonumber(args.durationMs) or 1000), 100, 15000)
+	local frequency = math.clamp(math.floor(tonumber(args.frequency) or 1000), 1, 10000)
+	local maxFunctions = math.clamp(math.floor(tonumber(args.maxFunctions) or 20), 1, 100)
+	local filter = if type(args.filter) == "string" and args.filter ~= "" then string.lower(args.filter) else nil
+	local isServer = RunService:IsServer()
+	local player = if isServer then nil else Players.LocalPlayer
+	if not isServer and not player then error("the play client has no LocalPlayer yet", 0) end
+	local data: string? = nil
+	local connection = service.OnNewData:Connect(function(_, json: string)
+		if data == nil then data = json end
+	end)
+	local started, startError = pcall(function()
+		if isServer then
+			service:ServerStart(frequency)
+		else
+			service:ClientStart(player :: Player, frequency)
+		end
+	end)
+	if not started then
+		connection:Disconnect()
+		error(`ScriptProfilerService could not start: {startError}`, 0)
+	end
+	task.wait(durationMs / 1000)
+	local stopped, stopError = pcall(function()
+		if isServer then
+			service:ServerStop()
+			service:ServerRequestData()
+		else
+			service:ClientStop(player :: Player)
+			service:ClientRequestData(player :: Player)
+		end
+	end)
+	if not stopped then
+		connection:Disconnect()
+		error(`ScriptProfilerService could not stop: {stopError}`, 0)
+	end
+	local deadline = os.clock() + 5
+	while data == nil and os.clock() < deadline do
+		task.wait(0.05)
+	end
+	connection:Disconnect()
+	if data == nil then error("ScriptProfilerService sent no data within 5 s of the request", 0) end
+	local json = data :: string
+	local HttpService = game:GetService("HttpService")
+	local decoded, profile = pcall(function() return HttpService:JSONDecode(json) end)
+	if not decoded or type(profile) ~= "table" then error(`the profiler's data is not JSON ({#json} bytes)`, 0) end
+	local functions = if type(profile.Functions) == "table" then profile.Functions else {}
+	local rows = {}
+	local omitted = { native = 0, plugin = 0, quack = 0, filtered = 0 }
+	for _, f in functions do
+		if type(f) ~= "table" then continue end
+		local flags = tonumber(f.Flags) or 0
+		local source = if type(f.Source) == "string" then f.Source else ""
+		local line = tonumber(f.Line) or 0
+		local name = if type(f.Name) == "string" and f.Name ~= "" then f.Name else "<anonymous>"
+		local isQuack = string.find(source, CHUNK, 1, true) ~= nil or string.find(source, "QuackPlugin", 1, true) ~= nil
+		if bit32.band(flags, 1) ~= 0 and args.includeNative ~= true then
+			omitted.native += 1
+			continue
+		end
+		if (isQuack or bit32.band(flags, 2) ~= 0) and args.includePlugin ~= true then
+			if isQuack then omitted.quack += 1 else omitted.plugin += 1 end
+			continue
+		end
+		if filter and not string.find(string.lower(`{name} {source}`), filter, 1, true) then
+			omitted.filtered += 1
+			continue
+		end
+		table.insert(rows, {
+			name = name,
+			source = if source ~= "" then source else nil,
+			line = if line > 0 then line else nil,
+			totalUs = tonumber(f.TotalDuration) or 0,
+			native = if bit32.band(flags, 1) ~= 0 then true else nil,
+		})
+	end
+	table.sort(rows, function(a, b) return a.totalUs > b.totalUs end)
+	local top = {}
+	for i = 1, math.min(maxFunctions, #rows) do
+		local row = rows[i]
+		row.rank = i
+		row.pct = round(row.totalUs / (durationMs * 1000) * 100, 2)
+		row.totalUs = math.floor(row.totalUs + 0.5)
+		top[i] = row
+	end
+	return {
+		durationMs = durationMs,
+		frequency = frequency,
+		functions = top,
+		counted = #functions,
+		kept = #rows,
+		omitted = omitted,
+		player = if player then player.Name else nil,
+		raw = if args.raw == true then json else nil,
+	}
+end
+
+--------------------------------------------------------------------------------------------
+-- Studio's Scene Analysis (SceneAnalysisService, a beta feature): each breakdown is a tree,
+-- flattened to its leaves and sorted by size (triangles by their count). In mode all every
+-- breakdown answers for itself, its error included.
+
+local SCENE_METHODS: { [string]: string } = {
+	instance_composition = "GetInstanceCompositionAsync",
+	script_memory = "GetScriptMemoryAsync",
+	unparented_instances = "GetUnparentedInstancesAsync",
+	triangle_composition = "GetTriangleCompositionAsync",
+	animation_memory = "GetAnimationMemoryAsync",
+	audio_memory = "GetAudioMemoryAsync",
+}
+local SCENE_ORDER: { string } = { "instance_composition", "script_memory", "unparented_instances", "triangle_composition", "animation_memory", "audio_memory" }
+
+local function sceneLeaves(node: any, out: { any })
+	local children = if type(node) == "table" then node.Children else nil
+	if type(children) == "table" and #children > 0 then
+		for _, child in children do
+			sceneLeaves(child, out)
+		end
+	elseif type(node) == "table" then
+		table.insert(out, node)
+	end
+end
+
+local function sceneSize(node: any, triangles: boolean): number
+	if triangles then return if type(node.Sizes) == "table" then tonumber(node.Sizes.Triangles) or 0 else 0 end
+	return tonumber(node.Size) or 0
+end
+
+local function sceneAnalysis(args: { [string]: any }): { [string]: any }
+	local found, service = pcall(function() return (game :: any):GetService("SceneAnalysisService") end)
+	if not found or not service then
+		error('SceneAnalysisService is not available: turn on the beta feature "Scene Analysis" (File > Beta Features) and restart Studio', 0)
+	end
+	local topN = math.clamp(math.floor(tonumber(args.topN) or 10), 1, 100)
+	local modes: { string } = if args.mode == nil or args.mode == "all" then SCENE_ORDER else { tostring(args.mode) }
+	local out: { [string]: any } = {}
+	for _, mode in modes do
+		local method = SCENE_METHODS[mode]
+		if not method then error(`mode must be all or one of {table.concat(SCENE_ORDER, ", ")}`, 0) end
+		local started = os.clock()
+		local ok, tree = pcall(function() return service[method](service) end)
+		local ms = math.floor((os.clock() - started) * 1000)
+		if not ok then
+			local message = tostring(tree)
+			if string.find(message, "not enabled", 1, true) then
+				message ..= ' (turn on the beta feature "Scene Analysis" in File > Beta Features and restart Studio)'
+			end
+			out[mode] = { method = method, ms = ms, error = message }
+			continue
+		end
+		local leaves = {}
+		sceneLeaves(tree, leaves)
+		local triangles = mode == "triangle_composition"
+		table.sort(leaves, function(a, b) return sceneSize(a, triangles) > sceneSize(b, triangles) end)
+		local top = {}
+		for i = 1, math.min(topN, #leaves) do
+			local leaf = leaves[i]
+			top[i] = { name = leaf.Name, size = leaf.Size, sizes = leaf.Sizes, assetId = leaf.AssetId }
+		end
+		out[mode] = {
+			method = method,
+			ms = ms,
+			root = { name = if type(tree) == "table" then tree.Name else nil, size = if type(tree) == "table" then tree.Size else nil, sizes = if type(tree) == "table" then tree.Sizes else nil, leaves = #leaves },
+			top = top,
+		}
+	end
+	return { modes = out, order = modes }
+end
+
+--------------------------------------------------------------------------------------------
 
 export type Role = "edit" | "server" | "client"
 
@@ -1552,9 +2399,18 @@ local HANDLERS: { [string]: { [Role]: (args: { [string]: any }) -> any } } = {
 	sourceCheck = { edit = sourceCheck },
 	perf = { server = perfSample, client = perfSample },
 	logpoint = { edit = logpoint },
+	inspect = { edit = inspectInstance, server = inspectInstance, client = inspectInstance },
+	setProps = { edit = setProperties, server = setProperties, client = setProperties },
+	simulate = { edit = simulate, client = simulate },
+	tabs = { edit = scriptTabs },
 	exportRbxm = { edit = exportRbxm },
 	importRbxm = { edit = importRbxm },
 	device = { edit = device },
+	assetPreview = { edit = previewAsset },
+	assetInsert = { edit = insertAsset },
+	memory = { edit = memoryBreakdown, server = memoryBreakdown, client = memoryBreakdown },
+	profiler = { server = scriptProfiler, client = scriptProfiler },
+	scene = { edit = sceneAnalysis, server = sceneAnalysis, client = sceneAnalysis },
 }
 
 --[=[

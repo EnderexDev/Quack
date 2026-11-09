@@ -3,14 +3,16 @@ import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 import { BUNDLED_VERSION } from "../bundled.js";
 import { newErrorsText, recordSummary, runControl, type ControlContext } from "./commands.js";
-import type { FlavorInfo } from "./hubClient.js";
+import { instructions } from "./rule.js";
 
 /**
  * `quack mcp` / `quackdev mcp`: the hub for an AI, as an MCP server on stdio (JSON-RPC, one
  * message per line). Each tool runs the terminal command of the same name through runControl,
  * so the terminal and the AI never read the hub two ways. Reading, waiting, play and the Studio
- * tools (evals, execute_luau, playtest, screenshots, keys, the device simulator): a change to the
- * hub (resolve, pause, register...) stays a person's, in the app or the terminal.
+ * tools (evals, execute_luau, playtest, screenshots, keys, the device simulator, Creator Store
+ * assets previewed and inserted, memory, the script profiler, scene analysis), and the Roblox web
+ * tools that need no hub (the engine reference, the Creator Store, an Open Cloud upload): a
+ * change to the hub (resolve, pause, register...) stays a person's, in the app or the terminal.
  */
 
 type Context = Omit<ControlContext, "out" | "err" | "confirm" | "interactive" | "color">;
@@ -479,6 +481,136 @@ export const TOOLS: Tool[] = [
     },
   },
   {
+    name: "inspect_instance",
+    description: "Reads one instance whole instead of an eval that lists properties: the properties that differ from a new instance of its class (all true: every readable one), each with its type, its attributes, tags, children, and a model's pivot and bounding box. During a play it reads the running game (the server, or the client for a PlayerGui path); peer edit reads the place in edit mode.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Workspace.Map.Door, ReplicatedStorage.Config, PlayerGui.Shop..." },
+        peer: { type: "string", enum: ["edit", "server", "client"], description: "Default: the play server (client for PlayerGui) while a play runs, else edit" },
+        all: { type: "boolean", description: "Every readable property, defaults included" },
+        hidden: { type: "boolean", description: "Also deprecated and hidden properties" },
+        ...placeProp,
+      },
+      required: ["path"],
+    },
+    argv: (args) => {
+      if (args.peer !== undefined && !["edit", "server", "client"].includes(String(args.peer))) throw new ToolInputError("peer must be edit, server or client");
+      return ["inspect", ...text(args, "path", true), ...text(args, "place"), ...(args.peer ? [`--peer=${args.peer}`] : []), ...(args.all === true ? ["--all"] : []), ...(args.hidden === true ? ["--hidden"] : [])];
+    },
+  },
+  {
+    name: "set_properties",
+    description: "Changes properties and attributes of one instance together: every value is checked before anything changes, and one undo step in edit mode. A plain value takes the type of what is there now (\"Neon\" for Material, [1, 2, 3] for a Vector3, \"#ff8800\" for a Color3, a path for an Instance property); or name the type: {\"Vector3\": [1, 2, 3]}, {\"UDim2\": [0, 10, 0.5, 0]}, {\"CFrame\": [x, y, z, rx, ry, rz]}, {\"Enum\": \"Name\"}. An attribute set to null is removed. In edit mode the change is the place's (and a script's Source is not a property here: edit its file); during a play, the running game's.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        properties: { type: "object", description: "name: value" },
+        attributes: { type: "object", description: "name: value (null removes it)" },
+        peer: { type: "string", enum: ["edit", "server", "client"], description: "Default as inspect_instance" },
+        ...placeProp,
+      },
+      required: ["path"],
+    },
+    argv: (args) => {
+      const isObject = (v: unknown) => v !== undefined && v !== null && typeof v === "object" && !Array.isArray(v);
+      if (args.properties !== undefined && !isObject(args.properties)) throw new ToolInputError("properties must be an object");
+      if (args.attributes !== undefined && !isObject(args.attributes)) throw new ToolInputError("attributes must be an object");
+      if (args.peer !== undefined && !["edit", "server", "client"].includes(String(args.peer))) throw new ToolInputError("peer must be edit, server or client");
+      return [
+        "set", ...text(args, "path", true), ...text(args, "place"),
+        ...(args.properties ? [`--props=${JSON.stringify(args.properties)}`] : []),
+        ...(args.attributes ? [`--attrs=${JSON.stringify(args.attributes)}`] : []),
+        ...(args.peer ? [`--peer=${args.peer}`] : []),
+      ];
+    },
+  },
+  {
+    name: "simulate_conditions",
+    description: "Studio's network and performance simulation, the toolbar's Network simulation and Performance simulation panels: a network preset (off, great 15 ms, good 50 ms with 10 ms jitter, poor 150 ms with 100 ms jitter and 0.5% loss) or each side's latency, jitter and loss (the engine allows at most 0.5% loss); the graphics quality level (auto or 1 to 21); the device memory in MB. Set in edit mode and in the play client when one runs; a multiplayer client keeps the values it started with. With nothing to set it reports the state. Put it back (network off, quality auto) when done: it is Studio's own setting and stays.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        network: { type: "string", enum: ["off", "great", "good", "poor"] },
+        inbound: { type: "object", properties: { latencyMs: { type: "number" }, jitterMs: { type: "number" }, lossPercent: { type: "number" } } },
+        outbound: { type: "object", properties: { latencyMs: { type: "number" }, jitterMs: { type: "number" }, lossPercent: { type: "number" } } },
+        quality: { description: "\"auto\" or 1 to 21" },
+        memoryMb: { type: "number", description: "The device memory to simulate, in MB" },
+        ...placeProp,
+      },
+    },
+    argv: (args) => {
+      const side = (key: string) => {
+        const v = args[key] as any;
+        if (v === undefined || v === null) return [];
+        if (typeof v !== "object") throw new ToolInputError(`${key} must be { latencyMs, jitterMs, lossPercent }`);
+        const cell = (n: unknown) => (n === undefined ? "" : String(n));
+        return [`--${key}=${cell(v.latencyMs)},${cell(v.jitterMs)},${cell(v.lossPercent)}`];
+      };
+      if (args.network !== undefined && !["off", "great", "good", "poor"].includes(String(args.network))) throw new ToolInputError("network must be off, great, good or poor");
+      if (args.quality !== undefined && args.quality !== "auto" && !(Number.isInteger(args.quality) && (args.quality as number) >= 1 && (args.quality as number) <= 21)) throw new ToolInputError("quality must be auto or 1 to 21");
+      return [
+        "simulate", ...text(args, "place"),
+        ...(args.network ? [`--network=${args.network}`] : []), ...side("inbound"), ...side("outbound"),
+        ...(args.quality !== undefined ? [`--quality=${args.quality}`] : []), ...number(args, "memoryMb", "--memory"),
+      ];
+    },
+  },
+  {
+    name: "script_tabs",
+    description: "The script tabs open in this Studio, and the ones whose text differs from the script's .Source right now. play closes the open tabs of the scripts it swaps by itself: a tab once typed in (by hand, or by the sync writing to it) gives a play its own text, and no API says whether a tab was ever typed in. Use this to list tabs, or to close some (close: script paths; closeEdited: every one with unsaved text). A collaborator's tab in Team Create is not listed and does not interfere.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        close: { type: "array", items: { type: "string" }, description: "Script paths whose tabs to close" },
+        closeEdited: { type: "boolean" },
+        ...placeProp,
+      },
+    },
+    argv: (args) => {
+      const close = args.close;
+      if (close !== undefined && (!Array.isArray(close) || close.some((p) => typeof p !== "string" || !p || p.includes(",")))) throw new ToolInputError("close must be a list of script paths, none with a comma");
+      return ["tabs", ...text(args, "place"), ...(Array.isArray(close) && close.length ? [`--close=${close.join(",")}`] : []), ...(args.closeEdited === true ? ["--close-edited"] : [])];
+    },
+  },
+  {
+    name: "capture_devices",
+    description: "The view on several devices in one call and one picture, side by side at the same height: the device simulator set to each in turn (default a small Android phone, an iPhone 14, an iPad and no simulation), a screenshot of each, the simulator put back as it was. For checking a UI on phones and a tablet without a set_device_simulator and a capture_screenshot per device. Device ids as set_device_simulator lists them; none is no simulation.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        devices: { type: "array", items: { type: "string" }, description: "Up to 8 device ids (none: no simulation)" },
+        orientation: { type: "string", description: "Enum.ScreenOrientation name (default LandscapeLeft)" },
+        width: { type: "number", description: "Each screenshot at most this wide (default 900)" },
+        ...placeProp,
+      },
+    },
+    argv: (args) => {
+      const devices = args.devices;
+      if (devices !== undefined && (!Array.isArray(devices) || !devices.length || devices.some((d) => typeof d !== "string" || !d || d.includes(",")))) throw new ToolInputError("devices must be a list of device ids");
+      return ["devices", ...text(args, "place"), ...(Array.isArray(devices) ? [`--devices=${devices.join(",")}`] : []), ...(typeof args.orientation === "string" && args.orientation ? [`--orientation=${args.orientation}`] : []), ...number(args, "width", "--width"), "--json"];
+    },
+    finish: devicesAnswer,
+  },
+  {
+    name: "test_profile",
+    description: "Keeps the test player's profile and puts it back, through the game's own functions: the place's quack-prelude/server.luau defines __quackSaveProfile(player), returning the profile as a table, and __quackRestoreProfile(player, data). Quack does not know a game's data layer, so without them it says what to add. save before a test that spends or grants, restore after; list shows what is kept (under .quack/profiles).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["save", "restore", "list"] },
+        name: { type: "string", description: "Letters, digits, - or _ (default: default)" },
+        ...placeProp,
+      },
+      required: ["action"],
+    },
+    argv: (args) => {
+      if (!["save", "restore", "list"].includes(String(args.action))) throw new ToolInputError("action must be save, restore or list");
+      return ["profile", String(args.action), ...(args.action !== "list" ? text(args, "name") : []), ...text(args, "place")];
+    },
+  },
+  {
     name: "simulate_mouse_input",
     description: "The play client's mouse: a click (or double, down, up; left, right or middle button) at a point given in the last capture_screenshot's own pixels (Quack scales it to the screen, so display scaling and the device simulator do not shift it), or at the center of a GuiObject or a part by its path (a 3D object: ClickDetectors, the world under the cursor). Answers the screen point, the GUI object under it and the part a ray from the camera hits there. For a GUI button prefer click_gui (it says whether the button fired). Studio's virtual input has no mouse move or wheel: drags and scrolls cannot be sent.",
     inputSchema: {
@@ -510,10 +642,211 @@ export const TOOLS: Tool[] = [
       ];
     },
   },
+  {
+    name: "get_roblox_docs",
+    description: "A page of Roblox's engine reference (create.roblox.com) by name: a class, enum, datatype, library or global (TweenService, Enum.KeyCode, Color3, task). Use it instead of guessing an API. The answer starts with every member whose security is above None (PluginSecurity: plugins and the command bar only; RobloxScriptSecurity: Roblox only), so check a property there before trusting a game script can write it. Long pages stop at 50,000 characters with the list of sections: ask for one section (Properties, Methods, Events...) to read it whole. A name not found answers the 5 nearest. Cached a day on disk; needs internet, not Studio.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "PascalCase, as in the engine: Instance, ProximityPrompt, Enum.KeyCode, CFrame" },
+        type: { type: "string", enum: ["classes", "enums", "datatypes", "libraries", "globals"], description: "Default: found from the reference's index" },
+        section: { type: "string", description: "One ## section, any case: Properties, Methods, Events, Callbacks, Description, Code Samples" },
+      },
+      required: ["name"],
+    },
+    argv: (args) => {
+      if (args.type !== undefined && !["classes", "enums", "datatypes", "libraries", "globals"].includes(String(args.type))) throw new ToolInputError("type must be classes, enums, datatypes, libraries or globals");
+      return ["docs", ...text(args, "name", true), ...(args.type ? [`--type=${args.type}`] : []), ...(typeof args.section === "string" && args.section ? [`--section=${args.section}`] : [])];
+    },
+  },
+  {
+    name: "search_assets",
+    description: "Searches the Creator Store (the Toolbox) with no login: each result's asset id, name, creator (verified or not), price, votes, script count, triangles, an image's id, an audio's length and the start of its description. assetType Image is searched as Decal (its imageId is the texture to use); Particle and VFX as Models with those words added. A free model with scripts can hide a backdoor: preview_asset before insert_asset.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        assetType: { type: "string", enum: ["Model", "Decal", "Image", "Audio", "MeshPart", "Video", "Plugin", "FontFamily", "Particle", "VFX"], description: "Default Model" },
+        maxResults: { type: "number", description: "1 to 100 (default 10)" },
+        sortBy: { type: "string", enum: ["Relevance", "Trending", "Top", "AudioDuration", "CreateTime", "UpdatedTime", "Ratings"] },
+        robloxCreatedOnly: { type: "boolean", description: "Only assets made by Roblox" },
+      },
+    },
+    argv: (args) => {
+      const query = typeof args.query === "string" ? args.query.trim() : "";
+      return [
+        "asset", "search",
+        ...(args.assetType ? [`--type=${args.assetType}`] : []),
+        ...number(args, "maxResults", "--limit"),
+        ...(args.sortBy ? [`--sort=${args.sortBy}`] : []),
+        ...(args.robloxCreatedOnly === true ? ["--roblox"] : []),
+        // After "--" the query is the query even when it starts with "-"
+        ...(query ? ["--", query] : []),
+      ];
+    },
+  },
+  {
+    name: "get_asset_details",
+    description: "One Creator Store asset by id: name, creator, price, votes, type, whether it has scripts and how many, instance counts, mesh triangles, an image's id, dates and description. No login, no Studio.",
+    inputSchema: { type: "object", properties: { assetId: { type: "number" } }, required: ["assetId"] },
+    argv: (args) => ["asset", "details", assetIdArg(args)],
+  },
+  {
+    name: "get_asset_thumbnail",
+    description: "A Creator Store asset's thumbnail as an image (Roblox's thumbnails API, retried while it is still being made). Also saved as a PNG; the answer says where. No login, no Studio.",
+    inputSchema: {
+      type: "object",
+      properties: { assetId: { type: "number" }, size: { type: "string", enum: ["150x150", "420x420", "768x432"], description: "Default 420x420" } },
+      required: ["assetId"],
+    },
+    argv: (args) => {
+      if (args.size !== undefined && !["150x150", "420x420", "768x432"].includes(String(args.size))) throw new ToolInputError("size must be 150x150, 420x420 or 768x432");
+      return ["asset", "thumbnail", assetIdArg(args), ...(args.size ? [`--size=${args.size}`] : []), "--json"];
+    },
+    finish: thumbnailAnswer,
+  },
+  {
+    name: "preview_asset",
+    description: "Loads a Creator Store asset in Studio's edit mode without putting it in the place, reads it and destroys it: instance count by class, a tree of up to 100 objects (maxDepth levels, default 4), every script with its line count and what in it a backdoor uses (require by id, loadstring, getfenv, HttpService...), PackageLinks and sounds. Call it before insert_asset on anything with scripts. An asset the place's owner does not own needs \"Allow Loading Third Party Assets\" (Game Settings > Security); the refusal says so.",
+    inputSchema: {
+      type: "object",
+      properties: { assetId: { type: "number" }, maxDepth: { type: "number", description: "Tree levels (default 4, at most 20)" }, ...placeProp },
+      required: ["assetId"],
+    },
+    argv: (args) => ["asset", "preview", assetIdArg(args), ...text(args, "place"), ...number(args, "maxDepth", "--depth")],
+  },
+  {
+    name: "insert_asset",
+    description: "Puts a Creator Store asset in the place in edit mode, as one undo step, and selects it. Every script and PackageLink in it is destroyed first and the asset checked again: when any is left nothing is inserted. A Store asset's scripts never come in this way (they would sync to disk and run in the game); the answer lists what was removed. position moves it so its first model or part's pivot lands there, the rest keeping their offsets. Not during a play.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        assetId: { type: "number" },
+        parentPath: { type: "string", description: "Where to put it (default Workspace)" },
+        position: { type: "object", properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } }, required: ["x", "y", "z"], description: "In studs" },
+        ...placeProp,
+      },
+      required: ["assetId"],
+    },
+    argv: (args) => {
+      const p = args.position as { x?: unknown; y?: unknown; z?: unknown } | undefined;
+      if (p !== undefined && p !== null && !(typeof p === "object" && [p.x, p.y, p.z].every((n) => typeof n === "number" && Number.isFinite(n)))) throw new ToolInputError("position must be { x, y, z } in studs");
+      return [
+        "asset", "insert", assetIdArg(args), ...text(args, "place"),
+        ...(typeof args.parentPath === "string" && args.parentPath ? [`--parent=${args.parentPath}`] : []),
+        ...(p ? [`--at=${p.x},${p.y},${p.z}`] : []),
+      ];
+    },
+  },
+  {
+    name: "upload_asset",
+    description: "Uploads a file to Roblox through Open Cloud: Decal (png, jpg, bmp, tga), Audio (mp3, ogg, wav, flac), Model (fbx, gltf, glb, rbxm, rbxmx), Animation (rbxm, rbxmx) or Video (mp4, mov). The key and creator come from ROBLOX_OPEN_CLOUD_API_KEY and ROBLOX_CREATOR_USER_ID / ROBLOX_CREATOR_GROUP_ID (the group wins) or open-cloud.env in Quack's folder (%APPDATA%\\quack). Every upload is logged by the file's hash, type, name and creator: the same upload again answers the asset it already made (or keeps waiting for one still processing) instead of making a duplicate, so retrying after a timeout is safe; force posts anyway. A Decal also answers its image id (what an ImageLabel takes), read from the Creator Store or the place's Studio.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        filePath: { type: "string", description: "Absolute path of the file" },
+        assetType: { type: "string", enum: ["Decal", "Audio", "Model", "Animation", "Video"] },
+        displayName: { type: "string", description: "The asset's name on Roblox (at most 50 characters)" },
+        description: { type: "string" },
+        userId: { type: "string", description: "Upload for this user instead of the configured creator" },
+        groupId: { type: "string", description: "Upload for this group instead of the configured creator" },
+        force: { type: "boolean", description: "Post even when the log knows this upload (a new asset)" },
+        ...placeProp,
+      },
+      required: ["filePath", "assetType", "displayName"],
+    },
+    argv: (args) => {
+      if (!["Decal", "Audio", "Model", "Animation", "Video"].includes(String(args.assetType))) throw new ToolInputError("assetType must be Decal, Audio, Model, Animation or Video");
+      if (typeof args.displayName !== "string" || !args.displayName.trim()) throw new ToolInputError("displayName is required");
+      for (const key of ["userId", "groupId"]) if (args[key] !== undefined && !/^\d+$/.test(String(args[key]))) throw new ToolInputError(`${key} must be a number`);
+      return [
+        "asset", "upload", ...text(args, "filePath", true), ...text(args, "place"),
+        `--type=${args.assetType}`, `--name=${args.displayName}`,
+        ...(typeof args.description === "string" && args.description ? [`--description=${args.description}`] : []),
+        ...(args.userId !== undefined ? [`--user=${args.userId}`] : []),
+        ...(args.groupId !== undefined ? [`--group=${args.groupId}`] : []),
+        ...(args.force === true ? ["--force"] : []),
+      ];
+    },
+  },
+  {
+    name: "get_memory_breakdown",
+    description: "Memory by Enum.DeveloperMemoryTag (the Developer Console's Memory tab) and the total, from Studio's edit mode and each play peer at once (or the peer named). In a solo play edit mode, the server and the client are one Studio process: the totals are that process's, the same in each, and only the tags tell them apart. tags keeps only those (Script, Instances, PhysicsCollision, GraphicsTexture...). For frame times use perf_sample.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        peer: { type: "string", enum: ["edit", "server", "client"], description: "Default every one connected" },
+        tags: { type: "array", items: { type: "string" }, description: "Enum.DeveloperMemoryTag names" },
+        ...placeProp,
+      },
+    },
+    argv: (args) => {
+      if (args.peer !== undefined && !["edit", "server", "client"].includes(String(args.peer))) throw new ToolInputError("peer must be edit, server or client");
+      const tags = args.tags;
+      if (tags !== undefined && (!Array.isArray(tags) || tags.some((t) => typeof t !== "string" || !/^\w+$/.test(t)))) throw new ToolInputError("tags must be a list of DeveloperMemoryTag names");
+      return ["memory", ...text(args, "place"), ...(args.peer ? [`--peer=${args.peer}`] : []), ...(Array.isArray(tags) && tags.length ? [`--tags=${tags.join(",")}`] : [])];
+    },
+  },
+  {
+    name: "capture_script_profiler",
+    description: "Runs ScriptProfilerService in the play server (default) or the play client for durationMs (100 to 15000, default 1000) and answers the functions that took the most time: each one's share of the capture, its total time, name, script and line. Quack's own plugin and eval functions are left out (includePlugin keeps them), native ones too (includeNative). filter keeps functions whose name or script contains the text. out saves the raw profile JSON. Needs a play running; to find what eats a frame, after perf_sample says one does.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        peer: { type: "string", enum: ["server", "client"], description: "Default server" },
+        durationMs: { type: "number" },
+        frequency: { type: "number", description: "Samples a second, 1 to 10000 (default 1000)" },
+        maxFunctions: { type: "number", description: "1 to 100 (default 20)" },
+        filter: { type: "string" },
+        includeNative: { type: "boolean" },
+        includePlugin: { type: "boolean" },
+        out: { type: "string", description: "Absolute path of a .json for the raw profile" },
+        ...placeProp,
+      },
+    },
+    argv: (args) => {
+      if (args.peer !== undefined && args.peer !== "server" && args.peer !== "client") throw new ToolInputError("peer must be server or client");
+      if (args.out !== undefined && (typeof args.out !== "string" || !/\.json$/i.test(args.out))) throw new ToolInputError("out must be a .json path");
+      return [
+        "profiler", ...text(args, "place"),
+        ...(args.peer ? [`--peer=${args.peer}`] : []),
+        ...number(args, "durationMs", "--ms"), ...number(args, "frequency", "--frequency"), ...number(args, "maxFunctions", "--limit"),
+        ...(typeof args.filter === "string" && args.filter ? [`--filter=${args.filter}`] : []),
+        ...(args.includeNative === true ? ["--native"] : []),
+        ...(args.includePlugin === true ? ["--plugin"] : []),
+        ...(args.out ? [`--out=${args.out}`] : []),
+      ];
+    },
+  },
+  {
+    name: "get_scene_analysis",
+    description: "Studio's Scene Analysis (SceneAnalysisService): the biggest entries of instance_composition, script_memory, unparented_instances (instances kept alive with no parent: leaks), triangle_composition, animation_memory and audio_memory, or all six (default). Each breakdown is flattened to its leaves and sorted by size (triangles by count); topN per breakdown (default 10). Edit mode with no play, the play server during one, or the peer named. Needs Studio's beta feature Scene Analysis; the refusal says so, and in mode all each breakdown reports its own error.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        mode: { type: "string", enum: ["all", "instance_composition", "script_memory", "unparented_instances", "triangle_composition", "animation_memory", "audio_memory"] },
+        peer: { type: "string", enum: ["edit", "server", "client"] },
+        topN: { type: "number", description: "1 to 100 (default 10)" },
+        ...placeProp,
+      },
+    },
+    argv: (args) => {
+      if (args.mode !== undefined && !["all", "instance_composition", "script_memory", "unparented_instances", "triangle_composition", "animation_memory", "audio_memory"].includes(String(args.mode))) throw new ToolInputError("mode must be all or one of the six breakdowns");
+      if (args.peer !== undefined && !["edit", "server", "client"].includes(String(args.peer))) throw new ToolInputError("peer must be edit, server or client");
+      return ["scene", ...text(args, "place"), ...(args.mode ? [`--mode=${args.mode}`] : []), ...(args.peer ? [`--peer=${args.peer}`] : []), ...number(args, "topN", "--limit")];
+    },
+  },
 ];
 
+/** A Creator Store id from the AI: a whole number, as one argv entry */
+function assetIdArg(args: Record<string, unknown>): string {
+  const id = Number(args.assetId);
+  if (!Number.isSafeInteger(id) || id <= 0) throw new ToolInputError("assetId must be a whole number above 0");
+  return String(id);
+}
+
 /** In a multiplayer test these reach one player's client: they take `player` */
-const PLAYER_TOOLS = new Set(["eval_client_runtime", "simulate_keyboard_input", "click_gui", "wait_for", "inspect_gui", "simulate_mouse_input", "perf_sample"]);
+const PLAYER_TOOLS = new Set(["eval_client_runtime", "inspect_instance", "set_properties", "simulate_conditions", "simulate_keyboard_input", "click_gui", "wait_for", "inspect_gui", "simulate_mouse_input", "perf_sample", "get_memory_breakdown", "capture_script_profiler", "get_scene_analysis"]);
 for (const tool of TOOLS) {
   if (!PLAYER_TOOLS.has(tool.name)) continue;
   const schema = tool.inputSchema as { properties: Record<string, unknown> };
@@ -524,6 +857,24 @@ for (const tool of TOOLS) {
     if (typeof args.player !== "string" || args.player.startsWith("-")) throw new ToolInputError("player must be a player's name");
     return [...argv(args), `--player=${args.player}`];
   };
+}
+
+/** The devices command's --json answer: which device is where, and the picture as an image block */
+function devicesAnswer(body: string, code: number): object[] {
+  let result: any;
+  try {
+    result = JSON.parse(body);
+  } catch {
+    return [{ type: "text", text: body || "(no output)" }];
+  }
+  if (code !== 0 || typeof result?.sheet !== "string") return [{ type: "text", text: typeof result?.error === "string" ? result.error : body }];
+  const order = result.shots.map((s: any) => `${s.device === "none" ? "no simulation" : s.device} (${s.width}x${s.height})`).join(", ");
+  const summary = `${result.shots.length} devices, left to right then down: ${order}. Each screenshot: ${result.shots.map((s: any) => s.file).join(" ")}. ${result.ms} ms.${errorsAfter(result)}`;
+  try {
+    return [{ type: "text", text: summary }, { type: "image", data: fs.readFileSync(result.sheet).toString("base64"), mimeType: "image/png" }];
+  } catch (error) {
+    return [{ type: "text", text: `${summary} The picture could not be read back: ${(error as Error).message}` }];
+  }
 }
 
 /** The record command's --json answer: one line, and the contact sheet as an image block */
@@ -550,6 +901,23 @@ function errorsAfter(result: any): string {
   return listed.length || result?.repeatedErrors ? `\n${newErrorsText(listed, result.repeatedErrors)}` : "";
 }
 
+/** The asset thumbnail command's --json answer: where it was saved, and the PNG as an image block */
+function thumbnailAnswer(body: string, code: number): object[] {
+  let result: any;
+  try {
+    result = JSON.parse(body);
+  } catch {
+    return [{ type: "text", text: body || "(no output)" }];
+  }
+  if (code !== 0 || typeof result?.file !== "string") return [{ type: "text", text: typeof result?.error === "string" ? result.error : body }];
+  const summary = `Thumbnail of asset ${result.assetId} (${result.size}), saved at ${result.file}`;
+  try {
+    return [{ type: "text", text: summary }, { type: "image", data: fs.readFileSync(result.file).toString("base64"), mimeType: "image/png" }];
+  } catch (error) {
+    return [{ type: "text", text: `${summary}, but it could not be read back: ${(error as Error).message}` }];
+  }
+}
+
 /** The screenshot command's --json answer: its text, and the PNG it saved as an image block */
 function screenshotAnswer(body: string, code: number): object[] {
   let shot: any;
@@ -569,36 +937,7 @@ function screenshotAnswer(body: string, code: number): object[] {
   }
 }
 
-export function instructions(info: FlavorInfo): string {
-  return `${info.appName} syncs Roblox places in Studio with folders on disk, both ways. One hub (port ${info.port}) runs one daemon per registered place; \`status\` lists each place and its folder. Scripts are files: .luau is a ModuleScript, .server.luau a Script, .client.luau a LocalScript. The terminal command \`${info.command}\` does the same as these tools and more.
-
-Editing in the synced folder:
-- A file saved there reaches Studio in milliseconds while Studio has the place open and connected. Check \`status\` first: with no Studio connected, edits wait, and when the place is opened again Studio's copy of every script wins, so disk edits made meanwhile come back reverted.
-- Before a playtest or reading a script in Studio, call \`wait\`.
-- A new script: create the file (one at a time, not a burst), then confirm it exists in Studio.
-- A script edited in Studio and on disk at once is merged; a disk version the merge did not keep goes to \`conflicts\`. Check it after a batch of edits. Which side wins is the user's call.
-- Do not use Studio's Undo (Ctrl+Z, ChangeHistoryService:Undo) with the sync on: it also undoes the sync's own steps, and a created file gets deleted from disk too.
-
-Git in the synced folder: every file git writes goes to Studio. A merge or fast-forward is fine. Never switch branches, checkout or stash there: the moment the tree rewinds becomes deletions in Studio, and pausing the sync does not protect it. After any git operation there: \`wait\`, then \`log\` for a deleted script the operation did not mean to delete. A deleted one comes back by writing it from git (git show HEAD:<path> > <path>). \`wait\` also lists script files on disk with no instance in Studio (a merge's new script the sync missed): \`wait\` with fix sends their creates again; saving such a file again does nothing.
-
-Work on another branch in a git worktree:
-- Its edits never reach Studio. Do not change scripts in Studio for that work (that writes to the synced folder's branch).
-- Test with \`play\` (worktree path). A new file needs \`git add\` first, or the play leaves it out. The answer says 'N of M have the branch'; compare 'N changed, N new' with what the branch touched. To change code: stop the play, edit, \`play\` again.
-- A 'conflict:' line is a script the branch changed that Studio also holds changed by someone else. 'has the place's text' means a tab open and edited in that Studio beat the swap: closing the tab fixes the next play.
-- Maps, models and UI layout live in the place and are not carried by a play.
-
-Studio tools (through ${info.appName}'s own plugin, for the place named or the one whose folder the AI runs in):
-- solo_playtest start, then eval_server_runtime / eval_client_runtime run Luau inside the running game (its require cache), get_runtime_logs reads the play's output with a cursor, simulate_keyboard_input sends keys to the play client, capture_screenshot shows the viewport. solo_playtest stop returns once Studio is back in edit mode.
-- click_gui clicks a button by its path (no pixel coordinates), wait_for waits for Luau to turn truthy or an output line instead of sleeping, record makes a GIF of a few seconds of the play view (its answer shows a contact sheet of the frames).
-- inspect_gui reads a GUI as the player sees it (text, place, hidden by what, clickable or covered) instead of an eval over PlayerGui. capture_screenshot takes width (an image costs by its pixels) and focus (a GUI object to crop to, or a part or model to point the camera at). simulate_mouse_input clicks at x, y on the last screenshot, or a GuiObject's or a part's center; it cannot drag or scroll.
-- Every Studio answer lists the play's errors logged since your previous call ("New errors in the play..."): read them before going on.
-- quack-prelude/server.luau, client.luau and edit.luau at the project's root (next to the sync folder, kept in git) go before every eval of that peer: a game names its player, services and modules there once. An answer says when one was used; prelude false leaves it out.
-- verify_sync tells whether Studio holds the disk's text of each script (its .Source and its open tab, the text a play copies): call it after edits and before a play instead of reading .Source. find_instances searches the whole place by name, class and path from Quack's own copy, with no Studio call.
-- perf_sample measures fps, frame times, hitches and memory in both play peers for a few seconds. set_logpoint prints values from a script line when it runs, with no edit (its lines reach get_runtime_logs). export_rbxm and import_rbxm move models as .rbxm files.
-- solo_playtest start with players runs a multiplayer test; the client tools then take player.
-- execute_luau runs in the edit plugin: what it changes in the place syncs to disk.
-- An error says its cause: no Studio connected, no play running, no play client (Run mode), an older plugin (reopen the place), the window minimized, or Luau's own error.`;
-}
+export { instructions };
 
 /** Serves MCP on `input`/`output` until `input` ends */
 export function serveMcp(input: Readable, output: Writable, ctx: Context): Promise<void> {

@@ -104,10 +104,10 @@ test("play: only the branch's tracked scripts are swapped, and the play session'
       ],
     );
 
-    (daemon as any).handleStudioMessage({ type: "playOverlayResult", id: swap.id, ok: true, windowMs: 1370, applied: 3 });
+    (daemon as any).handleStudioMessage({ type: "playOverlayResult", id: swap.id, ok: true, windowMs: 1370, applied: 3, closedTabs: ["ReplicatedStorage.Config"] });
     const state = await playing;
     assert.equal(state.done, true);
-    assert.deepEqual(state.result, { ok: true, windowMs: 1370, applied: 3 });
+    assert.deepEqual(state.result, { ok: true, windowMs: 1370, applied: 3, closedTabs: ["ReplicatedStorage.Config"] }, "the tabs the plugin closed before the swap are said");
     assert.equal(state.skipped.length, 1);
     assert.match(state.skipped[0], /OldModule\.luau/);
 
