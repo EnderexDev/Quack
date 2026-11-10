@@ -35,7 +35,7 @@ import { HubLink, readHubLink } from "./hubLink.js";
 import { StudioTools } from "./studioTools.js";
 import { clearHubLock } from "./hub/owners.js";
 import { StudioWrites } from "./fs/studioWrites.js";
-import { studioChanges } from "./changes.js";
+import { commitBalance, studioChanges } from "./changes.js";
 
 /** Quack: a `quackdev play`, from the swap request to the play session's check */
 export interface PlayState {
@@ -305,6 +305,7 @@ export class SyncDaemon {
       // pruning it would save that stale copy over the live daemon's when it stops
       changes: async (options) => {
         if (this.standby || this.handedOff) throw new Error("this daemon is handing its place to another; ask again in a moment");
+        if (options.commitBalance) return commitBalance(this.fileWriter.getBaseDir(), this.studioWrites);
         return studioChanges(this.fileWriter.getBaseDir(), this.studioWrites, options);
       },
     });

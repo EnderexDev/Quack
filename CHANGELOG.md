@@ -6,6 +6,11 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.24] - 2026-11-10
+
+### Added
+- `quack changes --balance` (the MCP's `studio_changes` with `balance`) lists the balance: files only Studio changed since the last commit, and only in numbers, a designer tuning values. `--commit-balance` (`commitBalance`) commits exactly those in their own "Balance: values tuned in Studio" commit, then pushes. Every other change, and whatever is staged, stays as it was. A file Studio writes again while the commit runs is named, and the push is skipped.
+
 ## [1.0.23] - 2026-11-10
 
 ### Added
@@ -311,7 +316,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.23...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.24...HEAD
+[1.0.24]: https://github.com/EnderexDev/Quack/compare/v1.0.23...v1.0.24
 [1.0.23]: https://github.com/EnderexDev/Quack/compare/v1.0.22...v1.0.23
 [1.0.22]: https://github.com/EnderexDev/Quack/compare/v1.0.21...v1.0.22
 [1.0.21]: https://github.com/EnderexDev/Quack/compare/v1.0.20...v1.0.21

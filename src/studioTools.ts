@@ -57,7 +57,7 @@ export interface PlaceView {
   /** A script's file, from the sync folder */
   fileOf(guid: string): string | undefined;
   /** The files git sees as changed in the sync folder, each marked by whether Studio wrote it */
-  changes?(options: { numbersOnly?: boolean }): Promise<unknown>;
+  changes?(options: { numbersOnly?: boolean; commitBalance?: boolean }): Promise<unknown>;
 }
 
 /** FNV-1a, 32 bits, over UTF-8 bytes: the plugin hashes Studio's text the same way */
@@ -1144,12 +1144,16 @@ export class StudioTools {
 
   /**
    * Which uncommitted changes in the sync folder came from Studio, read in the daemon from what it
-   * wrote there itself: no Studio call, so it answers with Studio closed too
+   * wrote there itself: no Studio call, so it answers with Studio closed too. balance (numbersOnly)
+   * also lists Studio's numbers-only files; commitBalance commits exactly those
    */
   private async changes(args: Record<string, any>) {
     if (!this.place?.changes) throw new ToolError("this daemon does not record Studio's writes");
-    if (args.numbersOnly !== undefined && typeof args.numbersOnly !== "boolean") throw new ToolError("numbersOnly must be true or false");
-    return this.place.changes({ numbersOnly: args.numbersOnly === true });
+    for (const key of ["numbersOnly", "balance", "commitBalance"]) {
+      if (args[key] !== undefined && typeof args[key] !== "boolean") throw new ToolError(`${key} must be true or false`);
+    }
+    const commitBalance = args.commitBalance === true;
+    return this.place.changes({ numbersOnly: commitBalance || args.balance === true || args.numbersOnly === true, ...(commitBalance ? { commitBalance } : {}) });
   }
 
   /**

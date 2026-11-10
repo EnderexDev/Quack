@@ -48,7 +48,7 @@ ${app} syncs Roblox places in Studio with folders on disk, both ways. One hub ru
 - Do not use Studio's Undo (Ctrl+Z, ChangeHistoryService:Undo) with the sync on: it also undoes the sync's own steps, and a created file gets deleted from disk too.
 - Maps, models and UI layout live in the place, not on disk: change them with \`set_properties\`, \`execute_luau\` or \`import_rbxm\`, and carry them between places with \`export_rbxm\` / \`import_rbxm\`. \`selection\` reads or sets Studio's selection and points the edit camera at something (then \`capture_screenshot\` shows it); \`get_place_info\` names the place, its version and owner; \`generate_model\` makes a 3D model from a prompt or an image with Roblox's generation (minutes).
 - Instances the sync deleted with no copy in git: \`list_place_versions\`, \`download_place\` (an .rbxl of a saved version), then \`import_rbxm\` of that .rbxl with \`paths\` (Workspace.Map, StarterGui.Shop: each goes back to its own service; \`list\` shows what the file holds first). A place's scripts come in only with \`scripts\`: a downloaded place is untrusted.
-- \`studio_changes\` says which uncommitted files came from Studio (a designer's numbers, an edit made there) and which were edited on disk: read it before committing a synced folder, instead of guessing whose changes they are.
+- \`studio_changes\` says which uncommitted files came from Studio (a designer's numbers, an edit made there) and which were edited on disk: read it before committing a synced folder, instead of guessing whose changes they are. With \`balance\` it lists the balance: files only Studio changed, and only in numbers (comments ignored; a string counts when its whole text is a number). \`commitBalance\` (\`${q} changes --commit-balance\`) commits exactly those in their own "Balance: values tuned in Studio" commit and pushes, leaving every other change and whatever is staged as it was; a file Studio wrote again during the commit is named and the push skipped. Files marked \`mixed\` or \`other\` are someone's work: never in that commit. Commit the balance only when the user's instructions say to; otherwise say what is there.
 
 ## The test cycle
 
@@ -144,6 +144,7 @@ export function instructions(info: FlavorInfo): string {
 - \`get_roblox_docs\` for an engine API instead of guessing; assets through \`search_assets\`, \`preview_asset\`, \`insert_asset\` (scripts stripped) and \`upload_asset\` (never uploads the same file twice).
 - The live game's Open Cloud (DataStores, configs, badges, products, servers, bans...): the key stays in Quack, never ask for it. Read freely; write only when the user asked for that exact change, and Quack still asks them in its app first (Accept or Refuse; never retry a refusal).
 - Never Undo in Studio with the sync on. In the synced folder git may merge or fast-forward, never checkout, reset or stash; after any git operation: \`wait\`, then \`log\` for deletions.
+- Before committing a synced folder: \`studio_changes\` says which files Studio wrote; \`commitBalance\` commits only Studio's numbers-only files (a designer's tuning) and pushes, when the user's instructions say to.
 - Another branch lives in a git worktree and is tested with \`play\` (its path; \`git add\` new files first).
 - Settling conflicts, pausing, registering and restarting the hub are the user's.
 

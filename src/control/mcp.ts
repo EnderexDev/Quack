@@ -4,6 +4,7 @@ import type { Readable, Writable } from "node:stream";
 import { BUNDLED_VERSION } from "../bundled.js";
 import { newErrorsText, recordSummary, runControl, type ControlContext } from "./commands.js";
 import { instructions } from "./rule.js";
+import { BALANCE_SUBJECT } from "../util/luauNumbers.js";
 
 /**
  * `quack mcp` / `quackdev mcp`: the hub for an AI, as an MCP server on stdio (JSON-RPC, one
@@ -388,15 +389,21 @@ export const TOOLS: Tool[] = [
   },
   {
     name: "studio_changes",
-    description: "Which uncommitted changes in the place's synced folder came from Studio (a game designer tuning values there; the sync writes them to disk), so they are not taken for someone's work in progress. Lists every file git sees as changed in the sync folder, new files too, each marked: studio (Studio wrote it and nothing touched it since; from the commit only Studio changed it), mixed (Studio wrote it, but the disk changed it after, or it already held another uncommitted edit, or a merge) or other (not from Studio). Quack knows because its daemon writes those files itself; no Studio call, so it answers with Studio closed. numbersOnly also says which of Studio's files differ from the commit only in numeric literals. Paths are from the repository's root. It commits nothing: whether to commit is the user's call.",
+    description: "Which uncommitted changes in the place's synced folder came from Studio (a game designer tuning values there; the sync writes them to disk), so they are not taken for someone's work in progress. Lists every file git sees as changed in the sync folder, new files too, each marked: studio (Studio wrote it and nothing touched it since; from the commit only Studio changed it), mixed (Studio wrote it, but the disk changed it after, or it already held another uncommitted edit, or a merge) or other (not from Studio). Quack knows because its daemon writes those files itself; no Studio call, so it answers with Studio closed. balance also lists the balance: Studio's files whose only change from the commit is numbers (a designer tuning values; comments ignored, a string counts only when its whole text is a number). Paths are from the repository's root. It commits nothing, except with commitBalance: the balance alone in its own commit (\"" + BALANCE_SUBJECT + "\"), every other change and whatever is staged left as it was, then a push; mixed and other files are never in it, and whether to commit them is the user's call.",
     inputSchema: {
       type: "object",
       properties: {
-        numbersOnly: { type: "boolean", description: "Also say which of Studio's files differ from the commit only in numbers" },
+        balance: { type: "boolean", description: "Also list the balance: Studio's files that differ from the commit only in numbers" },
+        commitBalance: { type: "boolean", description: "Commit the balance alone, then push. Only when the user's instructions say to commit the balancer's numbers" },
+        numbersOnly: { type: "boolean", description: "The same as balance (its older name)" },
         ...placeProp,
       },
     },
-    argv: (args) => ["changes", ...text(args, "place"), ...(args.numbersOnly === true ? ["--numbers-only"] : [])],
+    argv: (args) => [
+      "changes",
+      ...text(args, "place"),
+      ...(args.commitBalance === true ? ["--commit-balance"] : args.balance === true || args.numbersOnly === true ? ["--balance"] : []),
+    ],
   },
   {
     name: "perf_sample",

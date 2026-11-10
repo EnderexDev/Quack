@@ -1426,6 +1426,74 @@ test("changes: the terminal and the MCP say which uncommitted files Studio wrote
     const answer = await mcp.tool("studio_changes", { numbersOnly: true });
     assert.equal(answer.isError, undefined, answer.content[0].text);
     assert.match(answer.content[0].text, /studio \?\? {2}sync\/ServerStorage\/AlphaScript\.luau {2}made by Studio \[Studio wrote it [^\]]+\]; not only numbers: a new file/);
+    assert.match(answer.content[0].text, /\nBalance: none \(no file from Studio changed only in numbers\)\.$/);
     await mcp.close();
   });
+});
+
+test("changes --commit-balance: commits Studio's numbers alone through the hub and pushes from the caller; a failed push is an error", { timeout: 60000 }, async () => {
+  const remote = fs.mkdtempSync(path.join(os.tmpdir(), "quack-balance-remote-"));
+  try {
+    await withHub(async ({ port, folders }) => {
+      const folder = folders["111"];
+      const gitIn = (...args: string[]) => execFileSync("git", ["-C", folder, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      fs.writeFileSync(path.join(folder, ".gitignore"), ".quack/\nsourcemap.json\n");
+      gitIn("init", "-q");
+      gitIn("config", "user.email", "test@example.com");
+      gitIn("config", "user.name", "Test");
+      gitIn("config", "core.hooksPath", path.join(folder, ".git", "hooks"));
+      gitIn("add", "-A");
+      gitIn("commit", "-q", "-m", "start");
+
+      const studio = fakeStudio(port, 111, "AlphaScript");
+      const run = control(port, { cwd: path.join(folder, "sync") });
+      const alpha = path.join(folder, "sync", "ServerStorage", "AlphaScript.luau");
+      const studioEdit = async (source: string) => {
+        studio.ws.send(JSON.stringify({ type: "scriptChanged", data: { guid: "s111", source, path: ["ServerStorage", "AlphaScript"], className: "ModuleScript" } }));
+        await waitFor(() => fs.existsSync(alpha) && fs.readFileSync(alpha, "utf8") === source);
+      };
+      await waitFor(async () => (await run("status", "--json")).json().sessions[0]?.instances === 3);
+      await studioEdit("return { Hp = 1 }\n");
+      gitIn("add", "-A");
+      gitIn("commit", "-q", "-m", "the script");
+
+      // The designer tunes it in Studio; someone's edit sits staged
+      await studioEdit("return { Hp = 2 }\n");
+      fs.writeFileSync(path.join(folder, "Note.txt"), "mine\n");
+      gitIn("add", "Note.txt");
+      const listed = await run("changes", "--balance");
+      assert.equal(listed.code, 0, listed.err);
+      assert.match(listed.out, /\nBalance: 1 file from Studio changed only in numbers \(--commit-balance commits it alone\)\.$/);
+      assert.equal(gitIn("rev-list", "--count", "HEAD").trim(), "2", "listing commits nothing");
+
+      // No remote: committed, the push fails, exit 1
+      const noRemote = await run("changes", "--commit-balance");
+      assert.equal(noRemote.code, 1, noRemote.out);
+      assert.match(noRemote.out, /^Committed [0-9a-f]{7} "Balance: values tuned in Studio" with 1 file only Studio changed, numbers only:\n {2}sync\/ServerStorage\/AlphaScript\.luau\n/);
+      assert.match(noRemote.out, /\nThe push failed, and stopped there \(the commit stays\): /);
+      assert.equal(gitIn("log", "-1", "--format=%s").trim(), "Balance: values tuned in Studio");
+      assert.equal(gitIn("show", "--name-only", "--format=", "HEAD").trim(), "sync/ServerStorage/AlphaScript.luau");
+      assert.equal(gitIn("diff", "--cached", "--name-only").trim(), "Note.txt", "the staged file stays staged");
+
+      // With a remote: the MCP commits and pushes
+      execFileSync("git", ["init", "-q", "--bare", remote]);
+      gitIn("remote", "add", "origin", remote);
+      gitIn("push", "-q", "-u", "origin", "HEAD");
+      await studioEdit("return { Hp = 3 }\n");
+      const mcp = mcpSession(port, path.join(folder, "sync"));
+      const answer = await mcp.tool("studio_changes", { commitBalance: true });
+      assert.equal(answer.isError, undefined, answer.content[0].text);
+      assert.match(answer.content[0].text, /^Committed [0-9a-f]{7} "Balance: values tuned in Studio"/);
+      assert.match(answer.content[0].text, /\nPushed/);
+      assert.equal(execFileSync("git", ["-C", remote, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), gitIn("rev-parse", "HEAD").trim());
+      // Nothing left to commit: says so, exit 0, no push
+      const none = await run("changes", "--commit-balance", "--json");
+      assert.equal(none.code, 0, none.out);
+      assert.deepEqual([none.json().committed, none.json().pushed], [null, undefined]);
+      await mcp.close();
+      studio.ws.close();
+    });
+  } finally {
+    fs.rmSync(remote, { recursive: true, force: true });
+  }
 });

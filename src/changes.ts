@@ -2,7 +2,7 @@ import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { ABSENT, sha256, textHash, type StudioWrite, type StudioWrites } from "./fs/studioWrites.js";
-import { numbersOnly } from "./util/luauNumbers.js";
+import { BALANCE_SUBJECT, numbersOnly } from "./util/luauNumbers.js";
 import { diskText } from "./util/scriptFile.js";
 
 /**
@@ -12,7 +12,9 @@ import { diskText } from "./util/scriptFile.js";
  * - mixed: Studio wrote it, but the disk changed it since, or the file already held someone's
  *   uncommitted edit when Studio began writing it, or it is a merge of both sides
  * - other: not from Studio at all (an agent, a person, git)
- * The commit stays the caller's: this only says whose each change is.
+ * With numbersOnly it also names the balance: Studio's files whose only change from the commit is
+ * numbers, a game designer tuning values. `commitBalance` commits exactly those, in their own
+ * commit, and nothing else; every other change stays the caller's to commit or ask about.
  */
 
 export type ChangeOrigin = "studio" | "mixed" | "other";
@@ -32,18 +34,44 @@ export interface ChangedFile {
   numbersNote?: string;
 }
 
+/** The balance commit `commitBalance` made */
+export interface BalanceCommit {
+  sha: string;
+  subject: string;
+  /** From the repository's root */
+  files: string[];
+  /**
+   * Files whose committed text is not the one judged numbers-only: Studio wrote them again between
+   * the judgement and the commit, so their commit may hold more than numbers
+   */
+  unjudged: string[];
+}
+
 export type ChangesResult =
-  | { git: false; syncDir: string; note: string }
-  | { git: true; root: string; syncDir: string; files: ChangedFile[]; studio: number; mixed: number; other: number; forgotten: number; ms: number };
+  | { git: false; syncDir: string; note: string; committed?: null }
+  | {
+      git: true; root: string; syncDir: string; files: ChangedFile[]; studio: number; mixed: number; other: number; forgotten: number; ms: number;
+      /** With numbersOnly: Studio's files that differ from the commit only in numbers (the balancer's) */
+      balance?: string[];
+      /** From commitBalance: the commit, or null when there was no balance to commit */
+      committed?: BalanceCommit | null;
+    };
 
 const GIT_TIMEOUT_MS = 30_000;
 
-function git(cwd: string, args: string[]): Promise<Buffer> {
+function git(cwd: string, args: string[], input?: string, timeout = GIT_TIMEOUT_MS): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    execFile("git", ["-C", cwd, ...args], { encoding: "buffer", maxBuffer: 256 * 1024 * 1024, timeout: GIT_TIMEOUT_MS, windowsHide: true }, (error, stdout, stderr) => {
+    // Nothing here may wait on a prompt nobody sees: the daemon has no terminal
+    const env = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+    const child = execFile("git", ["-C", cwd, ...args], { encoding: "buffer", maxBuffer: 256 * 1024 * 1024, timeout, windowsHide: true, env }, (error, stdout, stderr) => {
       if (error) reject(Object.assign(error, { stderr: stderr?.toString("utf8") ?? "" }));
       else resolve(stdout);
     });
+    if (input !== undefined) {
+      // git leaving early closes its stdin: its exit code says why, not this EPIPE
+      child.stdin?.on("error", () => {});
+      child.stdin?.end(input);
+    }
   });
 }
 
@@ -131,7 +159,52 @@ function headVersions(root: string, paths: string[], keepText: boolean): Promise
 }
 
 export async function studioChanges(syncDir: string, writes: StudioWrites, options: { numbersOnly?: boolean } = {}, now: () => number = Date.now): Promise<ChangesResult> {
+  return (await classify(syncDir, writes, options, now)).result;
+}
+
+/**
+ * Commits the balance (Studio's files that differ from the commit only in numbers) and nothing
+ * else: `git commit --only` takes exactly those files from the disk and leaves whatever else is
+ * staged or changed where it was. The answer is the listing after the commit, with the commit.
+ * Pushing is the caller's: it runs where the user's credentials answer.
+ */
+export async function commitBalance(syncDir: string, writes: StudioWrites, hooks: { beforeCommit?: () => void } = {}, now: () => number = Date.now): Promise<ChangesResult> {
+  const { result, judged } = await classify(syncDir, writes, { numbersOnly: true }, now);
+  if (!result.git || !result.balance?.length) return { ...result, committed: null };
+  const paths = result.balance;
+  hooks.beforeCommit?.();
+  const message = [
+    BALANCE_SUBJECT,
+    "",
+    "Numbers changed in Studio and written to disk by Quack's sync, picked by",
+    "Quack's balance commit: Studio wrote each file and nothing changed it since,",
+    "and its Luau tokens match the previous commit except for numbers (comments",
+    "ignored).",
+    "",
+    ...paths.map((p) => `- ${p}`),
+  ].join("\n");
+  try {
+    // The paths go on stdin, NUL-separated: no command line limit, and taken literally (a [ or a *
+    // in a script's name is no pattern). A hook may take a while: a longer timeout than a read
+    await git(result.root, ["--literal-pathspecs", "commit", "--quiet", "--only", "-m", message, "--pathspec-from-file=-", "--pathspec-file-nul"], paths.map((p) => `${p}\0`).join(""), 120_000);
+  } catch (error) {
+    const stderr = String((error as { stderr?: string }).stderr ?? "").trim();
+    throw new Error(`git refused the balance commit: ${stderr || (error as Error).message}`);
+  }
+  const sha = (await git(result.root, ["rev-parse", "HEAD"])).toString("utf8").trim();
+  // The commit took the disk as it was then: a file Studio wrote again since the judgement holds a
+  // text nobody judged
+  const heads = await headVersions(result.root, paths, false);
+  const unjudged = paths.filter((p) => heads.get(p)?.hash !== judged.get(p));
+  const after = (await classify(syncDir, writes, { numbersOnly: true }, now)).result;
+  if (!after.git) throw new Error(`committed ${sha.slice(0, 7)}, then git could not list the folder again: ${after.note}`);
+  return { ...after, committed: { sha, subject: BALANCE_SUBJECT, files: paths, unjudged } };
+}
+
+async function classify(syncDir: string, writes: StudioWrites, options: { numbersOnly?: boolean }, now: () => number): Promise<{ result: ChangesResult; judged: Map<string, string> }> {
   const started = now();
+  // Each balance file's text (line endings ignored) as judged: what its commit must hold
+  const judged = new Map<string, string>();
   // What the record held when this began: only those entries may be forgotten at the end (a file
   // Studio writes while git answers keeps its entry)
   const seen = writes.snapshot();
@@ -144,8 +217,8 @@ export async function studioChanges(syncDir: string, writes: StudioWrites, optio
     prefix = out[1] ?? "";
   } catch (error) {
     const stderr = String((error as { stderr?: string }).stderr ?? "");
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { git: false, syncDir: shownSync, note: "git is not installed (or not on PATH), so Quack cannot tell what changed" };
-    if (/not a git repository/i.test(stderr)) return { git: false, syncDir: shownSync, note: "the sync folder is not in a git repository, so there is no commit to compare with" };
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { result: { git: false, syncDir: shownSync, note: "git is not installed (or not on PATH), so Quack cannot tell what changed" }, judged };
+    if (/not a git repository/i.test(stderr)) return { result: { git: false, syncDir: shownSync, note: "the sync folder is not in a git repository, so there is no commit to compare with" }, judged };
     throw new Error(`git could not read the sync folder: ${stderr.trim() || (error as Error).message}`);
   }
   let hasHead = true;
@@ -261,6 +334,7 @@ export async function studioChanges(syncDir: string, writes: StudioWrites, optio
         const why = disk === undefined || sha256(disk) !== record.hash ? "it changed while being read; ask again" : numbersOnly(diskText(head.text ?? ""), diskText(disk.toString("utf8")));
         file.numbersOnly = why === null;
         if (why !== null) file.numbersNote = why;
+        else judged.set(file.path, diskHash);
       }
     }
   }
@@ -268,5 +342,6 @@ export async function studioChanges(syncDir: string, writes: StudioWrites, optio
   // Bounded: a file git no longer lists (committed, or put back as the commit has it) is forgotten
   const forgotten = writes.keepOnly(keep, seen);
   const count = (origin: ChangeOrigin) => files.filter((f) => f.origin === origin).length;
-  return { git: true, root, syncDir: prefix.replace(/\/$/, "") || ".", files, studio: count("studio"), mixed: count("mixed"), other: count("other"), forgotten, ms: now() - started };
+  const balance = options.numbersOnly ? { balance: files.filter((f) => f.origin === "studio" && f.numbersOnly === true).map((f) => f.path) } : {};
+  return { result: { git: true, root, syncDir: prefix.replace(/\/$/, "") || ".", files, studio: count("studio"), mixed: count("mixed"), other: count("other"), forgotten, ms: now() - started, ...balance }, judged };
 }

@@ -7,6 +7,7 @@ import { HubClient, HubError, HubOffline, type FlavorInfo } from "./hubClient.js
 import { PLAY_TAB_HINT } from "../play/overlay.js";
 import { rule, rulePrompt } from "./rule.js";
 import { summaryText } from "../util/rbxl.js";
+import { BALANCE_SUBJECT } from "../util/luauNumbers.js";
 import { liveCommand } from "./live.js";
 import {
   assetDetails, assetThumbnail, detailsText, docsText, imageIdLua, rememberImageId, RobloxError, robloxDocs, robloxEnv, searchAssets, searchText,
@@ -144,6 +145,10 @@ interface Options {
   closeEdited: boolean;
   /** changes: which of Studio's files differ from the commit only in numbers */
   numbersOnly: boolean;
+  /** changes: the same, with the list of those files (the balance) */
+  balance: boolean;
+  /** changes: commit the balance alone, then push */
+  commitBalance: boolean;
   devices?: string;
   /** rule: the rule with how an AI installs or updates it (what the app copies) */
   prompt: boolean;
@@ -308,6 +313,8 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       close: { type: "string" },
       "close-edited": { type: "boolean" },
       "numbers-only": { type: "boolean" },
+      balance: { type: "boolean" },
+      "commit-balance": { type: "boolean" },
       devices: { type: "string" },
       prompt: { type: "boolean" },
       "key-stdin": { type: "boolean" },
@@ -469,6 +476,8 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       close: values.close,
       closeEdited: values["close-edited"] === true,
       numbersOnly: values["numbers-only"] === true,
+      balance: values.balance === true,
+      commitBalance: values["commit-balance"] === true,
       devices: values.devices,
       prompt: values.prompt === true,
       keyStdin: values["key-stdin"] === true,
@@ -622,11 +631,16 @@ Studio (through the ${info.appName} plugin; the code goes as --code=<luau> or --
   verify [place] [--files <a,b>]   Whether Studio holds each synced script's disk text, in its
                             .Source and in an open tab (the text a play copies); the files
                             are paths from the sync folder (default every script)
-  changes [place] [--numbers-only]   The files git sees as changed in the sync folder, each
-                            marked: studio (Studio wrote it, untouched since), mixed (Studio
-                            wrote it and something else changed it too) or other (not from
-                            Studio). --numbers-only also says which of Studio's differ from the
-                            commit only in numbers. Commits nothing
+  changes [place] [--balance | --commit-balance]   The files git sees as changed in the sync
+                            folder, each marked: studio (Studio wrote it, untouched since), mixed
+                            (Studio wrote it and something else changed it too) or other (not
+                            from Studio). --balance (or --numbers-only) also lists the balance:
+                            Studio's files whose only change from the commit is numbers (a
+                            designer tuning values in Studio; comments ignored, a string only
+                            when its whole text is a number). Commits nothing, except:
+      --commit-balance      commits the balance alone ("${BALANCE_SUBJECT}"), leaving every
+                            other change and whatever is staged as it was, then pushes; exit
+                            ${EXIT.error} when git refuses the commit or the push
   logpoint add|remove <file> | --path=<path> --line <n> [place] [--message=<luau values>] [--condition=<luau>]
   logpoint list|clear [place]
                             A script line that prints values each time it runs in the play, with
@@ -1970,9 +1984,38 @@ async function verifySync(ctx: ControlContext, options: Options, query: string |
 /** Which uncommitted changes in the place's sync folder came from Studio */
 async function changes(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
   const place = await resolvePlace(ctx, query);
-  const result = await studio(ctx, place, "changes", { ...(options.numbersOnly ? { numbersOnly: true } : {}) }, 60_000);
-  ctx.out(options.json ? JSON.stringify(result, null, 2) : changesText(result));
-  return EXIT.ok;
+  const commit = options.commitBalance;
+  const numbers = commit || options.balance || options.numbersOnly;
+  // numbersOnly too: a daemon older than the balance still answers it
+  // A commit runs the repo's hooks: the hub waits longer for it (timeoutMs) than for a listing
+  const result = await studio(ctx, place, "changes", { ...(numbers ? { numbersOnly: true } : {}), ...(options.balance ? { balance: true } : {}), ...(commit ? { commitBalance: true, timeoutMs: 180_000 } : {}) }, commit ? 210_000 : 60_000);
+  if (result.git && numbers && !Array.isArray(result.balance)) {
+    // An older daemon lists no balance: it is Studio's numbers-only files. It also commits nothing
+    if (commit) throw new Error(`The daemon of ${placeLabel(place)} is older than --commit-balance, and committed nothing: ${ctx.info.command} restart-hub --daemons.`);
+    result.balance = (result.files ?? []).filter((f: any) => f.origin === "studio" && f.numbersOnly === true).map((f: any) => f.path);
+  }
+  // The push runs here, where the user's own git credentials answer, never in the hub
+  const unjudged: string[] = result.committed?.unjudged ?? [];
+  if (result.committed) result.pushed = unjudged.length ? { ok: false, error: "not pushed: a file changed again after it was judged" } : await gitPush(result.root);
+  if (options.json) ctx.out(JSON.stringify(result, null, 2));
+  else {
+    ctx.out(changesText(result));
+    if (result.pushed?.ok) ctx.out(`Pushed${result.pushed.out ? `: ${result.pushed.out}` : "."}`);
+    else if (result.pushed && !unjudged.length) ctx.out(`The push failed, and stopped there (the commit stays): ${result.pushed.error}`);
+  }
+  return result.pushed && !result.pushed.ok ? EXIT.error : EXIT.ok;
+}
+
+/** git push in the repo, with no prompt (nobody may be at a terminal) and a deadline */
+async function gitPush(root: string): Promise<{ ok: true; out: string } | { ok: false; error: string }> {
+  const { execFile } = await import("node:child_process");
+  return new Promise((resolve) => {
+    execFile("git", ["-C", root, "push"], { encoding: "utf8", timeout: 120_000, windowsHide: true, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } }, (error, stdout, stderr) => {
+      const text = `${stdout ?? ""}${stderr ?? ""}`.trim().split(/\r?\n/).filter(Boolean);
+      if (error) resolve({ ok: false, error: text.join(" / ") || error.message });
+      else resolve({ ok: true, out: text.slice(-1)[0] ?? "" });
+    });
+  });
 }
 
 /** A time as the local day and minute, YYYY-MM-DD HH:MM */
@@ -1985,16 +2028,32 @@ function localMinute(ms: number): string {
 /** changes' answer: a line a file (who, git's status, the path from the repo's root, why), then the counts */
 export function changesText(r: any): string {
   if (r.git === false) return `Nothing to compare in ${r.syncDir}: ${r.note}.`;
+  const lines: string[] = [];
+  if (r.committed === null) lines.push("No balance to commit: no file from Studio differs from the commit only in numbers.");
+  else if (r.committed) {
+    const c = r.committed;
+    const sha = c.sha.slice(0, 7);
+    lines.push(`Committed ${sha} "${c.subject}" with ${c.files.length} file${c.files.length === 1 ? "" : "s"} only Studio changed, numbers only:`);
+    for (const p of c.files) lines.push(`  ${p}`);
+    for (const p of c.unjudged) lines.push(`${p} changed again after it was judged (Studio wrote it while the commit ran), so the commit may hold more than numbers: read git show ${sha} -- "${p}" before pushing. Not pushed.`);
+  }
   const files: any[] = r.files ?? [];
-  if (!files.length) return `Nothing changed in ${r.syncDir} since the last commit (${r.ms} ms).`;
+  if (!files.length) {
+    lines.push(`Nothing changed in ${r.syncDir} since the last commit (${r.ms} ms).`);
+    return lines.join("\n");
+  }
   const width = Math.max(...files.map((f) => f.path.length));
-  const lines = [`${files.length} file${files.length === 1 ? "" : "s"} changed in ${r.syncDir} since the last commit (repo ${r.root}):`];
+  lines.push(`${files.length} file${files.length === 1 ? "" : "s"} ${r.committed ? "still " : ""}changed in ${r.syncDir} since the last commit (repo ${r.root}):`);
   for (const f of files) {
     const when = f.writtenAt !== undefined ? ` [Studio wrote it ${localMinute(f.writtenAt)}]` : "";
     const numbers = f.numbersOnly === true ? "; only numbers changed" : f.numbersOnly === false ? `; not only numbers: ${f.numbersNote}` : "";
     lines.push(`  ${f.origin.padEnd(6)} ${f.status}  ${f.path.padEnd(width)}  ${f.note}${when}${numbers}`);
   }
   lines.push(`${r.studio} from Studio, ${r.mixed} mixed, ${r.other} not from Studio (${r.ms} ms). Paths are from the repo's root, for git add.`);
+  if (Array.isArray(r.balance) && r.committed === undefined) {
+    const n = r.balance.length;
+    lines.push(n ? `Balance: ${n} file${n === 1 ? "" : "s"} from Studio changed only in numbers (--commit-balance commits ${n === 1 ? "it" : "them"} alone).` : "Balance: none (no file from Studio changed only in numbers).");
+  }
   return lines.join("\n");
 }
 

@@ -7,6 +7,8 @@ import { execFileSync } from "node:child_process";
 
 import { SyncDaemon } from "../index.js";
 import { STREAK_LIMIT, StudioWrites } from "../fs/studioWrites.js";
+import { commitBalance } from "../changes.js";
+import { changesText } from "../control/commands.js";
 import { config } from "../config.js";
 import { isVersionCompatible } from "../util/versionUtils.js";
 
@@ -2691,6 +2693,87 @@ test("changes: Studio's writes are told from disk edits, kept across a daemon re
     const saved = JSON.parse(fs.readFileSync(path.join(root, ".quack", "studio-writes.json"), "utf8"));
     assert.equal(saved.files["ReplicatedStorage/Config.luau"], undefined, "a committed file is dropped from the record");
     assert.ok(saved.files["ReplicatedStorage/Made.luau"]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("changes: balance lists Studio's numbers-only files, and commitBalance commits exactly those, leaving what is staged as it was", { timeout: 60000 }, async () => {
+  const { root, sync } = changesProject({
+    "ServerStorage/Waves.luau": "return { Hp = 100, Cost = \"1e30\" } -- the boss\n",
+    "ServerStorage/Shop.luau": "return 1\n",
+    "ServerStorage/Draft.luau": "return 1\n",
+    "ServerStorage/Staged.luau": "return 's'\n",
+    "ServerStorage/Code.luau": "return { Hp = 1 }\n",
+    "ServerStorage/[odd] name.luau": "return 1\n",
+  });
+  const file = (rel: string) => path.join(sync, ...rel.split("/"));
+  const names = ["Waves", "Shop", "Draft", "Staged", "Code", "[odd] name"];
+  const edit = (daemon: SyncDaemon, name: string, source: string) =>
+    (daemon as any).handleStudioMessage({ type: "scriptChanged", data: { guid: name, source, path: ["ServerStorage", name], className: "ModuleScript" } });
+  try {
+    await withChangesDaemon(root, sync, async (daemon) => {
+      (daemon as any).handleStudioMessage({
+        type: "fullSnapshot",
+        data: [
+          { guid: "ss", className: "ServerStorage", name: "ServerStorage", parentGuid: "root", path: ["ServerStorage"] },
+          ...names.map((name) => ({ guid: name, className: "ModuleScript", name, parentGuid: "ss", path: ["ServerStorage", name], source: fs.readFileSync(file(`ServerStorage/${name}.luau`), "utf8") })),
+        ],
+      });
+      // The balancer's: numbers (a BigNum string too) tuned in Studio; a glob character in a name
+      edit(daemon, "Waves", "return { Hp = 120, Cost = \"2.5K\" } -- the boss\n");
+      edit(daemon, "[odd] name", "return 2\n");
+      // Studio's numbers, then the disk changed it: mixed, never the balancer's alone
+      edit(daemon, "Shop", "return 2\n");
+      fs.writeFileSync(file("ServerStorage/Shop.luau"), "return 3\n");
+      // Numbers only, but edited on disk: someone's
+      fs.writeFileSync(file("ServerStorage/Draft.luau"), "return 2\n");
+      // Someone's edit, staged: stays staged and out of the commit
+      fs.writeFileSync(file("ServerStorage/Staged.luau"), "return 't'\n");
+      gitIn(root, "add", "sync/ServerStorage/Staged.luau");
+      // Studio's, but more than numbers
+      edit(daemon, "Code", "return { Hp = 1, Fly = true }\n");
+
+      const listed = await changesOf(daemon, { balance: true });
+      assert.deepEqual(listed.balance, ["sync/ServerStorage/Waves.luau", "sync/ServerStorage/[odd] name.luau"].sort());
+      assert.equal(listed.committed, undefined, "listing commits nothing");
+      assert.equal(gitIn(root, "rev-list", "--count", "HEAD").trim(), "1");
+
+      const done = await changesOf(daemon, { commitBalance: true });
+      const head = gitIn(root, "rev-parse", "HEAD").trim();
+      assert.deepEqual([done.committed.sha, done.committed.files, done.committed.unjudged], [head, listed.balance, []]);
+      assert.equal(gitIn(root, "log", "-1", "--format=%s").trim(), "Balance: values tuned in Studio");
+      assert.deepEqual(gitIn(root, "show", "--name-only", "--format=", "HEAD").trim().split("\n").sort(), listed.balance);
+      assert.equal(gitIn(root, "show", "HEAD:sync/ServerStorage/Waves.luau"), "return { Hp = 120, Cost = \"2.5K\" } -- the boss\n");
+      assert.equal(gitIn(root, "diff", "--cached", "--name-only").trim(), "sync/ServerStorage/Staged.luau", "the staged edit is still staged");
+      // The answer is the listing after the commit: the rest is still there, the balance is gone
+      assert.deepEqual(done.balance, []);
+      assert.deepEqual(done.files.map((f: any) => [f.path, f.origin]).sort(), [
+        ["sync/ServerStorage/Code.luau", "studio"], ["sync/ServerStorage/Draft.luau", "other"],
+        ["sync/ServerStorage/Shop.luau", "mixed"], ["sync/ServerStorage/Staged.luau", "other"],
+      ]);
+
+      // Nothing left: no commit
+      const again = await changesOf(daemon, { commitBalance: true });
+      assert.equal(again.committed, null);
+      assert.equal(gitIn(root, "rev-parse", "HEAD").trim(), head);
+
+      // Studio writes again between the judgement and the commit: the commit holds a text nobody
+      // judged, and the answer names it
+      edit(daemon, "Waves", "return { Hp = 150, Cost = \"2.5K\" } -- the boss\n");
+      const raced = await commitBalance(sync, (daemon as any).studioWrites, { beforeCommit: () => edit(daemon, "Waves", "return { Hp = 150, Cost = \"2.5K\", Fly = true } -- the boss\n") });
+      assert.ok(raced.git && raced.committed);
+      assert.deepEqual(raced.committed.unjudged, ["sync/ServerStorage/Waves.luau"]);
+      assert.match(changesText(raced), /changed again after it was judged/);
+
+      // A commit git refuses says git's own reason (the repo's own hooks folder, whatever the
+      // machine's global hooksPath says)
+      gitIn(root, "config", "core.hooksPath", path.join(root, ".git", "hooks"));
+      fs.mkdirSync(path.join(root, ".git", "hooks"), { recursive: true });
+      fs.writeFileSync(path.join(root, ".git", "hooks", "pre-commit"), "#!/bin/sh\necho refused by the hook >&2\nexit 1\n", { mode: 0o755 });
+      edit(daemon, "Waves", "return { Hp = 160, Cost = \"2.5K\", Fly = true } -- the boss\n");
+      await assert.rejects(changesOf(daemon, { commitBalance: true }), /refused by the hook/);
+    });
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

@@ -6,7 +6,10 @@
  * its whole content is one (a BigNum like "1e30", or "2.54K" with a magnitude suffix).
  */
 
-const NUMBER_TEXT = /^-?(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|(?:\d[\d_]*(?:\.[\d_]*)?|\.\d[\d_]*)(?:[eE][+-]?\d[\d_]*)?)$/;
+/** The subject of the commit that holds the balancer's numbers alone (`changes --commit-balance`) */
+export const BALANCE_SUBJECT = "Balance: values tuned in Studio";
+
+const NUMBER_TEXT =/^-?(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|(?:\d[\d_]*(?:\.[\d_]*)?|\.\d[\d_]*)(?:[eE][+-]?\d[\d_]*)?)$/;
 // A number with a magnitude suffix ("2.54ζT", "8.25βD", "1.5K"): the balancer moves the suffix as
 // often as the digits
 const SUFFIXED_NUMBER = /^-?(?:\d[\d_]*(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d[\d_]*)?\p{L}{1,4}$/u;
