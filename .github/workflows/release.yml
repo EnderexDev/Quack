@@ -112,6 +112,7 @@ jobs:
             gh release create "v${version}" release-out/* --draft --target "$GITHUB_SHA" \
               --title "Quack ${version} (draft)" --notes "Test build of ${GITHUB_SHA}."
           else
+            node scripts/changelog.mjs notes "${version}" > release-notes.md
             gh release create "v${version}" release-out/* --verify-tag --latest \
-              --title "Quack ${version}" --notes "Quack ${version}."
+              --title "Quack ${version}" --notes-file release-notes.md
           fi
