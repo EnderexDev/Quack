@@ -92,22 +92,36 @@ function searchRoot(resolved: string): boolean {
 function globMatches(glob: string, target: string): boolean {
   const g = glob.toLowerCase();
   const s = target.toLowerCase();
+  // Where each [ closes, in one pass from the end (an unclosed [ is a plain character)
+  const closeAt: number[] = new Array(g.length).fill(-1);
+  for (let i = g.length - 1, close = -1; i >= 0; i--) {
+    closeAt[i] = close;
+    if (g[i] === "]") close = i;
+  }
   const tokens: string[] = [];
   for (let i = 0; i < g.length; ) {
     if (g.startsWith("**", i)) {
-      tokens.push("**");
       while (g[i] === "*") i++;
-    } else if (g[i] === "[") {
-      const close = g.indexOf("]", i + 1);
+      // **/ is zero or more whole folders: quack/**/open-cloud.key matches quack/open-cloud.key
+      if (g[i] === "/") {
+        tokens.push("**/");
+        i++;
+      } else tokens.push("**");
+    } else if (g[i] === "[" && closeAt[i] >= 0) {
       tokens.push("?");
-      i = close < 0 ? i + 1 : close + 1;
+      i = closeAt[i] + 1;
     } else tokens.push(g[i++]);
   }
   let row: boolean[] = Array.from({ length: s.length + 1 }, (_, j) => j === 0);
   for (const token of tokens) {
     const next: boolean[] = new Array(s.length + 1).fill(false);
+    let before = false;
     for (let j = 0; j <= s.length; j++) {
-      if (token === "**") next[j] = row[j] || (j > 0 && next[j - 1]);
+      if (token === "**/") {
+        // nothing, or anything that ends at a folder's slash
+        next[j] = row[j] || (j > 0 && s[j - 1] === "/" && before);
+        before = before || row[j];
+      } else if (token === "**") next[j] = row[j] || (j > 0 && next[j - 1]);
       else if (token === "*") next[j] = row[j] || (j > 0 && s[j - 1] !== "/" && next[j - 1]);
       else if (j > 0 && row[j - 1]) next[j] = token === "?" ? s[j - 1] !== "/" : token === s[j - 1];
     }
@@ -120,15 +134,32 @@ function globMatches(glob: string, target: string): boolean {
 /** Quack's own files under a user's folder: the vault (and its old plain-text file), both tokens */
 const QUACK_FILES = ["quack/open-cloud.key", "quack/open-cloud.env", "dev.enderex.quack/approval-token.dpapi", "dev.enderex.quack.dev/approval-token.dpapi"];
 
-/** A resolved wildcard path that can match one of Quack's files, for this user or the one it names */
-function reachesQuackFile(resolved: string): boolean {
+/** The Roaming folders a resolved path can mean: this user's, and the one the path names */
+function roamingsOf(resolved: string): string[] {
   const roamings = new Set([slashes(ROAMING).replace(/\/+$/, "")]);
   const named = /^([A-Za-z]:\/+Users\/+[^/*?[]+)/i.exec(resolved);
   if (named) roamings.add(`${named[1]}/AppData/Roaming`);
-  return [...roamings].some((roaming) => QUACK_FILES.some((file) => globMatches(resolved, `${roaming}/${file}`)));
+  return [...roamings];
 }
 
-const SEARCH_WORDS = new Set(["rg", "ag", "ack", "findstr", "select-string", "sls", "--recursive", "/s"]);
+/** A resolved wildcard path that can match one of Quack's files, for this user or the one it names */
+function reachesQuackFile(resolved: string): boolean {
+  return roamingsOf(resolved).some((roaming) => QUACK_FILES.some((file) => globMatches(resolved, `${roaming}/${file}`)));
+}
+
+/**
+ * A resolved wildcard path that can match a folder holding Quack's files (quack, qua?k,
+ * Roaming/*, App*): read by a recursive command (cp -r, tar, Copy-Item -Recurse), it carries them
+ */
+function reachesQuackFolder(resolved: string): boolean {
+  return roamingsOf(resolved).some((roaming) => {
+    const folders = [roaming, roaming.replace(/\/[^/]+$/, ""), roaming.replace(/\/[^/]+\/[^/]+$/, ""), ...QUACK_FILES.map((f) => `${roaming}/${f.split("/")[0]}`)];
+    return folders.some((folder) => globMatches(resolved, folder));
+  });
+}
+
+// Search tools, and the commands that carry a whole folder (an archive, a mirror copy)
+const SEARCH_WORDS = new Set(["rg", "ag", "ack", "findstr", "select-string", "sls", "--recursive", "/s", "tar", "zip", "7z", "7za", "rar", "robocopy", "xcopy", "rsync", "scp", "compress-archive"]);
 /**
  * A word that makes its command read every file under a folder: a search tool, or a recursive
  * flag (grep -rn, cp -R, PowerShell's -r, -rec, -Recurse). Short flags only (up to four letters),
@@ -204,7 +235,12 @@ function checkCommand(command: string, cwd: string): GuardBlock | undefined {
     // A wildcard, resolved where it runs, must not match one of Quack's own files (quack*/*,
     // ~/AppDat?/Roaming/quack/*, cat * inside quack). Any other one passes: /* in a code comment,
     // a search pattern like AppData.*, ~/AppData/Local/Roblox/logs/*.log
-    if (GLOB.test(word) && reachesQuackFile(resolveWord(word, folderAt[i]))) return blocked;
+    if (GLOB.test(word)) {
+      const resolved = resolveWord(word, folderAt[i]);
+      if (reachesQuackFile(resolved)) return blocked;
+      // A wildcard naming a folder that holds them counts as that folder for a recursive command
+      if (reachesQuackFolder(resolved)) rootWord = true;
+    }
   }
   // A recursive search from Quack's folders or above them (rg . C:/Users/ana/AppData/Roaming/x/..,
   // or rg . run from Roaming)

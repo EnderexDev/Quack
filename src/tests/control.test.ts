@@ -614,6 +614,13 @@ test("Quack's guard refuses the vault, the approval token, DPAPI, the vault's co
     ["Bash", { command: "cat ~/App*/Roaming/quack/open*" }],
     ["Bash", { command: "cat C:/Users/*/AppData/Roaming/dev.enderex.quack*/*" }],
     ["Bash", { command: "rg KEY ~/**/quack/*.env" }],
+    // ** is zero or more folders; a wildcard naming the folder carries the files to a recursive
+    // copy or an archive
+    ["Bash", { command: "cat $APPDATA/quack/**/open-clou?.key" }],
+    ["PowerShell", { command: "Copy-Item -Recurse $env:APPDATA/qua?k ./dump" }],
+    ["Bash", { command: "cp -r ~/AppData/Roaming/quack* /tmp/x" }],
+    ["Bash", { command: "tar czf x.tgz ~/AppData/Roaming/*" }],
+    ["Bash", { command: "tar czf q.tgz ~/AppData/Roaming/quack" }],
     ["PowerShell", { command: "Get-Content C:\\Users\\ana\\AppData\\Roaming\\quack\\*" }],
     ["PowerShell", { command: "Get-Content $env:APPDATA\\quack\\*" }],
     ["PowerShell", { command: "powershell -enc cABvAHcAZQByAHMAaABlAGwAbAAgAC0AZQBuAGMAIABXAHcAQgBUAEEARwBVAEEAWQB3AEIAMQBBAEgASQBBAGEAUQBCADAAQQBIAGsAQQBMAGcAQgBEAEEASABJAEEAZQBRAEIAdwBBAEgAUQBBAGIAdwBCAG4AQQBIAEkAQQBZAFEAQgB3AEEARwBnAEEAZQBRAEEAdQBBAEYAQQBBAGMAZwBCAHYAQQBIAFEAQQBaAFEAQgBqAEEASABRAEEAWgBRAEIAawBBAEUAUQBBAFkAUQBCADAAQQBHAEUAQQBYAFEAQQA2AEEARABvAEEAVgBRAEIAdQBBAEgAQQBBAGMAZwBCAHYAQQBIAFEAQQBaAFEAQgBqAEEASABRAEEASwBBAEEAawBBAEcASQBBAEwAQQBBAGsAQQBHAFUAQQBMAEEAQQBuAEEARQBNAEEAZABRAEIAeQBBAEgASQBBAFoAUQBCAHUAQQBIAFEAQQBWAFEAQgB6AEEARwBVAEEAYwBnAEEAbgBBAEMAawBBAA==" }],
@@ -653,6 +660,9 @@ test("Quack's guard refuses the vault, the approval token, DPAPI, the vault's co
     ["Bash", { command: "git commit -m \"the root /* is no wildcard here\"" }],
     ["Bash", { command: "ls ~/* /*" }],
     ["Bash", { command: "cat ~/AppData/Roaming/Code/User/*.json" }],
+    ["Bash", { command: "tar xzf build.tgz -C dist" }],
+    ["Bash", { command: "cp -r src/* dist" }],
+    ["Bash", { command: "zip -r out.zip src" }],
     ["PowerShell", { command: "powershell -EncodedCommand RwBlAHQALQBQAHIAbwBjAGUAcwBzACAAcQB1AGEAYwBrAC0AYQBwAHAA" }],
   ];
   for (const [tool, input] of blocked) assert.ok(checkTool(tool, input), `${tool} ${JSON.stringify(input)} should be blocked`);
@@ -675,6 +685,7 @@ test("Quack's guard refuses the vault, the approval token, DPAPI, the vault's co
     (n: number) => "approval-token".repeat(n),
     (n: number) => `rg x ${"/.".repeat(n)}x`,
     (n: number) => "-r ".repeat(n) + "x",
+    (n: number) => "cat " + "[".repeat(n),
   ];
   const timeOf = (command: string) => {
     let best = Infinity;
