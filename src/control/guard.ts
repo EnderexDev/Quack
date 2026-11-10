@@ -207,45 +207,59 @@ function normalizeWord(word: string): string {
 }
 
 function checkCommand(command: string, cwd: string): GuardBlock | undefined {
-  // An option's value glued to it (-Path:$env:APPDATA/quack, --dir=~/AppData) is a word too
-  const words = command.split(/[\s"'`;|&()<>,]+/).filter(Boolean)
-    .flatMap((w) => {
-      const glued = /^-{1,2}[A-Za-z][\w-]*[:=](.+)$/.exec(w);
-      return glued ? [w, glued[1]] : [w];
-    })
-    .map(normalizeWord);
-  for (const word of words) {
-    const hit = fileHit(word);
+  const words = command.split(/[\s"'`;|&()<>,]+/).filter(Boolean).map(normalizeWord);
+  // An option's value glued to it (-Path:$env:APPDATA/quack, --dir=~/AppData) is checked as a
+  // path where its option stands, never read as a command or a cd of its own
+  const glued = words.map((w) => /^-{1,2}[A-Za-z][\w-]*[:=](.+)$/.exec(w)?.[1]);
+  for (const value of [...words, ...glued]) {
+    const hit = value === undefined ? undefined : fileHit(value);
     if (hit) return hit;
   }
   const blocked = { id: "quack-data-search", reason: SEARCH_REASON };
-  // The folder each word runs in: the session's, then each cd's target (cd $env:APPDATA\quack; cat *)
+  // The folder each word runs in: the session's, then each cd's target (cd $env:APPDATA\quack;
+  // cat *). The target is the first word after cd that is not an option, or the value of
+  // -Path / -LiteralPath, glued (-Path:x) or not (-Path x)
   const folderAt: string[] = [];
   let here = slashes(path.resolve(cwd));
   for (let i = 0; i < words.length; i++) {
     folderAt.push(here);
-    if (CHANGE_DIR.has(words[i].toLowerCase()) && i + 1 < words.length && !isOption(words[i + 1])) here = resolveWord(words[i + 1], here);
+    if (!CHANGE_DIR.has(words[i].toLowerCase())) continue;
+    for (let j = i + 1; j < words.length && j <= i + 4; j++) {
+      const isPath = /^-(?:literal)?path(?:[:=]|$)/i.test(words[j]);
+      if (isPath && glued[j] !== undefined) {
+        here = resolveWord(glued[j]!, here);
+        break;
+      }
+      if (isPath && j + 1 < words.length) {
+        here = resolveWord(words[j + 1], here);
+        break;
+      }
+      if (!isOption(words[j])) {
+        here = resolveWord(words[j], here);
+        break;
+      }
+    }
   }
   let recursive = false;
   let rootWord = false;
   for (let i = 0; i < words.length; i++) {
-    const word = words[i];
     // A recursive search reads from the folder it runs in, or from a word naming one
-    if (recursiveWord(word)) {
+    if (recursiveWord(words[i])) {
       recursive = true;
       if (searchRoot(folderAt[i])) rootWord = true;
     }
-    if (isOption(word)) continue;
-    const where = resolveWord(word, folderAt[i]);
-    if (searchRoot(where)) rootWord = true;
-    // A wildcard, resolved where it runs, must not match one of Quack's own files (quack*/*,
-    // ~/AppDat?/Roaming/quack/*, cat * inside quack). Any other one passes: /* in a code comment,
-    // a search pattern like AppData.*, ~/AppData/Local/Roblox/logs/*.log
-    if (GLOB.test(word)) {
-      const resolved = resolveWord(word, folderAt[i]);
-      if (reachesQuackFile(resolved)) return blocked;
-      // A wildcard naming a folder that holds them counts as that folder for a recursive command
-      if (reachesQuackFolder(resolved)) rootWord = true;
+    for (const word of [isOption(words[i]) ? undefined : words[i], glued[i]]) {
+      if (word === undefined) continue;
+      if (searchRoot(resolveWord(word, folderAt[i]))) rootWord = true;
+      // A wildcard, resolved where it runs, must not match one of Quack's own files (quack*/*,
+      // ~/AppDat?/Roaming/quack/*, cat * inside quack). Any other one passes: /* in a code
+      // comment, a search pattern like AppData.*, ~/AppData/Local/Roblox/logs/*.log
+      if (GLOB.test(word)) {
+        const resolved = resolveWord(word, folderAt[i]);
+        if (reachesQuackFile(resolved)) return blocked;
+        // A wildcard naming a folder that holds them counts as that folder for a recursive command
+        if (reachesQuackFolder(resolved)) rootWord = true;
+      }
     }
   }
   // A recursive search from Quack's folders or above them (rg . C:/Users/ana/AppData/Roaming/x/..,
