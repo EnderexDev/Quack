@@ -207,7 +207,13 @@ function normalizeWord(word: string): string {
 }
 
 function checkCommand(command: string, cwd: string): GuardBlock | undefined {
-  const words = command.split(/[\s"'`;|&()<>,]+/).filter(Boolean).map(normalizeWord);
+  // An option's value glued to it (-Path:$env:APPDATA/quack, --dir=~/AppData) is a word too
+  const words = command.split(/[\s"'`;|&()<>,]+/).filter(Boolean)
+    .flatMap((w) => {
+      const glued = /^-{1,2}[A-Za-z][\w-]*[:=](.+)$/.exec(w);
+      return glued ? [w, glued[1]] : [w];
+    })
+    .map(normalizeWord);
   for (const word of words) {
     const hit = fileHit(word);
     if (hit) return hit;

@@ -618,6 +618,10 @@ test("Quack's guard refuses the vault, the approval token, DPAPI, the vault's co
     // copy or an archive
     ["Bash", { command: "cat $APPDATA/quack/**/open-clou?.key" }],
     ["PowerShell", { command: "Copy-Item -Recurse $env:APPDATA/qua?k ./dump" }],
+    // A value glued to its option is read too
+    ["PowerShell", { command: "Copy-Item -Recurse -Path:$env:APPDATA/qua?k ./dump" }],
+    ["Bash", { command: "rg --hidden --files-from=x . --path-separator=/ --pre=cat --glob=* --type-add=x:* --iglob=* --search-zip -e x --max-depth=9 --follow --no-ignore --dir=~/AppData/Roaming/quack" }],
+    ["PowerShell", { command: "Get-Content -Path:C:\\Users\\ana\\AppData\\Roaming\\quack\\open-cloud.key" }],
     ["Bash", { command: "cp -r ~/AppData/Roaming/quack* /tmp/x" }],
     ["Bash", { command: "tar czf x.tgz ~/AppData/Roaming/*" }],
     ["Bash", { command: "tar czf q.tgz ~/AppData/Roaming/quack" }],
