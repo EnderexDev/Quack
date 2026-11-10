@@ -611,7 +611,11 @@ test("Quack's guard refuses the vault, the approval token, DPAPI, the vault's co
     ["PowerShell", { command: "Get-ChildItem $env:APPDATA -rec | Get-Content" }],
     ["PowerShell", { command: "C:\\tools\\rg.exe --hidden --no-ignore . C:\\Users\\ana\\AppData\\Roaming" }],
     ["Bash", { command: "cat C:/Users/ana/AppDat?/Roaming/quack/*" }],
-    ["Bash", { command: "cat ~/App*/Roaming/x" }],
+    ["Bash", { command: "cat ~/App*/Roaming/quack/open*" }],
+    ["Bash", { command: "cat C:/Users/*/AppData/Roaming/dev.enderex.quack*/*" }],
+    ["Bash", { command: "rg KEY ~/**/quack/*.env" }],
+    ["PowerShell", { command: "Get-Content C:\\Users\\ana\\AppData\\Roaming\\quack\\*" }],
+    ["PowerShell", { command: "Get-Content $env:APPDATA\\quack\\*" }],
     ["PowerShell", { command: "powershell -enc cABvAHcAZQByAHMAaABlAGwAbAAgAC0AZQBuAGMAIABXAHcAQgBUAEEARwBVAEEAWQB3AEIAMQBBAEgASQBBAGEAUQBCADAAQQBIAGsAQQBMAGcAQgBEAEEASABJAEEAZQBRAEIAdwBBAEgAUQBBAGIAdwBCAG4AQQBIAEkAQQBZAFEAQgB3AEEARwBnAEEAZQBRAEEAdQBBAEYAQQBBAGMAZwBCAHYAQQBIAFEAQQBaAFEAQgBqAEEASABRAEEAWgBRAEIAawBBAEUAUQBBAFkAUQBCADAAQQBHAEUAQQBYAFEAQQA2AEEARABvAEEAVgBRAEIAdQBBAEgAQQBBAGMAZwBCAHYAQQBIAFEAQQBaAFEAQgBqAEEASABRAEEASwBBAEEAawBBAEcASQBBAEwAQQBBAGsAQQBHAFUAQQBMAEEAQQBuAEEARQBNAEEAZABRAEIAeQBBAEgASQBBAFoAUQBCAHUAQQBIAFEAQQBWAFEAQgB6AEEARwBVAEEAYwBnAEEAbgBBAEMAawBBAA==" }],
   ];
   const allowed: [string, Record<string, unknown>][] = [
@@ -641,6 +645,14 @@ test("Quack's guard refuses the vault, the approval token, DPAPI, the vault's co
     ["Bash", { command: "cmd /c dir /s src" }],
     ["PowerShell", { command: "Remove-Item dist -Force -ErrorAction SilentlyContinue" }],
     ["Bash", { command: "ls ~/AppData/Local/Roblox/logs/*.log" }],
+    // An escaped wildcard is literal text, never the root "/*" (it blocked a real session, 10/11/26)
+    ["Bash", { command: "head -30 x.mjs | grep -E \"^//|^ \\*|spawn|import\"" }],
+    ["Bash", { command: "grep -n \"a\\?b\" src/x.ts" }],
+    // A wildcard that cannot reach Quack's files: a code comment, the root, a home's top folder
+    ["Bash", { command: "cat > x.js <<'EOF'\n/* a comment */\nconst a = 1;\nEOF" }],
+    ["Bash", { command: "git commit -m \"the root /* is no wildcard here\"" }],
+    ["Bash", { command: "ls ~/* /*" }],
+    ["Bash", { command: "cat ~/AppData/Roaming/Code/User/*.json" }],
     ["PowerShell", { command: "powershell -EncodedCommand RwBlAHQALQBQAHIAbwBjAGUAcwBzACAAcQB1AGEAYwBrAC0AYQBwAHAA" }],
   ];
   for (const [tool, input] of blocked) assert.ok(checkTool(tool, input), `${tool} ${JSON.stringify(input)} should be blocked`);

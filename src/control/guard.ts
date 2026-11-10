@@ -84,8 +84,49 @@ function searchRoot(resolved: string): boolean {
   return /\/AppData\/+Roaming\/+(?:quack|dev\.enderex\.quack(?:\.dev)?)$/i.test(w) || same(path.join(ROAMING, "quack"));
 }
 
-/** Inside Roaming (where both folders live), resolved */
-const inRoaming = (resolved: string) => /\/AppData\/+Roaming(?:\/|$)/i.test(resolved) || resolved.toLowerCase().startsWith(slashes(ROAMING).toLowerCase());
+/**
+ * Whether a wildcard path can match a file of the given path: * and ? stay inside one folder,
+ * ** crosses folders, [..] is one character. Dynamic programming over the two strings, so a
+ * long pattern costs its length times the path's (a protected path is under 100 characters).
+ */
+function globMatches(glob: string, target: string): boolean {
+  const g = glob.toLowerCase();
+  const s = target.toLowerCase();
+  const tokens: string[] = [];
+  for (let i = 0; i < g.length; ) {
+    if (g.startsWith("**", i)) {
+      tokens.push("**");
+      while (g[i] === "*") i++;
+    } else if (g[i] === "[") {
+      const close = g.indexOf("]", i + 1);
+      tokens.push("?");
+      i = close < 0 ? i + 1 : close + 1;
+    } else tokens.push(g[i++]);
+  }
+  let row: boolean[] = Array.from({ length: s.length + 1 }, (_, j) => j === 0);
+  for (const token of tokens) {
+    const next: boolean[] = new Array(s.length + 1).fill(false);
+    for (let j = 0; j <= s.length; j++) {
+      if (token === "**") next[j] = row[j] || (j > 0 && next[j - 1]);
+      else if (token === "*") next[j] = row[j] || (j > 0 && s[j - 1] !== "/" && next[j - 1]);
+      else if (j > 0 && row[j - 1]) next[j] = token === "?" ? s[j - 1] !== "/" : token === s[j - 1];
+    }
+    row = next;
+    if (!row.includes(true)) return false;
+  }
+  return row[s.length];
+}
+
+/** Quack's own files under a user's folder: the vault (and its old plain-text file), both tokens */
+const QUACK_FILES = ["quack/open-cloud.key", "quack/open-cloud.env", "dev.enderex.quack/approval-token.dpapi", "dev.enderex.quack.dev/approval-token.dpapi"];
+
+/** A resolved wildcard path that can match one of Quack's files, for this user or the one it names */
+function reachesQuackFile(resolved: string): boolean {
+  const roamings = new Set([slashes(ROAMING).replace(/\/+$/, "")]);
+  const named = /^([A-Za-z]:\/+Users\/+[^/*?[]+)/i.exec(resolved);
+  if (named) roamings.add(`${named[1]}/AppData/Roaming`);
+  return [...roamings].some((roaming) => QUACK_FILES.some((file) => globMatches(resolved, `${roaming}/${file}`)));
+}
 
 const SEARCH_WORDS = new Set(["rg", "ag", "ack", "findstr", "select-string", "sls", "--recursive", "/s"]);
 /**
@@ -124,8 +165,18 @@ function withDecoded(command: string, depth = 0): string[] {
   return all;
 }
 
+/**
+ * A word with "/" for "\". A "\" before a wildcard escapes it (grep "a\*b", a shell's \?), so
+ * that wildcard is no wildcard: it never becomes "/*", the root. Only a word that starts as a
+ * Windows path (C:\, \\server, $env:, %APPDATA%) keeps "\*" as a folder and a wildcard.
+ */
+function normalizeWord(word: string): string {
+  if (/^(?:[A-Za-z]:|\\\\|\$env:|%)/i.test(word)) return slashes(word);
+  return slashes(word.replace(/\\[*?[]/g, "\u0001"));
+}
+
 function checkCommand(command: string, cwd: string): GuardBlock | undefined {
-  const words = command.split(/[\s"'`;|&()<>,]+/).filter(Boolean).map(slashes);
+  const words = command.split(/[\s"'`;|&()<>,]+/).filter(Boolean).map(normalizeWord);
   for (const word of words) {
     const hit = fileHit(word);
     if (hit) return hit;
@@ -150,14 +201,10 @@ function checkCommand(command: string, cwd: string): GuardBlock | undefined {
     if (isOption(word)) continue;
     const where = resolveWord(word, folderAt[i]);
     if (searchRoot(where)) rootWord = true;
-    // A wildcard: the folder before its first wildcard, resolved where it runs, must not be
-    // Quack's, inside Roaming, or above it (quack*/*, App*/Roaming, ~/AppDat?/x). A search
-    // pattern like AppData.* resolves inside the folder the command runs in, so it passes there
-    const star = word.search(GLOB);
-    if (star >= 0) {
-      const folder = resolveWord(word.slice(0, word.lastIndexOf("/", star) + 1) || ".", folderAt[i]);
-      if (searchRoot(folder) || inRoaming(folder)) return blocked;
-    }
+    // A wildcard, resolved where it runs, must not match one of Quack's own files (quack*/*,
+    // ~/AppDat?/Roaming/quack/*, cat * inside quack). Any other one passes: /* in a code comment,
+    // a search pattern like AppData.*, ~/AppData/Local/Roblox/logs/*.log
+    if (GLOB.test(word) && reachesQuackFile(resolveWord(word, folderAt[i]))) return blocked;
   }
   // A recursive search from Quack's folders or above them (rg . C:/Users/ana/AppData/Roaming/x/..,
   // or rg . run from Roaming)
