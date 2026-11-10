@@ -6,10 +6,15 @@ import { CLIENTS, connectClients, defaultClientsEnv, listClients, serverName, ty
 import { HubClient, HubError, HubOffline, type FlavorInfo } from "./hubClient.js";
 import { PLAY_TAB_HINT } from "../play/overlay.js";
 import { rule, rulePrompt } from "./rule.js";
+import { summaryText } from "../util/rbxl.js";
+import { liveCommand } from "./live.js";
 import {
   assetDetails, assetThumbnail, detailsText, docsText, imageIdLua, rememberImageId, RobloxError, robloxDocs, robloxEnv, searchAssets, searchText,
-  uploadAsset, type RobloxEnv, cloudSettings, saveCloudSettings,
+  type RobloxEnv, cloudSettings, saveCloudSettings, versionsText,
 } from "./roblox.js";
+import { BADGE_COST } from "../cloud/economy.js";
+import { lintTranslations, LOC_TABLE_MAX } from "../cloud/localization.js";
+import { ANALYTICS_KINDS, defaultAnalyticsBody } from "../cloud/analytics.js";
 
 /**
  * `quack` / `quackdev`: the hub from a terminal. Every command is one or a few calls to the
@@ -119,6 +124,10 @@ interface Options {
   message?: string;
   condition?: string;
   parent?: string;
+  /** import: items of the file to keep */
+  paths?: string;
+  /** import: let a place file's scripts land */
+  scripts: boolean;
   /** A multiplayer test: which player's client; and how many players a start makes */
   player?: string;
   players?: string;
@@ -133,6 +142,8 @@ interface Options {
   outbound?: string;
   close?: string;
   closeEdited: boolean;
+  /** changes: which of Studio's files differ from the commit only in numbers */
+  numbersOnly: boolean;
   devices?: string;
   /** rule: the rule with how an AI installs or updates it (what the app copies) */
   prompt: boolean;
@@ -155,6 +166,70 @@ interface Options {
   plugin: boolean;
   mode?: string;
   sort?: string;
+  /** place, selection, generate, micro */
+  version?: string;
+  page?: string;
+  open: boolean;
+  from?: string;
+  angle?: string;
+  padding?: string;
+  frames?: string;
+  gpu: boolean;
+  includeIdle: boolean;
+  image?: string;
+  triangles?: string;
+  noTextures: boolean;
+  schema?: string;
+  groups?: string;
+  /** datastore, config */
+  universe?: string;
+  prefix?: string;
+  scope?: string;
+  allScopes: boolean;
+  fields?: string;
+  value?: string;
+  by?: string;
+  start?: string;
+  end?: string;
+  oldestFirst: boolean;
+  keys?: string;
+  repository?: string;
+  /** find in a live DataModel, move */
+  attr?: string;
+  tag?: string;
+  exact: boolean;
+  radius?: string;
+  /** Open Cloud: badge, product, gamepass, loc, analytics */
+  spend: boolean;
+  price?: string;
+  forSale?: string;
+  icon?: string;
+  dryRun: boolean;
+  body?: string;
+  kind?: string;
+  locales?: string;
+  unchecked: boolean;
+  // Open Cloud on a live game (src/cloud)
+  places?: string;
+  bleed?: string;
+  amount?: string;
+  ttl?: string;
+  sortKey?: string;
+  priority?: string;
+  count?: string;
+  invisible?: string;
+  min?: string;
+  max?: string;
+  inPlace?: string;
+  reason?: string;
+  display?: string;
+  allVersions: boolean;
+  allOrNothing: boolean;
+  test: boolean;
+  descending: boolean;
+  ascending: boolean;
+  upsert: boolean;
+  keepAlts: boolean;
 }
 
 function parse(argv: string[]): { command?: string; args: string[]; options: Options } {
@@ -218,6 +293,8 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       message: { type: "string" },
       condition: { type: "string" },
       parent: { type: "string" },
+      paths: { type: "string" },
+      scripts: { type: "boolean" },
       player: { type: "string" },
       players: { type: "string" },
       all: { type: "boolean" },
@@ -230,6 +307,7 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       outbound: { type: "string" },
       close: { type: "string" },
       "close-edited": { type: "boolean" },
+      "numbers-only": { type: "boolean" },
       devices: { type: "string" },
       prompt: { type: "boolean" },
       "key-stdin": { type: "boolean" },
@@ -249,6 +327,65 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       plugin: { type: "boolean" },
       mode: { type: "string" },
       sort: { type: "string" },
+      version: { type: "string" },
+      page: { type: "string" },
+      open: { type: "boolean" },
+      from: { type: "string" },
+      angle: { type: "string" },
+      padding: { type: "string" },
+      frames: { type: "string" },
+      gpu: { type: "boolean" },
+      "include-idle": { type: "boolean" },
+      image: { type: "string" },
+      triangles: { type: "string" },
+      "no-textures": { type: "boolean" },
+      schema: { type: "string" },
+      groups: { type: "string" },
+      universe: { type: "string" },
+      prefix: { type: "string" },
+      scope: { type: "string" },
+      "all-scopes": { type: "boolean" },
+      fields: { type: "string" },
+      value: { type: "string" },
+      by: { type: "string" },
+      start: { type: "string" },
+      end: { type: "string" },
+      "oldest-first": { type: "boolean" },
+      keys: { type: "string" },
+      repository: { type: "string" },
+      attr: { type: "string" },
+      tag: { type: "string" },
+      exact: { type: "boolean" },
+      radius: { type: "string" },
+      spend: { type: "boolean" },
+      price: { type: "string" },
+      "for-sale": { type: "string" },
+      icon: { type: "string" },
+      "dry-run": { type: "boolean" },
+      body: { type: "string" },
+      kind: { type: "string" },
+      locales: { type: "string" },
+      unchecked: { type: "boolean" },
+      places: { type: "string" },
+      bleed: { type: "string" },
+      amount: { type: "string" },
+      ttl: { type: "string" },
+      "sort-key": { type: "string" },
+      priority: { type: "string" },
+      count: { type: "string" },
+      invisible: { type: "string" },
+      min: { type: "string" },
+      max: { type: "string" },
+      "in-place": { type: "string" },
+      reason: { type: "string" },
+      display: { type: "string" },
+      "all-versions": { type: "boolean" },
+      "all-or-nothing": { type: "boolean" },
+      test: { type: "boolean" },
+      descending: { type: "boolean" },
+      ascending: { type: "boolean" },
+      upsert: { type: "boolean" },
+      "keep-alts": { type: "boolean" },
     },
   });
   const number = (name: "idle" | "timeout"): number | undefined => {
@@ -317,6 +454,8 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       message: values.message,
       condition: values.condition,
       parent: values.parent,
+      paths: values.paths,
+      scripts: values.scripts === true,
       player: values.player,
       players: values.players,
       all: values.all === true,
@@ -329,6 +468,7 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       outbound: values.outbound,
       close: values.close,
       closeEdited: values["close-edited"] === true,
+      numbersOnly: values["numbers-only"] === true,
       devices: values.devices,
       prompt: values.prompt === true,
       keyStdin: values["key-stdin"] === true,
@@ -348,6 +488,65 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       plugin: values.plugin === true,
       mode: values.mode,
       sort: values.sort,
+      version: values.version,
+      page: values.page,
+      open: values.open === true,
+      from: values.from,
+      angle: values.angle,
+      padding: values.padding,
+      frames: values.frames,
+      gpu: values.gpu === true,
+      includeIdle: values["include-idle"] === true,
+      image: values.image,
+      triangles: values.triangles,
+      noTextures: values["no-textures"] === true,
+      schema: values.schema,
+      groups: values.groups,
+      universe: values.universe,
+      prefix: values.prefix,
+      scope: values.scope,
+      allScopes: values["all-scopes"] === true,
+      fields: values.fields,
+      value: values.value,
+      by: values.by,
+      start: values.start,
+      end: values.end,
+      oldestFirst: values["oldest-first"] === true,
+      keys: values.keys,
+      repository: values.repository,
+      attr: values.attr,
+      tag: values.tag,
+      exact: values.exact === true,
+      radius: values.radius,
+      spend: values.spend === true,
+      price: values.price,
+      forSale: values["for-sale"],
+      icon: values.icon,
+      dryRun: values["dry-run"] === true,
+      body: values.body,
+      kind: values.kind,
+      locales: values.locales,
+      unchecked: values.unchecked === true,
+      places: values["places"],
+      bleed: values["bleed"],
+      amount: values["amount"],
+      ttl: values["ttl"],
+      sortKey: values["sort-key"],
+      priority: values["priority"],
+      count: values["count"],
+      invisible: values["invisible"],
+      min: values["min"],
+      max: values["max"],
+      inPlace: values["in-place"],
+      reason: values["reason"],
+      display: values["display"],
+      allVersions: values["all-versions"] === true,
+      allOrNothing: values["all-or-nothing"] === true,
+      test: values["test"] === true,
+      descending: values["descending"] === true,
+      ascending: values["ascending"] === true,
+      upsert: values["upsert"] === true,
+      keepAlts: values["keep-alts"] === true,
     },
   };
 }
@@ -423,19 +622,38 @@ Studio (through the ${info.appName} plugin; the code goes as --code=<luau> or --
   verify [place] [--files <a,b>]   Whether Studio holds each synced script's disk text, in its
                             .Source and in an open tab (the text a play copies); the files
                             are paths from the sync folder (default every script)
+  changes [place] [--numbers-only]   The files git sees as changed in the sync folder, each
+                            marked: studio (Studio wrote it, untouched since), mixed (Studio
+                            wrote it and something else changed it too) or other (not from
+                            Studio). --numbers-only also says which of Studio's differ from the
+                            commit only in numbers. Commits nothing
   logpoint add|remove <file> | --path=<path> --line <n> [place] [--message=<luau values>] [--condition=<luau>]
   logpoint list|clear [place]
                             A script line that prints values each time it runs in the play, with
                             no edit to the script (needs Studio's beta "Studio Debugger Luau API")
   export <path>[,<path>...] [place] [--out <file.rbxm>]   Instances saved as an .rbxm file
-  import <file.rbxm> [place] [--parent <path>]   An .rbxm's instances put in the place (edit
-                            mode, default under Workspace); their scripts sync to disk
+  import <file.rbxm|.rbxl> [place] [--parent <path>] [--paths <a,b>] [--scripts] [--list]
+                            A model's or a place file's instances put in the place (edit mode,
+                            a model under Workspace by default); their scripts sync to disk.
+                            --paths keeps only those items of the file, each put back in its
+                            own parent (Workspace.MapA, StarterGui.Shop); a whole place lands
+                            under ServerStorage as Folders. A place's scripts land only with
+                            --scripts; --list reads the file and calls no Studio
   perf [place] [--seconds <s>] [--peer server|client]
                             A few seconds of the play's performance in both peers: fps, frame
                             times p50 / p90 / p99 / max, hitches over 50 ms, memory by tag
   find [place] [--name <pattern>] [--class <A,B>] [--under <path>] [--limit <n>]
                             Instances of the synced tree (edit mode, as of the last sync) by
                             name (* and ?), class and where; scripts with their file
+      --peer server|client|edit   a live DataModel instead (a running play's, or Studio in
+                            edit mode): classes by IsA (--exact: the ClassName), also
+                            --attr <name>[=<value>] and --tag <tag>; --limit defaults to 50
+  move <path> [place] | move [place] --at=<x>,<y>,<z> [--mode teleport|walk|path] [--timeout <s>]
+       [--radius <studs>] [--peer server|client]
+                            The player's character in a running play teleported onto a part,
+                            model or attachment (or its feet to a position), or walked there
+                            (path: PathfindingService) until it arrives, gets no closer for
+                            2 s, or --timeout (default 15)
   inspect <path> [place] [--peer edit|server|client] [--all] [--hidden]
                             One instance read whole: properties that differ from a new one of
                             its class (--all: every one), attributes, tags, children
@@ -466,6 +684,23 @@ Studio (through the ${info.appName} plugin; the code goes as --code=<luau> or --
   scene [place] [--mode all|instance_composition|script_memory|unparented_instances|
         triangle_composition|animation_memory|audio_memory] [--peer edit|server|client] [--limit <n>]
                             Studio's Scene Analysis (a beta feature): the biggest entries of each
+  micro [place] [--peer edit|server|client] [--ms <n>] [--frames <n>] [--mode all|script|physics|
+        render|network|jobs] [--filter <text>] [--sort self|inclusive] [--limit <n>] [--gpu] [--include-idle]
+        [--keep] [--out <file.mpz>]  The MicroProfiler for --ms (default 1000, at most 5000), read
+                            through LibMP: frame times, the scopes that took them (self and
+                            inclusive ms a frame), groups and threads; a thread's Sleep is left out
+                            unless --include-idle; the profiler is off again unless --keep
+  result <request id> [place]   What became of a Studio call that timed out (its id is in the
+                            timeout's message): pending, answered (with the answer), failed, lost
+  place info [place]        The place in Studio: ids, version, owner, published name, edit or play
+  selection [get] [place] | selection set <path>[,<path>] [place] [--mode set|add|remove]
+  selection view [path] [place] [--from <deg>] [--angle <deg>] [--padding <n>]
+                            Studio's selection; view points the edit camera at a path or the
+                            selection and leaves it there (set none clears the selection)
+  generate <prompt> [place] [--image <asset id | file.png>] [--size <x>,<y>,<z>] [--at <x>,<y>,<z>]
+           [--parent <path>] [--name <name>] [--triangles <n>] [--no-textures] [--schema Body1|Car5]
+           [--groups <a>,<b>]  A model from Roblox's generation, put in the place (edit mode, one
+                            undo step, selected); minutes. A PNG is uploaded first as a Decal
   asset preview <id> [place] [--depth <n>]   A Creator Store asset loaded and read, not inserted:
                             its classes, scripts (and what they call), PackageLinks, sounds, tree
   asset insert <id> [place] [--parent <path>] [--at=<x>,<y>,<z>]   The asset put in the place
@@ -485,6 +720,93 @@ Roblox (no hub needed)
                             ROBLOX_CREATOR_USER_ID / _GROUP_ID or open-cloud.env next to the
                             registry; the same file uploaded again answers the asset it made
                             (--force posts anyway); a Decal also gets its image id
+  place versions [place id] [--limit <n>] [--page <token>]   A place's saved versions, newest
+                            first (Open Cloud, the key needs asset:read)
+  place download [place id] [--version <n>] [--out <file.rbxl>] [--open]   One saved version (default
+                            the latest) as an .rbxl; --open opens it in a Studio of its own
+  open --file <file.rbxl>   A place file in a Studio of its own (no place id: the hub leaves it be)
+
+Open Cloud through the hub (the key lives only there, encrypted; a write asks the user in
+Quack's app first, and an AI asks the user before even proposing one). The experience is --universe,
+or the place's (a registered place or a place id)
+  datastore stores [place] [--prefix <p>]               A live game's DataStores
+  datastore keys <store> [place] [--prefix <p>] [--scope <s> | --all-scopes]
+  datastore get <store> <key> [place] [--fields a,b.c] [--version <id>] [--out <file.json>]
+  datastore versions <store> <key> [place] [--start <iso>] [--end <iso>] [--oldest-first]
+  datastore set <store> <key> [place] --value=<json> | --file <json>   (write)
+  datastore increment <store> <key> [place] --by <n>    (write)
+  datastore delete <store> <key> [place]                (write)
+  config get [place] [--keys a,b]                       The experience's configs as published
+  config draft [place]                                  The pending draft and what it changes
+  config set [place] --value=<json object> | --file <json>   Merged into the draft (not live)
+  config publish [place] [--message <text>]             The draft goes live (write)
+  luau [place] --code=<luau> | --file <path> [--version <n>] [--timeout <s>]
+                            Luau run by Roblox in a cloud server on the place's saved version, no
+                            Studio needed (write: it can change DataStores)
+  cloud check               What the saved key may do, and what each missing permission leaves out
+Open Cloud (run by the hub with its key; a create, change or delete asks you in Quack's app first)
+  badge quota|list <universeId>   Free badges left today (5 a UTC day, then ${BADGE_COST} Robux each) / every badge
+  badge create <universeId> --name <name> [--description <text>] [--icon <file.png>] [--spend]
+                            Never deleted, only disabled. Past the free quota it refuses unless
+                            --spend; the cost is sent as expectedCost, so Roblox charges nothing else
+  badge icon <badgeId> <file.png>   Replace a badge's icon
+  product list|get|create|update <universeId> [productId] [--name] [--price <robux>]
+          [--description] [--for-sale true|false] [--image <file.png>]
+                            Developer products: never deleted, only taken off sale; create puts it
+                            on sale, update changes only what is given
+  gamepass list|get|create|update <universeId> [gamePassId] [same options]   Game passes, the same;
+                            create --for-sale false keeps it off sale until its code is live
+  loc info <universeId>     The localization table: entries (of 10,000), untranslated, settings
+  loc dump <universeId> <out.json>   Every entry, to a file (a copy before a delete)
+  loc push <universeId> <strings.json> [--dry-run]   Adds the English strings the table lacks,
+                            untranslated: automatic translation fills them, spending the quota
+  loc delete <universeId> <sources.json> [--dry-run]   Deletes those entries; no undo
+  loc translate <universeId> <translations.json> [--locales <a,b>] [--dry-run] [--unchecked]
+                            Writes our translations ({ "<source>": { "<locale>": "<text>" } }),
+                            checked first as loc lint does; they spend no quota
+  loc lint <translations.json> [--locales <a,b>]   The file alone: placeholders, tags, icons,
+                            redeem codes, the 300-character source limit, the locales asked
+  loc check <universeId> <source text> [--locales <a,b>]   The latest translation of one string
+  loc langs <universeId> [pt=on de=off ...]   Which languages get automatic translation; a change asks
+  analytics <universeId> [--body=<json> | --file <query.json>] [--kind metrics|dimension-values]
+                            The Analytics Query API, read-only (default: daily active users, 3 days)
+The live game (Open Cloud, run by the hub with its key; every change asks the user in Quack's app
+and runs only after their Accept. [place] is the last argument and names the experience
+through its place; --universe <id> names it instead)
+  universe [get] [place]    The experience's settings: visibility, voice, devices, private servers
+  universe set [place] --props=<json>   Change them, by Open Cloud name: voiceChatEnabled,
+                            desktopEnabled, mobileEnabled, tabletEnabled, consoleEnabled, vrEnabled,
+                            visibility (PUBLIC|PRIVATE: PRIVATE removes every player at once),
+                            privateServerPriceRobux (a new price cancels every private server
+                            subscription; null turns private servers off)
+  servers restart [place] [--places <id>,<id>] [--all-versions] [--bleed <minutes>]
+                            Restart the servers on an older version (--all-versions: every
+                            server); their players are disconnected. --bleed 1 to 60: they take
+                            no new players and close after that long
+  message publish <topic> [place] --message=<text>   MessagingService to every live server
+                            (topic 80 characters, message 1,024)
+  memory-store map list <map> [place] [--limit <n>] [--page <t>] [--descending] [--filter=<cel>]
+  memory-store map get|delete <map> <item> [place]
+  memory-store map create|update <map> <item> [place] --value=<json> --ttl <s> [--sort-key=<k>]
+               [--upsert]   A sorted map's items (a value that is not JSON goes as text)
+  memory-store queue read <queue> [place] [--count <n>] [--invisible <s>] [--all-or-nothing]
+                            Takes items from the front: the game does not see them for --invisible
+                            seconds (default 30), then they come back unless discarded
+  memory-store queue add <queue> [place] --value=<json> --ttl <s> [--priority=<n>]
+  memory-store queue discard <queue> <read id> [place]
+  memory-store flush [place] [--test]   Erase every map and queue (LIVE; --test: Studio's)
+  leaderboard list <store> [place] [--scope <name>] [--ascending] [--min=<n>] [--max=<n>] [--limit <n>]
+  leaderboard get|delete <store> <entry> [place] [--scope <name>]
+  leaderboard create|set <store> <entry> [place] --value=<n> [--upsert]
+  leaderboard increment <store> <entry> [place] --amount=<n>
+                            An ordered data store (default scope global), highest first
+  ban list [place] [--in-place <place id>] | ban get <user id> [place]
+  ban set <user id> [place] [--duration <90s|30m|12h|7d|2w>] [--display=<shown to them>]
+          [--reason=<private>] [--keep-alts] [--in-place <place id>]
+                            Bans the user (permanently without --duration) and kicks them if in
+                            a server; their alt accounts too unless --keep-alts
+  ban lift <user id> [place] [--reason=<private>]
+  ban logs [place] [--user <id>] [--in-place <place id>]   Every ban and unban, newest first
 
 Studio queue (one per place: test jobs, the Studio lock and who waits for it)
   queue [place]             Who holds Studio and for how long, who waits (level, wait), the jobs
@@ -516,9 +838,11 @@ AI
   cloud clear               Remove the saved key
   rule [--prompt]           How an AI uses ${info.appName}, for its instructions file (CLAUDE.md, AGENTS.md);
                             --prompt adds how the AI puts it there or swaps an older copy
-                            (the app's "Copy rule for AI" copies that)
-  ai-clients                Claude Code, Cursor and Codex on this computer, and whether each has the MCP
-  connect-ai [claude|cursor|codex|<id>]...   Add the MCP to each one named (default: every one installed).
+                            (for an AI connect-ai does not know; the app's "Copy rule for another AI")
+  ai-clients                Claude Code, Cursor and Codex on this computer: the MCP, the rule, the guard
+  connect-ai [claude|cursor|codex|<id>]...   Set up each one named (default: every one installed): the
+                            MCP, the rule in CLAUDE.md / AGENTS.md (an older copy replaced where it
+                            is) and, in Claude Code, Quack's guard hook.
                             Every config folder counts: CLAUDE_CONFIG_DIR / CODEX_HOME, ~/.claude-*,
                             ~/.codex-*, and each T3 Code provider's home
 
@@ -694,7 +1018,7 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
     case "ai":
       return ai(ctx, options, args[0]);
     case "open":
-      return open(ctx, options, need(args[0], "open <place>"));
+      return options.file !== undefined ? openFile(ctx, options) : open(ctx, options, need(args[0], "open <place> | open --file <file.rbxl>"));
     case "wait":
       return wait(ctx, options, args[0]);
     case "doctor":
@@ -705,6 +1029,15 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
       return play(ctx, options, args[0]);
     case "cloud":
       return cloud(ctx, options, args);
+    case "badge":
+      return badgeCommand(ctx, options, args);
+    case "product":
+    case "gamepass":
+      return saleCommand(ctx, options, command, args);
+    case "loc":
+      return locCommand(ctx, options, args);
+    case "analytics":
+      return analyticsCommand(ctx, options, args);
     case "rule": {
       const { version, text } = rule(ctx.info);
       const body = options.prompt ? rulePrompt(ctx.info) : text;
@@ -742,6 +1075,8 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
       return mouse(ctx, options, args);
     case "verify":
       return verifySync(ctx, options, args[0]);
+    case "changes":
+      return changes(ctx, options, args[0]);
     case "perf":
       return perf(ctx, options, args[0]);
     case "logpoint":
@@ -774,6 +1109,36 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
       return profiler(ctx, options, args[0]);
     case "scene":
       return scene(ctx, options, args[0]);
+    case "result":
+      return requestResult(ctx, options, args);
+    case "place":
+      return placeCommand(ctx, options, args);
+    case "selection":
+      return selectionCommand(ctx, options, args);
+    case "generate":
+      return generate(ctx, options, args);
+    case "micro":
+      return micro(ctx, options, args[0]);
+    case "datastore":
+      return datastoreCommand(ctx, options, args);
+    case "config":
+      return configCommand(ctx, options, args);
+    case "luau":
+      return luauCommand(ctx, options, args);
+    case "move":
+      return move(ctx, options, args);
+    case "universe":
+    case "servers":
+    case "message":
+    case "memory-store":
+    case "leaderboard":
+    case "ban":
+      return liveCommand({
+        out: ctx.out, json: options.json, command: ctx.info.command,
+        cloudCall: (op, opArgs) => cloudCall(ctx, op, opArgs),
+        placeId: (query) => placeIdArg(ctx, query),
+        roblox: () => rbx(ctx),
+      }, options, command, args);
   }
   throw new UsageError(`unknown command ${command}. Run ${ctx.info.command} --help.`);
 }
@@ -789,7 +1154,7 @@ async function aiClients(ctx: ControlContext, options: Options, connect: boolean
   } else found = await listClients(ctx.info, env);
   const name = serverName(ctx.info);
   ctx.out(options.json ? JSON.stringify({ server: name, clients: found }, null, 2) : found.map((c) =>
-    `${c.label}: ${!c.installed ? "not installed" : c.connected ? `has ${name}` : `no ${name}`}${c.problem ? ` (${c.problem})` : ""}`).join("\n"));
+    `${c.label}: ${!c.installed ? "not installed" : c.connected ? `has ${name}` : `no ${name}`}${c.guarded ? ", Quack's guard on" : ""}${c.rule ? `, rule ${c.rule}` : ""}${c.problem ? ` (${c.problem})` : ""}`).join("\n"));
   return found.some((c) => c.problem) ? EXIT.error : EXIT.ok;
 }
 
@@ -946,6 +1311,21 @@ async function open(ctx: ControlContext, options: Options, query: string): Promi
 }
 
 /**
+ * A place file (.rbxl / .rbxlx) in a Studio of its own: a saved version from `place download`,
+ * or any local file. It has no place id, so the hub never takes it for a second Studio of a
+ * registered place (measured with chrrxs 05/11/26: it shows as place 0).
+ */
+async function openFile(ctx: ControlContext, options: Options): Promise<number> {
+  const file = path.resolve(ctx.cwd, options.file!);
+  if (!/\.rbxlx?$/i.test(file)) throw new UsageError("--file must be an .rbxl or .rbxlx place file");
+  if (!fs.existsSync(file)) throw new UsageError(`no such file: ${file}`);
+  await ctx.openUri(file);
+  if (options.json) ctx.out(JSON.stringify({ ok: true, file }));
+  else ctx.out(`Opening ${file} in Studio.`);
+  return EXIT.ok;
+}
+
+/**
  * Until the place's Studio is connected and, unless --connected, nothing has crossed between
  * it and its daemon for --idle ms. The quiet is counted from the call too: a save just made
  * waits out the watcher's debounce before its patch counts as the last activity.
@@ -1032,7 +1412,8 @@ interface Check {
 async function doctor(ctx: ControlContext, options: Options): Promise<number> {
   const checks: Check[] = [];
   const [major, minor] = process.versions.node.split(".").map(Number);
-  checks.push({ ok: major > 20 || (major === 20 && minor >= 19), what: `Node ${process.versions.node}`, detail: "Quack needs 20.19 or newer" });
+  // 22.15: its zlib reads zstd, how Roblox compresses newer .rbxl files (the import of a saved version)
+  checks.push({ ok: major > 22 || (major === 22 && minor >= 15), what: `Node ${process.versions.node}`, detail: "Quack needs 22.15 or newer" });
 
   let state: any;
   try {
@@ -1576,6 +1957,37 @@ async function verifySync(ctx: ControlContext, options: Options, query: string |
   return ok ? EXIT.ok : EXIT.error;
 }
 
+/** Which uncommitted changes in the place's sync folder came from Studio */
+async function changes(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  const place = await resolvePlace(ctx, query);
+  const result = await studio(ctx, place, "changes", { ...(options.numbersOnly ? { numbersOnly: true } : {}) }, 60_000);
+  ctx.out(options.json ? JSON.stringify(result, null, 2) : changesText(result));
+  return EXIT.ok;
+}
+
+/** A time as the local day and minute, YYYY-MM-DD HH:MM */
+function localMinute(ms: number): string {
+  const d = new Date(ms);
+  const two = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`;
+}
+
+/** changes' answer: a line a file (who, git's status, the path from the repo's root, why), then the counts */
+export function changesText(r: any): string {
+  if (r.git === false) return `Nothing to compare in ${r.syncDir}: ${r.note}.`;
+  const files: any[] = r.files ?? [];
+  if (!files.length) return `Nothing changed in ${r.syncDir} since the last commit (${r.ms} ms).`;
+  const width = Math.max(...files.map((f) => f.path.length));
+  const lines = [`${files.length} file${files.length === 1 ? "" : "s"} changed in ${r.syncDir} since the last commit (repo ${r.root}):`];
+  for (const f of files) {
+    const when = f.writtenAt !== undefined ? ` [Studio wrote it ${localMinute(f.writtenAt)}]` : "";
+    const numbers = f.numbersOnly === true ? "; only numbers changed" : f.numbersOnly === false ? `; not only numbers: ${f.numbersNote}` : "";
+    lines.push(`  ${f.origin.padEnd(6)} ${f.status}  ${f.path.padEnd(width)}  ${f.note}${when}${numbers}`);
+  }
+  lines.push(`${r.studio} from Studio, ${r.mixed} mixed, ${r.other} not from Studio (${r.ms} ms). Paths are from the repo's root, for git add.`);
+  return lines.join("\n");
+}
+
 /** perf's answer: two lines a peer */
 export function perfText(result: any): string {
   const lines: string[] = [];
@@ -1649,15 +2061,29 @@ async function exportRbxm(ctx: ControlContext, options: Options, args: string[])
 }
 
 async function importRbxm(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
-  const file = path.resolve(ctx.cwd, need(args[0], "import <file.rbxm> [place] [--parent <path>]"));
+  const file = path.resolve(ctx.cwd, need(args[0], "import <file.rbxm|.rbxl> [place] [--parent <path>] [--paths <a,b>] [--scripts] [--list]"));
   const place = await resolvePlace(ctx, args[1]);
-  const result = await studio(ctx, place, "importRbxm", { file, parent: options.parent }, 130_000);
+  const paths = options.paths === undefined ? undefined : options.paths.split(",").map((p) => p.trim()).filter(Boolean);
+  if (paths && !paths.length) throw new UsageError("--paths takes paths in the file, comma-separated: Workspace.MapA,StarterGui.Shop");
+  const result = await studio(ctx, place, "importRbxm", { file, parent: options.parent, paths, scripts: options.scripts || undefined, list: options.list || undefined }, 130_000);
   if (options.json) {
     ctx.out(JSON.stringify(result, null, 2));
     return EXIT.ok;
   }
-  ctx.out(`Put ${result.placed.join(", ")} in the place${result.scripts ? `; its ${result.scripts} script(s) sync to disk` : ""} (${result.ms} ms).`);
+  ctx.out(importText(result));
   return EXIT.ok;
+}
+
+/** import's answer: what landed, what the file kept back, its scripts (or, with --list, the file read) */
+export function importText(r: any): string {
+  if (!r.placed) return summaryText(r);
+  const lines = [`Put ${r.placed.join(", ")} in the place${r.scripts ? `; its ${r.scripts} script(s) sync to disk` : ""} (${r.ms} ms).`];
+  if (r.alreadyThere?.length) lines.push(`Already there before, now twice: ${r.alreadyThere.join(", ")}`);
+  if (r.leftOutCount) lines.push(`Left out of the file: ${r.leftOut.join(", ")}${r.leftOutCount > r.leftOut.length ? `, ... (${r.leftOutCount})` : ""}`);
+  if (r.scriptList?.length) lines.push(`Scripts that came: ${r.scriptList.join(", ")}`);
+  if (r.note) lines.push(r.note);
+  if (r.terrain) lines.push(r.terrain);
+  return lines.join("\n");
 }
 
 function jsonOption(value: string | undefined, name: string): Record<string, unknown> | undefined {
@@ -1802,15 +2228,66 @@ async function profile(ctx: ControlContext, options: Options, args: string[]): P
 async function findInstances(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
   const place = await resolvePlace(ctx, query);
   const limit = positiveInt(options.limit, "limit");
-  const result = await studio(ctx, place, "find", { name: options.name, className: options.class, under: options.under, ...(limit ? { limit } : {}) }, 30_000);
-  if (options.json) {
-    ctx.out(JSON.stringify(result, null, 2));
-    return EXIT.ok;
-  }
-  for (const f of result.found) ctx.out(`${f.path} [${f.className}]${f.file ? `  ${f.file}` : ""}`);
-  const more = result.total > result.found.length ? `, the first ${result.found.length} shown (--limit for more)` : "";
-  ctx.out(`${result.total} found among ${result.scanned} instances${more}${result.studioConnected ? "" : "; Studio is not connected, so this is the tree as last synced"} (${result.ms} ms).`);
+  if (options.peer !== undefined && !["edit", "server", "client"].includes(options.peer)) throw new UsageError("--peer must be server or client (a running play), or edit");
+  if (options.attr !== undefined && !options.attr.split("=")[0]) throw new UsageError("--attr is <name> or <name>=<value>");
+  // --attr=Level=3: the name, then the value (an attribute's name has no "=")
+  const at = options.attr?.indexOf("=") ?? -1;
+  const attribute = options.attr === undefined ? {} : at < 0 ? { attribute: options.attr } : { attribute: options.attr.slice(0, at), attributeValue: options.attr.slice(at + 1) };
+  const result = await studio(ctx, place, "find", {
+    name: options.name, className: options.class, under: options.under, ...(limit ? { limit } : {}),
+    peer: options.peer, ...attribute, tag: options.tag, ...(options.exact ? { exact: true } : {}),
+  }, 30_000);
+  ctx.out(options.json ? JSON.stringify(result, null, 2) : findText(result));
   return EXIT.ok;
+}
+
+/** find's answer: one line an instance, then how many and where they were looked for */
+export function findText(r: any): string {
+  const lines = (r.found ?? []).map((f: any) => `${f.path} [${f.className}]${f.file ? `  ${f.file}` : ""}${f.attributes ? `  ${f.attributes} attribute${f.attributes === 1 ? "" : "s"}` : ""}`);
+  const more = r.total > r.found.length ? `, the first ${r.found.length} shown (--limit for more)` : "";
+  if (r.peer) {
+    const unknown = r.unknownClasses?.length ? `, except ${r.unknownClasses.join(", ")}: no class the API knows, so matched by exact ClassName` : "";
+    const classes = r.classMatch === "exact" ? "; classes by exact ClassName" : r.classMatch === "IsA" ? `; classes by IsA (subclasses too)${unknown}` : "";
+    lines.push(`${r.total} found among ${r.scanned} instances of ${PEER_NAME[r.peer] ?? r.peer}${more}${classes}${r.unsorted ? "; too many to sort, so in tree order" : ""} (${r.ms} ms).`);
+  } else lines.push(`${r.total} found among ${r.scanned} instances${more}${r.studioConnected ? "" : "; Studio is not connected, so this is the tree as last synced"} (${r.ms} ms).`);
+  return lines.join("\n");
+}
+
+const MOVE_USAGE = "move <path> [place] | move [place] --at=<x>,<y>,<z>   [--mode teleport|walk|path] [--timeout <s>] [--radius <studs>] [--peer server|client] [--player <name>]";
+
+/** The player's character teleported or walked to a position or an instance, in a running play */
+async function move(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const position = vectorOption(options.at, "at");
+  const target = position ? undefined : args[0];
+  if (!position && !target) throw new UsageError(`usage: ${MOVE_USAGE}`);
+  if (options.mode !== undefined && !["teleport", "walk", "path"].includes(options.mode)) throw new UsageError("--mode must be teleport, walk or path");
+  if (options.peer !== undefined && options.peer !== "server" && options.peer !== "client") throw new UsageError("--peer must be server or client");
+  const place = await resolvePlace(ctx, position ? args[0] : args[1]);
+  const timeoutMs = (options.timeout ?? 15) * 1000;
+  const result = await studio(ctx, place, "move", {
+    ...(position ? { position } : { path: target }),
+    mode: options.mode, peer: options.peer, timeoutMs, radius: numberOption(options.radius, "radius"),
+  }, timeoutMs + 30_000);
+  ctx.out(options.json ? JSON.stringify(result, null, 2) : moveText(result));
+  return EXIT.ok;
+}
+
+export function moveText(r: any): string {
+  const where = r.target ? `${r.target} (its top at ${r.goal.join(", ")})` : r.goal.join(", ");
+  const by = r.peer === "client" ? `the play client${r.owner ? ` (${r.owner} owns the character's physics)` : ""}` : `the play server${r.owner && r.owner !== "server" ? ` (the physics owner is ${r.owner})` : ""}`;
+  if (r.how === "teleport") {
+    return `Teleported ${r.player} to ${where} from ${r.from.join(", ")}, on ${by}: feet at ${r.at.join(", ")}, ${r.distanceLeft} studs from the goal${r.leftSeat ? "; it left its seat first" : ""} (${r.ms} ms).`;
+  }
+  const how = r.how === "path" ? `along a path of ${r.waypoints} waypoints` : "in a straight line (Humanoid:MoveTo)";
+  const why: Record<string, string> = {
+    arrived: "arrived",
+    stuck: "stopped: no closer for 2 s (a wall, a gap, or the game holding it)",
+    timeout: `stopped at the timeout (${r.timeoutSeconds} s)`,
+    died: "stopped: the character died or left the Workspace",
+  };
+  const height = Math.abs(r.heightLeft ?? 0) > 3 ? `, ${r.heightLeft} studs of height left` : "";
+  const waypoint = r.waypointReached !== undefined ? `, after waypoint ${r.waypointReached}` : "";
+  return `${r.player} walked ${how} from ${r.from.join(", ")} toward ${where}, on ${by}: ${why[r.stopped] ?? r.stopped}${waypoint}. Feet at ${r.at.join(", ")}, ${r.distanceLeft} studs left${height}; ${r.seconds} s at WalkSpeed ${r.walkSpeed} (${r.ms} ms in all).`;
 }
 
 function secondsOption(value: string | undefined, name: string): number | undefined {
@@ -1899,13 +2376,50 @@ function rbx(ctx: ControlContext): RobloxEnv {
   return robloxEnv(ctx.roblox?.dataDir ?? path.dirname(ctx.info.registry), ctx.roblox);
 }
 
+/**
+ * One Open Cloud operation, run by the hub: the key lives only in its process (src/cloud), so
+ * nothing here ever holds it. A Roblox refusal comes back as a RobloxError (pending: still
+ * processing on Roblox's side, exit as a timeout).
+ */
+async function cloudCall(ctx: ControlContext, op: string, args: Record<string, unknown>, timeoutMs = 600_000): Promise<any> {
+  let answer: any;
+  try {
+    answer = await ctx.client.post("/api/cloud", { op, args }, timeoutMs);
+  } catch (error) {
+    if (error instanceof HubOffline) throw new HubOffline(`${ctx.info.appName} is not running: the Open Cloud key lives in its hub, so ${op} runs there. Start the app.`);
+    if (error instanceof HubError && error.status === 404 && error.message === "not found") throw new Error(`The hub is older than this command: restart it (${ctx.info.command} restart-hub).`);
+    throw error;
+  }
+  if (typeof answer?.error === "string") {
+    const error = new RobloxError(answer.error);
+    error.pending = answer.pending === true;
+    throw error;
+  }
+  return answer?.result;
+}
+
 /** The Open Cloud key and creator in open-cloud.env: shown (never the key), saved, cleared */
 async function cloud(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
   const env = rbx(ctx);
   const action = args[0] ?? "show";
+  if (action === "check") {
+    // What the saved key may do, from Roblox (through the hub: only it holds the key)
+    const info = await cloudCall(ctx, "keyInfo", {});
+    if (options.json) {
+      ctx.out(JSON.stringify(info, null, 2));
+      return EXIT.ok;
+    }
+    ctx.out(`Key "${info.name}": ${info.enabled ? "enabled" : "DISABLED"}${info.expired ? ", EXPIRED" : ""}${info.expiration ? `, expires ${info.expiration}` : ""}`);
+    for (const s of info.scopes) ctx.out(`  ${s.name}: ${s.operations.join(", ")}${s.experiences.length ? ` (experiences ${s.experiences.join(", ")})` : ""}`);
+    if (info.missing.length) {
+      ctx.out("Missing for Quack's tools (add them to the key in the Creator Hub, Open Cloud, API Keys):");
+      for (const m of info.missing) ctx.out(`  ${m.tool}: ${m.missing.join(", ")}`);
+    } else ctx.out("Every Quack tool has what it needs.");
+    return EXIT.ok;
+  }
   let result: ReturnType<typeof cloudSettings>;
   if (action === "show") result = cloudSettings(env);
-  else if (action === "clear") result = saveCloudSettings(env, { key: "" });
+  else if (action === "clear") result = await saveCloudSettings(env, { key: "" });
   else if (action === "set") {
     if (options.user !== undefined && options.group !== undefined) throw new UsageError("give --user or --group, not both");
     let key: string | undefined;
@@ -1915,7 +2429,7 @@ async function cloud(ctx: ControlContext, options: Options, args: string[]): Pro
       if (!key) throw new UsageError("no key came on stdin");
     }
     if (key === undefined && options.user === undefined && options.group === undefined) throw new UsageError("cloud set needs --key-stdin, --user <id> or --group <id>");
-    result = saveCloudSettings(env, { key, userId: options.user, groupId: options.group });
+    result = await saveCloudSettings(env, { key, userId: options.user, groupId: options.group });
   } else throw new UsageError("cloud [show] | cloud set [--user <id> | --group <id>] [--key-stdin] | cloud clear");
   if (options.json) {
     ctx.out(JSON.stringify(result, null, 2));
@@ -1923,7 +2437,287 @@ async function cloud(ctx: ControlContext, options: Options, args: string[]): Pro
   }
   const creator = result.groupId ? `group ${result.groupId}` : result.userId ? `user ${result.userId}` : "no creator";
   ctx.out(`${result.hasKey ? (result.keyEnd ? `Key saved (ends in ${result.keyEnd})` : "Key saved") : "No key saved"}, ${creator}: ${result.file}`);
+  ctx.out(result.plainKey
+    ? "The key is still in plain text in that file: the hub moves it into its encrypted vault the first time it uses it."
+    : `The key is kept encrypted (${result.vaultFile}); only the hub decrypts it.`);
   if (result.fromEnvironment.length) ctx.out(`The environment sets ${result.fromEnvironment.join(", ")}, which wins over the file.`);
+  return EXIT.ok;
+}
+
+// ---------------------------------------------------------------------------------------
+// Open Cloud jobs (ported from ~/.claude/scripts/roblox-cloud.mjs and Anime Astral's
+// analytics-query.mjs and loc-check.mjs): run by the hub with its key (src/cloud). Reads
+// answer at once; every create, change or delete asks the user in Quack's app first.
+
+/** A universe id from the command line: never a place's (badges, products and passes live in the universe) */
+function universeArg(raw: string | undefined, usage: string): string {
+  const id = need(raw, usage);
+  if (!/^\d+$/.test(id)) throw new UsageError(`the universe id must be a number (Studio's game.GameId), not "${id}"`);
+  return id;
+}
+
+function idArg(raw: string | undefined, what: string, usage: string): string {
+  const id = need(raw, usage);
+  if (!/^\d+$/.test(id)) throw new UsageError(`${what} must be a number, not "${id}"`);
+  return id;
+}
+
+/** A file the hub reads: absolute, and there */
+function hubFile(ctx: ControlContext, raw: string | undefined, usage: string): string {
+  const file = path.resolve(ctx.cwd, need(raw, usage));
+  if (!fs.existsSync(file)) throw new UsageError(`no file ${file}`);
+  return file;
+}
+
+function forSaleOption(raw: string | undefined): boolean | undefined {
+  if (raw === undefined) return undefined;
+  if (raw !== "true" && raw !== "false") throw new UsageError("--for-sale must be true or false");
+  return raw === "true";
+}
+
+function priceOption(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || n < 0) throw new UsageError("--price must be a whole number of Robux");
+  return n;
+}
+
+/** Bulk localization writes run 50 entries a request with waits on 429: give them time */
+const LONG_CLOUD_MS = 60 * 60_000;
+
+const BADGE_USAGE = "badge quota|list <universeId> | badge create <universeId> --name <name> [--description <text>] [--icon <file.png>] [--spend] | badge icon <badgeId> <file.png>";
+
+async function badgeCommand(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const action = need(args[0], BADGE_USAGE);
+  const print = (value: unknown, text: () => string) => ctx.out(options.json ? JSON.stringify(value, null, 2) : text());
+  if (action === "quota") {
+    const r = await cloudCall(ctx, "badge.quota", { universeId: universeArg(args[1], BADGE_USAGE) });
+    print(r, () => `Free badges left today in universe ${r.universeId}: ${r.free} (past them, ${r.costPastQuota} Robux each).`);
+    return EXIT.ok;
+  }
+  if (action === "list") {
+    const r = await cloudCall(ctx, "badge.list", { universeId: universeArg(args[1], BADGE_USAGE) });
+    print(r, () => (r.badges.length ? r.badges.map((b: any) => `${b.id} | ${b.name} | enabled=${b.enabled} | icon ${b.iconImageId}`).join("\n") : `Universe ${r.universeId} has no badge.`));
+    return EXIT.ok;
+  }
+  if (action === "create") {
+    const universeId = universeArg(args[1], BADGE_USAGE);
+    if (!options.name?.trim()) throw new UsageError("--name is required");
+    const icon = options.icon !== undefined ? hubFile(ctx, options.icon, BADGE_USAGE) : undefined;
+    // The quota before the dialog: past it a badge costs Robux, which only --spend allows
+    const quota = await cloudCall(ctx, "badge.quota", { universeId });
+    const expectedCost = quota.free > 0 ? 0 : BADGE_COST;
+    if (expectedCost > 0 && !options.spend) throw new UsageError(`No free badge is left today in universe ${universeId}: it would cost ${BADGE_COST} Robux. Pass --spend to pay (the dialog asks again); nothing was made.`);
+    const universe = await cloudCall(ctx, "universe", { universeId });
+    const r = await cloudCall(ctx, "badge.create", { universeId, universeName: universe.name, name: options.name, description: options.description, icon, expectedCost, spend: options.spend });
+    print(r, () => `Created badge ${r.badgeId} "${r.name}" in ${universe.name} (enabled=${r.enabled}, icon ${r.iconImageId}), cost ${r.cost} Robux (paid by ${r.paidBy}; ${r.freeBefore} free before). A badge is never deleted: put its id in the game's config now.`);
+    return EXIT.ok;
+  }
+  if (action === "icon") {
+    const badgeId = idArg(args[1], "the badge id", BADGE_USAGE);
+    const r = await cloudCall(ctx, "badge.icon", { badgeId, file: hubFile(ctx, args[2], BADGE_USAGE) });
+    print(r, () => `Badge ${r.badgeId}: icon image ${r.iconImageId}.`);
+    return EXIT.ok;
+  }
+  throw new UsageError(`usage: ${BADGE_USAGE}`);
+}
+
+async function saleCommand(ctx: ControlContext, options: Options, command: string, args: string[]): Promise<number> {
+  const prefix = command === "product" ? "product" : "gamepass";
+  const label = command === "product" ? "developer product" : "game pass";
+  const idName = command === "product" ? "productId" : "gamePassId";
+  const usage = `${command} list <universeId> | ${command} get <universeId> <${idName}> | ${command} create <universeId> --name <name> --price <robux> [--description <text>] [--image <file.png>]${command === "gamepass" ? " [--for-sale true|false]" : ""} | ${command} update <universeId> <${idName}> [--name] [--price] [--for-sale true|false] [--description] [--image]`;
+  const action = need(args[0], usage);
+  const print = (value: unknown, text: () => string) => ctx.out(options.json ? JSON.stringify(value, null, 2) : text());
+  const universeId = universeArg(args[1], usage);
+  const line = (p: any) => `${p.id} | ${p.name} | ${p.price ?? "?"} R$ | forSale=${p.forSale}${p.iconAssetId !== undefined ? ` | icon=${p.iconAssetId}` : ""}`;
+  if (action === "list") {
+    const r = await cloudCall(ctx, `${prefix}.list`, { universeId });
+    print(r, () => (r.items.length ? r.items.map(line).join("\n") : `Universe ${universeId} has no ${label}.`));
+    return EXIT.ok;
+  }
+  if (action === "get") {
+    const r = await cloudCall(ctx, `${prefix}.get`, { universeId, id: idArg(args[2], `the ${label} id`, usage) });
+    ctx.out(JSON.stringify(r, null, 2));
+    return EXIT.ok;
+  }
+  const fields = {
+    name: options.name,
+    price: priceOption(options.price),
+    description: options.description,
+    forSale: forSaleOption(options.forSale),
+    image: options.image !== undefined ? hubFile(ctx, options.image, usage) : undefined,
+  };
+  if (action === "create") {
+    if (!fields.name?.trim() || fields.price === undefined) throw new UsageError(`${command} create <universeId> --name <name> --price <robux>`);
+    if (command === "product" && fields.forSale === false) throw new UsageError("a developer product is made on sale; take it off after with update --for-sale false");
+    const universe = await cloudCall(ctx, "universe", { universeId });
+    const r = await cloudCall(ctx, `${prefix}.create`, { universeId, universeName: universe.name, ...fields });
+    print(r, () => `Created ${label} ${line(r.created)} in ${universe.name}. It is never deleted: put its id in the game's config now.`);
+    return EXIT.ok;
+  }
+  if (action === "update") {
+    const id = idArg(args[2], `the ${label} id`, usage);
+    if (Object.values(fields).every((v) => v === undefined)) throw new UsageError("nothing to change: --name, --price, --description, --for-sale or --image");
+    const universe = await cloudCall(ctx, "universe", { universeId });
+    const r = await cloudCall(ctx, `${prefix}.update`, { universeId, universeName: universe.name, id, ...fields });
+    print(r, () => `Updated ${label} ${r.id} in ${universe.name}.`);
+    return EXIT.ok;
+  }
+  throw new UsageError(`usage: ${usage}`);
+}
+
+const LOC_USAGE = "loc info <universeId> | loc dump <universeId> <out.json> | loc push|delete <universeId> <file.json> [--dry-run] | loc translate <universeId> <translations.json> [--locales <a,b>] [--dry-run] [--unchecked] | loc lint <translations.json> [--locales <a,b>] | loc check <universeId> <source text> [--locales <a,b>] | loc langs <universeId> [pt=on de=off ...]";
+
+function localesOption(raw: string | undefined): string[] | undefined {
+  if (raw === undefined) return undefined;
+  const list = raw.split(",").map((l) => l.trim()).filter(Boolean);
+  if (!list.length || list.some((l) => !/^[a-z]{2,3}(-[a-z]{2,4})?$/i.test(l))) throw new UsageError("--locales is a list of locale codes, as --locales pt,es,zh-hans");
+  return list;
+}
+
+function lintText(file: string, lint: ReturnType<typeof lintTranslations>): string {
+  const lines = [`${path.basename(file)}: ${lint.strings} strings | locales ${lint.locales.join(", ") || "none"} | ${lint.translations} translations | ${lint.problems.length} problems`];
+  for (const p of lint.problems.slice(0, 80)) lines.push(`  ${p}`);
+  if (lint.problems.length > 80) lines.push(`  ... and ${lint.problems.length - 80} more`);
+  return lines.join("\n");
+}
+
+async function locCommand(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const action = need(args[0], LOC_USAGE);
+  const print = (value: unknown, text: () => string) => ctx.out(options.json ? JSON.stringify(value, null, 2) : text());
+  if (action === "lint") {
+    // The file only: no hub, no key
+    const file = hubFile(ctx, args[1], LOC_USAGE);
+    let data: unknown;
+    try {
+      data = JSON.parse(fs.readFileSync(file, "utf8").replace(/^\uFEFF/, ""));
+    } catch (error) {
+      throw new UsageError(`${file} is not JSON: ${(error as Error).message}`);
+    }
+    const lint = lintTranslations(data, localesOption(options.locales));
+    print(lint, () => lintText(file, lint));
+    return lint.problems.length ? EXIT.error : EXIT.ok;
+  }
+  const universeId = universeArg(args[1], LOC_USAGE);
+  if (action === "info") {
+    const r = await cloudCall(ctx, "loc.info", { universeId });
+    print(r, () => [
+      `table ${r.tableId} | ${r.entries} entries of ${r.max.toLocaleString("en-US")} | ${r.untranslated} with no translation yet | source ${r.sourceLanguage}`,
+      `  auto-localization ${r.autoLocalization} | text capture ${r.textCapture} | capture cleanup ${r.captureCleanup} | uses table ${r.usesTable}`,
+    ].join("\n"));
+    return EXIT.ok;
+  }
+  if (action === "dump") {
+    const out = path.resolve(ctx.cwd, need(args[2], "loc dump <universeId> <out.json>"));
+    if (!/\.json$/i.test(out)) throw new UsageError("the dump goes to a .json file");
+    const r = await cloudCall(ctx, "loc.dump", { universeId, out }, LONG_CLOUD_MS);
+    print(r, () => `${r.entries} entries -> ${r.file}`);
+    return EXIT.ok;
+  }
+  if (action === "push" || action === "delete") {
+    const file = hubFile(ctx, args[2], LOC_USAGE);
+    const plan = await cloudCall(ctx, "loc.plan", { universeId, file, action }, LONG_CLOUD_MS);
+    if (action === "push") {
+      if (!options.json) {
+        ctx.out(`table read: ${plan.total} entries`);
+        ctx.out(`${plan.strings} strings | ${plan.already} already in the table | ${plan.missing} to add | ${plan.tooLong.length} over 300 characters (skipped)`);
+        for (const s of plan.tooLong) ctx.out(`  too long: ${s}`);
+        if (plan.overCap) ctx.out(`The table would pass ${LOC_TABLE_MAX.toLocaleString("en-US")} entries (${plan.total} + ${plan.missing}): Roblox refuses new entries past it, and a slot a delete frees takes minutes to count.`);
+      }
+      if (options.dryRun || plan.missing === 0) {
+        if (options.json) ctx.out(JSON.stringify({ plan }, null, 2));
+        else if (plan.missing === 0) ctx.out("Nothing to add.");
+        return EXIT.ok;
+      }
+      const r = await cloudCall(ctx, "loc.push", { universeId, file, expected: plan.missing }, LONG_CLOUD_MS);
+      print({ plan, ...r }, () => [...r.failures.map((f: string) => `  failed: ${f}`), `sent ${r.sent}, failed ${r.failed} | ${r.before} entries before the push (loc info in a few minutes shows them)`].join("\n"));
+      return r.failed ? EXIT.error : EXIT.ok;
+    }
+    if (!options.json) ctx.out(`${plan.asked} sources asked | ${plan.found} found in the table of ${plan.total}`);
+    if (options.dryRun || plan.found === 0) {
+      if (options.json) ctx.out(JSON.stringify({ plan }, null, 2));
+      else if (plan.found === 0) ctx.out("Nothing to delete.");
+      return EXIT.ok;
+    }
+    const r = await cloudCall(ctx, "loc.delete", { universeId, file, expected: plan.found }, LONG_CLOUD_MS);
+    print({ plan, ...r }, () => [...r.failures.map((f: string) => `  failed: ${f}`), `deleted ${r.deleted}, failed ${r.failed} (loc info reads the new total)`].join("\n"));
+    return r.failed ? EXIT.error : EXIT.ok;
+  }
+  if (action === "translate") {
+    const file = hubFile(ctx, args[2], LOC_USAGE);
+    const locales = localesOption(options.locales);
+    let data: unknown;
+    try {
+      data = JSON.parse(fs.readFileSync(file, "utf8").replace(/^\uFEFF/, ""));
+    } catch (error) {
+      throw new UsageError(`${file} is not JSON: ${(error as Error).message}`);
+    }
+    // Checked here first: a file with problems never opens the dialog
+    const lint = lintTranslations(data, locales);
+    if (!options.json) ctx.out(lintText(file, lint));
+    // --unchecked sends past content problems, never past an entry Roblox cannot take
+    if (lint.problems.length && (!options.unchecked || lint.broken > 0)) {
+      if (options.json) ctx.out(JSON.stringify({ lint }, null, 2));
+      else ctx.out(lint.broken > 0 ? "Nothing was sent: fix the file (empty or malformed entries go nowhere, --unchecked or not)." : "Nothing was sent: fix the file (or pass --unchecked to send it anyway).");
+      return EXIT.error;
+    }
+    if (options.dryRun) {
+      if (options.json) ctx.out(JSON.stringify({ lint }, null, 2));
+      return EXIT.ok;
+    }
+    const r = await cloudCall(ctx, "loc.translate", { universeId, file, ...(locales ? { locales } : {}), unchecked: options.unchecked }, LONG_CLOUD_MS);
+    print({ lint, ...r }, () => [...r.failures.map((f: string) => `  failed: ${f}`), `sent ${r.sent}, failed ${r.failed} (check one from the middle with loc check)`].join("\n"));
+    return r.failed ? EXIT.error : EXIT.ok;
+  }
+  if (action === "check") {
+    const source = options.text ?? args.slice(2).join(" ");
+    if (!source) throw new UsageError('loc check <universeId> "<source text>" (or --text=<source>)');
+    const r = await cloudCall(ctx, "loc.check", { universeId, source, ...(options.locales ? { locales: localesOption(options.locales) } : {}) });
+    print(r, () => r.translations.map((t: any) => `${t.locale}: ${t.text !== undefined ? `${t.text} (${t.by}, ${t.at})` : "no translation"}`).join("\n"));
+    return EXIT.ok;
+  }
+  if (action === "langs") {
+    const changes: Record<string, boolean> = {};
+    for (const change of args.slice(2)) {
+      const [code, state] = change.split("=");
+      if (!code || (state !== "on" && state !== "off")) throw new UsageError(`"${change}" is not code=on or code=off`);
+      changes[code] = state === "on";
+    }
+    const changed = Object.keys(changes).length ? await cloudCall(ctx, "loc.setLangs", { universeId, changes }) : undefined;
+    const r = await cloudCall(ctx, "loc.langs", { universeId });
+    print({ ...(changed ? { changed: changed.changed } : {}), ...r }, () => [
+      ...(changed?.changed ?? []).map((c: any) => `${c.code}: automatic translation ${c.on ? "on" : "off"}`),
+      `on (${r.on.length}): ${r.on.join(", ")}`,
+      `off (${r.off.length}): ${r.off.join(", ")}`,
+    ].join("\n"));
+    return EXIT.ok;
+  }
+  throw new UsageError(`usage: ${LOC_USAGE}`);
+}
+
+const ANALYTICS_USAGE = "analytics <universeId> [--body=<json> | --file <query.json>] [--kind metrics|dimension-values]";
+
+async function analyticsCommand(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const universeId = universeArg(args[0], ANALYTICS_USAGE);
+  if (options.body !== undefined && options.file !== undefined) throw new UsageError("give --body or --file, not both");
+  const kind = options.kind ?? "metrics";
+  if (!(ANALYTICS_KINDS as readonly string[]).includes(kind)) throw new UsageError(`--kind must be ${ANALYTICS_KINDS.join(" or ")}`);
+  let body: unknown;
+  const raw = options.body ?? (options.file !== undefined ? fs.readFileSync(path.resolve(ctx.cwd, options.file), "utf8") : undefined);
+  if (raw !== undefined) {
+    try {
+      body = JSON.parse(raw.replace(/^\uFEFF/, ""));
+    } catch (error) {
+      throw new UsageError(`the query is not JSON: ${(error as Error).message}`);
+    }
+  }
+  const r = await cloudCall(ctx, "analytics.query", { universeId, kind, ...(body !== undefined ? { body } : {}) });
+  if (options.json) ctx.out(JSON.stringify(r, null, 2));
+  else {
+    ctx.out(`${kind} of universe ${universeId}${body === undefined ? ` (default: ${(defaultAnalyticsBody(Date.now()) as any).metric}, the last 3 days)` : ""}:`);
+    ctx.out(JSON.stringify(r.result, null, 2));
+  }
   return EXIT.ok;
 }
 
@@ -1994,7 +2788,7 @@ async function uploadCommand(ctx: ControlContext, options: Options, args: string
   if (!options.name) throw new UsageError("--name is required: the asset's display name on Roblox");
   if (options.user !== undefined && options.group !== undefined) throw new UsageError("give --user or --group, not both");
   const env = rbx(ctx);
-  const result: Record<string, any> = await uploadAsset(env, {
+  const result: Record<string, any> = await cloudCall(ctx, "upload", {
     file, assetType: options.type, displayName: options.name, description: options.description, userId: options.user, groupId: options.group, force: options.force,
   });
   // A Decal's own id is not the image's: scripts and ImageLabels need the image id inside it
@@ -2052,6 +2846,8 @@ export function previewText(r: any): string {
   if (r.sounds?.length) lines.push(`Sounds (${r.sounds.length}): ${r.sounds.slice(0, 10).map((s: any) => `${s.path} ${s.soundId}`).join(", ")}${r.sounds.length > 10 ? ", ..." : ""}`);
   lines.push("Tree:");
   for (const n of r.nodes ?? []) lines.push(`  ${"  ".repeat(n.d)}${n.n} [${n.c}]${n.more ? ` +${n.more} inside` : ""}`);
+  if (r.earlierCaptureLeftOut) lines.push("(frames of an earlier capture still in the profiler's buffer were left out)");
+  if (r.idleLeftOut) lines.push(`(${r.idleLeftOut} idle scope(s) left out: a thread waiting for work; --include-idle keeps them)`);
   if (r.truncated) lines.push(`  (stopped at ${r.nodes.length} objects)`);
   return lines.join("\n");
 }
@@ -2143,6 +2939,360 @@ export function sceneText(r: any): string {
     for (const e of m.top ?? []) lines.push(`  ${e.name ?? "?"}  ${mode === "triangle_composition" && e.sizes ? size(e.sizes) : size(e.size)}${e.assetId ? `  asset ${e.assetId}` : ""}`);
   }
   return lines.join("\n");
+}
+
+/** What became of a Studio call that timed out, by the request id its timeout named */
+async function requestResult(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const id = need(args[0], "result <request id> [place]");
+  const place = await resolvePlace(ctx, args[1]);
+  const result = await studio(ctx, place, "requestStatus", { id }, 5000);
+  if (options.json) ctx.out(JSON.stringify(result, null, 2));
+  else ctx.out(requestStatusText(result));
+  return result.state === "failed" || result.state === "lost" ? EXIT.error : EXIT.ok;
+}
+
+export function requestStatusText(r: any): string {
+  if (r.state === "unknown") return `Request ${r.id}: unknown. ${r.note}`;
+  const who = `${r.tool} to ${PEER_NAME[r.peer] ?? r.peer}${r.player ? ` (${r.player})` : ""}`;
+  const after = r.answeredAfterTimeoutMs !== undefined ? `, ${Math.round(r.answeredAfterTimeoutMs / 1000)} s after its timeout` : "";
+  if (r.state === "pending") return `Request ${r.id} (${who}): no answer yet, ${Math.round(r.timedOutAgoMs / 1000)} s after its timeout. ${r.note}`;
+  if (r.state === "failed" || r.state === "lost") return `Request ${r.id} (${who}): ${r.state === "lost" ? "lost" : "failed"}${after}: ${r.error}`;
+  if (r.note) return `Request ${r.id} (${who}): answered${after}; ${r.note}`;
+  const res = r.result;
+  // An eval or exec reads as the commands print it; anything else as its JSON
+  if (res && typeof res === "object" && Array.isArray(res.output) && "ok" in res) {
+    const lines = [`Request ${r.id} (${who}): answered${after}.`, ...res.output.map(String)];
+    lines.push(res.ok ? (res.values?.length ? `=> ${res.values.join(", ")}` : "=> (nothing returned)") : `Luau error: ${res.error}`);
+    return lines.join("\n");
+  }
+  return `Request ${r.id} (${who}): answered${after}.\n${JSON.stringify(res, null, 2)}`;
+}
+
+/** A place id from the command line: a number as is (registered or not), else a registered place's */
+async function placeIdArg(ctx: ControlContext, query: string | undefined): Promise<string> {
+  if (query && /^\d+$/.test(query)) return query;
+  return (await resolvePlace(ctx, query)).placeId;
+}
+
+const PLACE_USAGE = "place info [place] | place versions [place id] [--limit <n>] [--page <token>] | place download [place id] [--version <n>] [--out <file.rbxl>] [--open]";
+
+/** The place in Studio, and a place's saved versions on Roblox (one downloaded as an .rbxl) */
+async function placeCommand(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const action = need(args[0], PLACE_USAGE);
+  if (action === "info") {
+    const place = await resolvePlace(ctx, args[1]);
+    const result = await studio(ctx, place, "placeInfo", {}, 15_000);
+    if (options.json) ctx.out(JSON.stringify(result, null, 2));
+    else ctx.out(placeInfoText(result));
+    return EXIT.ok;
+  }
+  if (action === "versions") {
+    const placeId = await placeIdArg(ctx, args[1]);
+    const result = await cloudCall(ctx, "versions", { placeId, limit: positiveInt(options.limit, "limit"), pageToken: options.page });
+    ctx.out(options.json ? JSON.stringify(result, null, 2) : versionsText(result));
+    return EXIT.ok;
+  }
+  if (action === "download") {
+    const placeId = await placeIdArg(ctx, args[1]);
+    const result = await cloudCall(ctx, "download", { placeId, version: positiveInt(options.version, "version"), out: options.out ? path.resolve(ctx.cwd, options.out) : undefined });
+    if (options.open) await ctx.openUri(result.file);
+    if (options.json) ctx.out(JSON.stringify({ ...result, opened: options.open }, null, 2));
+    else {
+      ctx.out(`Place ${result.placeId}${result.version ? ` version ${result.version}` : " (its latest saved version)"}: ${result.file} (${Math.round(result.bytes / 1024)} KB).`);
+      ctx.out(`See what it holds with ${ctx.info.command} import "${result.file}" --list, then bring back what is missing with --paths (Workspace.MapA,StarterGui.Shop): each item goes back in its own parent.`);
+      if (options.open) ctx.out("Opening it in a Studio of its own too: no place id there, so Quack neither syncs it nor reaches it with its tools.");
+    }
+    return EXIT.ok;
+  }
+  throw new UsageError(`usage: ${PLACE_USAGE}`);
+}
+
+export function placeInfoText(r: any): string {
+  const lines = [`${r.name ?? r.dataModelName} (place ${r.placeId}, experience ${r.gameId}), version ${r.placeVersion}, owned by ${r.creatorType === "Group" ? "group" : "user"} ${r.creatorId}`];
+  lines.push(`Studio is ${r.editMode ? "in edit mode" : "running a play"}; StreamingEnabled ${r.streamingEnabled}, gravity ${r.gravity}${r.jobId ? `, job ${r.jobId}` : ""}`);
+  if (r.updated) lines.push(`Published ${r.updated}`);
+  if (r.description) lines.push(`Description: ${r.description}`);
+  if (r.nameError) lines.push(`(its published name could not be read: ${r.nameError})`);
+  return lines.join("\n");
+}
+
+const SELECTION_USAGE = "selection [get] [place] | selection set <path>[,<path>...] [place] [--mode set|add|remove] | selection view [path] [place] [--from <deg>] [--angle <deg>] [--padding <n>]";
+
+function numberOption(value: string | undefined, name: string): number | undefined {
+  if (value === undefined) return undefined;
+  const n = Number(value);
+  if (!Number.isFinite(n)) throw new UsageError(`--${name} must be a number`);
+  return n;
+}
+
+/** Studio's selection: read, set, or the edit camera pointed at it */
+async function selectionCommand(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const action = ["get", "set", "view"].includes(args[0]) ? args[0] : "get";
+  const rest = ["get", "set", "view"].includes(args[0]) ? args.slice(1) : args;
+  let request: Record<string, unknown> = { action };
+  let query: string | undefined;
+  if (action === "set") {
+    const list = need(rest[0], SELECTION_USAGE);
+    request = { action, paths: list === "none" ? [] : list.split(",").map((p) => p.trim()).filter(Boolean), mode: options.mode ?? "set" };
+    query = rest[1];
+  } else if (action === "view") {
+    // A path has dots or names a service; a place is an id or a registered name
+    const first = rest[0];
+    const isPath = first !== undefined && (first.includes(".") || /^(Workspace|workspace)$/.test(first));
+    request = { action, ...(isPath ? { path: first } : {}), from: numberOption(options.from, "from"), angleY: numberOption(options.angle, "angle"), padding: numberOption(options.padding, "padding") };
+    query = isPath ? rest[1] : first;
+  } else query = rest[0];
+  const place = await resolvePlace(ctx, query);
+  const result = await studio(ctx, place, "selection", request, 15_000);
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  if (result.action === "view") {
+    ctx.out(`The edit camera frames ${result.framed} object(s): center ${result.center.join(", ")}, size ${result.size.join(" x ")}, from ${result.distance} studs away. It stays there.`);
+  } else {
+    const list = (result.selected ?? []).map((s: any) => `  ${s.path} (${s.className})`);
+    ctx.out(result.count ? [`${result.count} selected:`, ...list.slice(0, 50), ...(list.length > 50 ? [`  ... and ${list.length - 50} more`] : [])].join("\n") : "Nothing is selected.");
+  }
+  return EXIT.ok;
+}
+
+const GENERATE_USAGE = "generate <prompt> [place] | generate [place] --text=<prompt> [--image <asset id | file.png>] [--size <x>,<y>,<z>] [--at <x>,<y>,<z>] [--parent <path>] [--name <name>] [--triangles <n>] [--no-textures] [--schema Body1|Car5] [--groups <a>,<b>]";
+
+function vectorOption(value: string | undefined, name: string): number[] | undefined {
+  if (value === undefined) return undefined;
+  const parts = value.split(",").map((v) => Number(v.trim()));
+  if (parts.length !== 3 || !parts.every(Number.isFinite)) throw new UsageError(`--${name} must be <x>,<y>,<z>`);
+  return parts;
+}
+
+/**
+ * A model from Roblox's generation, put in the place in edit mode. --image takes an image asset
+ * id, or a PNG that is uploaded first as a Decal (the same file is never uploaded twice).
+ */
+async function generate(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  // --text=<prompt> leaves the one positional to the place (what the MCP sends)
+  const prompt = options.text ?? args[0];
+  if (!prompt && !options.image) throw new UsageError(`usage: ${GENERATE_USAGE}`);
+  const place = await resolvePlace(ctx, options.text !== undefined ? args[0] : args[1]);
+  let imageAssetId: string | undefined;
+  if (options.image !== undefined) {
+    if (/^\d+$/.test(options.image)) imageAssetId = options.image;
+    else {
+      const file = path.resolve(ctx.cwd, options.image);
+      if (!/\.png$/i.test(file)) throw new UsageError("--image must be an image asset id or a .png file");
+      const env = rbx(ctx);
+      const uploaded = await cloudCall(ctx, "upload", { file, assetType: "Decal", displayName: path.basename(file, path.extname(file)).slice(0, 50) });
+      if (!uploaded.assetId) throw new Error(`the PNG's upload is still processing on Roblox: run the same command again in a minute (it resumes that upload, never a second one)`);
+      let imageId = uploaded.imageId;
+      if (!imageId) {
+        const found = await decalImageId(ctx, env, uploaded.assetId, place.placeId);
+        if (!found.imageId) throw new Error(`the PNG was uploaded as Decal ${uploaded.assetId}, but its image id is not known yet (${found.how}): try again in a minute`);
+        imageId = found.imageId;
+        rememberImageId(env, uploaded.key, imageId);
+      }
+      imageAssetId = imageId;
+      if (!options.json) ctx.out(`Image ${file}: Decal ${uploaded.assetId}, image ${imageAssetId}${uploaded.reused ? " (uploaded before)" : ""}.`);
+    }
+  }
+  const timeoutMs = (options.timeout ?? 300) * 1000;
+  const result = await studio(ctx, place, "generate", {
+    ...(prompt ? { prompt } : {}),
+    ...(imageAssetId ? { imageAssetId: Number(imageAssetId) } : {}),
+    size: vectorOption(options.size, "size"),
+    position: vectorOption(options.at, "at"),
+    parent: options.parent,
+    name: options.name,
+    maxTriangles: positiveInt(options.triangles, "triangles"),
+    ...(options.noTextures ? { textures: false } : {}),
+    schema: options.schema,
+    groups: options.groups?.split(",").map((g) => g.trim()).filter(Boolean),
+    timeoutMs,
+  }, timeoutMs);
+  if (options.json) ctx.out(JSON.stringify(result, null, 2));
+  else ctx.out(generateText(result));
+  return EXIT.ok;
+}
+
+export function generateText(r: any): string {
+  const lines = [`Generated ${r.path} in ${r.seconds} s: ${r.parts?.length ?? 0} mesh part(s), ${r.size?.join(" x ")} studs${r.scaled ? ` (scaled x${r.scaled} to the size asked)` : ""}${r.position ? `, resting at ${r.position.join(", ")}` : ""}; anchored, one undo step, selected.`];
+  for (const p of r.parts ?? []) lines.push(`  ${p.name}: ${p.size.join(" x ")}${p.meshId ? `, mesh ${p.meshId}` : p.mesh ? `, ${p.mesh} mesh` : ""}`);
+  if (r.opaqueMeshes) lines.push(`Its mesh is generated (Opaque) content with no asset id: an export_rbxm of it comes back with no mesh (measured), so do not copy it between places that way; whether a save of the place keeps it was not measured.`);
+  return lines.join("\n");
+}
+
+/** The MicroProfiler for a moment, read through LibMP */
+async function micro(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  if (options.peer !== undefined && !["edit", "server", "client"].includes(options.peer)) throw new UsageError("--peer must be edit, server or client");
+  if (options.out !== undefined && !/\.mpz$/i.test(options.out)) throw new UsageError("--out must be a .mpz file (the capture, LZ4-compressed)");
+  if (options.sort !== undefined && options.sort !== "self" && options.sort !== "inclusive") throw new UsageError("--sort must be self or inclusive");
+  const place = await resolvePlace(ctx, query);
+  const durationMs = positiveInt(options.ms, "ms") ?? 1000;
+  const timeoutMs = (options.timeout ?? Math.ceil(durationMs / 1000) + 60) * 1000;
+  const result = await studio(ctx, place, "micro", {
+    peer: options.peer, durationMs, frames: positiveInt(options.frames, "frames"), maxTimers: positiveInt(options.limit, "limit"),
+    focus: options.mode, sort: options.sort, filter: options.filter, includeGpu: options.gpu, includeIdle: options.includeIdle, keep: options.keep,
+    ...(options.out ? { out: path.resolve(ctx.cwd, options.out) } : {}), timeoutMs,
+  }, timeoutMs);
+  if (options.json) ctx.out(JSON.stringify(result, null, 2));
+  else ctx.out(microText(result));
+  return EXIT.ok;
+}
+
+export function microText(r: any): string {
+  const f = r.frames ?? {};
+  const lines = [
+    `MicroProfiler in ${PEER_NAME[r.peer] ?? r.peer} for ${r.durationMs} ms: ${f.count} frames (ids ${f.firstId} to ${f.lastId}), frame ms avg ${f.msAvg}, p50 ${f.msP50}, p90 ${f.msP90}, p99 ${f.msP99}, max ${f.msMax}; ${f.over50ms} over 50 ms`,
+  ];
+  if (f.slowest?.length) lines.push(`Slowest frames: ${f.slowest.map((s: any) => `${s.ms} ms (id ${s.id}, absolute ${s.absoluteId})`).join(", ")}`);
+  lines.push(`Scopes by ${r.sort === "inclusive" ? "inclusive" : "self"} time, ms a frame (self / inclusive / worst frame / calls):`);
+  for (const t of r.timers ?? []) lines.push(`${String(t.rank).padStart(3)}. ${String(t.selfMsPerFrame).padStart(8)} / ${String(t.inclusiveMsPerFrame).padStart(8)} / ${String(t.maxFrameMs).padStart(7)} / ${String(t.calls).padStart(6)}  ${t.name} [${t.group}]`);
+  if (!r.timers?.length) lines.push("  (no scope matched)");
+  if (r.groups?.length) lines.push(`Groups, self ms a frame: ${r.groups.slice(0, 10).map((g: any) => `${g.name} ${g.selfMsPerFrame} (${g.pct}%)`).join(", ")}`);
+  if (r.threads?.length) lines.push(`Threads, busy ms a frame: ${r.threads.slice(0, 8).map((t: any) => `${t.name} ${t.busyMsPerFrame}`).join(", ")}`);
+  if (r.truncated) lines.push(`(stopped after ${r.steps} log entries: fewer --frames reads all of them)`);
+  if (r.note) lines.push(`(${r.note})`);
+  if (r.profilerLeftOn) lines.push("(the MicroProfiler was left on)");
+  if (r.file) lines.push(`Capture: ${r.file}`);
+  return lines.join("\n");
+}
+
+/**
+ * The experience (universe) a cloud command works on: --universe, else the place's (a registered
+ * place or a place id) through Roblox's public places API, which needs no key.
+ */
+async function universeOf(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  if (options.universe !== undefined) {
+    const n = Number(options.universe);
+    if (!Number.isSafeInteger(n) || n <= 0) throw new UsageError("--universe must be an experience (universe) id");
+    return n;
+  }
+  const placeId = await placeIdArg(ctx, query);
+  const env = rbx(ctx);
+  let response: Response;
+  try {
+    response = await env.fetch(`https://apis.roblox.com/universes/v1/places/${placeId}/universe`, { signal: AbortSignal.timeout(15_000) });
+  } catch (error) {
+    throw new Error(`could not ask Roblox which experience place ${placeId} is in (${(error as Error).message}): give --universe`);
+  }
+  const json: any = await response.json().catch(() => undefined);
+  const id = Number(json?.universeId);
+  if (!response.ok || !Number.isSafeInteger(id) || id <= 0) throw new Error(`Roblox did not say which experience place ${placeId} is in (HTTP ${response.status}): give --universe`);
+  return id;
+}
+
+/** A JSON value from --value=<json> or --file <path> (a string that is not JSON stays a string) */
+function valueOption(ctx: ControlContext, options: Options): unknown {
+  if (options.value !== undefined && options.file !== undefined) throw new UsageError("give --value or --file, not both");
+  const text = options.file !== undefined ? fs.readFileSync(path.resolve(ctx.cwd, options.file), "utf8") : options.value;
+  if (text === undefined) throw new UsageError("give the value as --value=<json> or --file <path>");
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+const DATASTORE_USAGE = "datastore stores|keys <store>|get <store> <key>|versions <store> <key>|set <store> <key>|increment <store> <key>|delete <store> <key> [place] [--universe <id>] (see --help)";
+
+/** A live game's DataStores (Open Cloud, through the hub): reads free, writes after the user's yes */
+async function datastoreCommand(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const action = need(args[0], DATASTORE_USAGE);
+  const needsStore = action !== "stores";
+  const needsKey = !["stores", "keys"].includes(action);
+  const store = needsStore ? need(args[1], DATASTORE_USAGE) : undefined;
+  const key = needsKey ? need(args[2], DATASTORE_USAGE) : undefined;
+  const query = args[needsKey ? 3 : needsStore ? 2 : 1];
+  const universeId = await universeOf(ctx, options, query);
+  const common = { universeId, ...(store ? { store } : {}), ...(key ? { key } : {}), ...(options.scope ? { scope: options.scope } : {}) };
+  const ops: Record<string, [string, Record<string, unknown>]> = {
+    stores: ["dsStores", { universeId, prefix: options.prefix, limit: positiveInt(options.limit, "limit"), cursor: options.cursor }],
+    keys: ["dsKeys", { ...common, prefix: options.prefix, allScopes: options.allScopes, limit: positiveInt(options.limit, "limit"), cursor: options.cursor }],
+    get: ["dsGet", { ...common, fields: options.fields, version: options.version, ...(options.out ? { out: path.resolve(ctx.cwd, options.out) } : {}) }],
+    versions: ["dsVersions", { ...common, start: options.start, end: options.end, limit: positiveInt(options.limit, "limit"), oldestFirst: options.oldestFirst, cursor: options.cursor }],
+    set: ["dsSet", { ...common, value: action === "set" ? valueOption(ctx, options) : undefined }],
+    increment: ["dsIncrement", { ...common, by: options.by === undefined ? undefined : Number(options.by) }],
+    delete: ["dsDelete", common],
+  };
+  const chosen = ops[action];
+  if (!chosen) throw new UsageError(`usage: ${DATASTORE_USAGE}`);
+  if (action === "increment" && options.by === undefined) throw new UsageError("--by <n> is required");
+  const result = await cloudCall(ctx, chosen[0], chosen[1]);
+  ctx.out(options.json ? JSON.stringify(result, null, 2) : datastoreText(action, result));
+  return EXIT.ok;
+}
+
+export function datastoreText(action: string, r: any): string {
+  const where = r.store ? `${r.store}${r.key ? `/${r.key}` : ""}${r.scope && r.scope !== "global" ? ` (scope ${r.scope})` : ""}` : `experience ${r.universeId}`;
+  const more = r.cursor ? `\nMore: --cursor ${r.cursor}` : "";
+  switch (action) {
+    case "stores":
+      return `${r.stores.length} DataStore(s) in experience ${r.universeId}:\n${r.stores.map((s: any) => `  ${s.name}`).join("\n")}${more}`;
+    case "keys":
+      return `${r.keys.length} key(s) in ${where}:\n${r.keys.map((k: string) => `  ${k}`).join("\n")}${more}`;
+    case "get": {
+      if (!r.exists) return `${where}: no such entry.`;
+      const head = `${where}: version ${r.version}, ${r.bytes} bytes, saved ${r.versionCreatedTime ?? "?"}${r.userIds?.length ? `, users ${r.userIds.join(", ")}` : ""}`;
+      if (r.fields) return `${head}\n${Object.entries(r.fields).map(([k, v]) => `  ${k} = ${JSON.stringify(v)}`).join("\n")}`;
+      if (r.file) return `${head}\nThe value is in ${r.file}${r.note ? ` (${r.note})` : ""}${r.topLevelKeys ? `\nTop-level keys: ${r.topLevelKeys.join(", ")}` : ""}`;
+      return `${head}\n${JSON.stringify(r.value, null, 2)}`;
+    }
+    case "versions":
+      return `${r.versions.length} version(s) of ${where}:\n${r.versions.map((v: any) => `  ${v.createdTime}  ${v.version}  ${v.contentLength} bytes${v.deleted ? "  (deleted)" : ""}`).join("\n")}${more}`;
+    case "set":
+      return `Saved ${where} (version ${r.version}, ${r.bytes} bytes).`;
+    case "increment":
+      return `${where} is now ${JSON.stringify(r.value)}.`;
+    case "delete":
+      return `Deleted ${where} (its versions stay readable for 30 days).`;
+  }
+  return JSON.stringify(r, null, 2);
+}
+
+/** Luau run by Roblox in a cloud server against a saved version of a place (a write: the dialog shows it) */
+async function luauCommand(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const script = luauCode(ctx, options);
+  const placeId = Number(await placeIdArg(ctx, args[0]));
+  const universeId = await universeOf(ctx, options, String(placeId));
+  const result = await cloudCall(ctx, "luauRun", {
+    universeId, placeId, script, ...(options.version ? { version: positiveInt(options.version, "version") } : {}), ...(options.timeout ? { timeoutSeconds: options.timeout } : {}),
+  });
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return result.state === "COMPLETE" ? EXIT.ok : EXIT.error;
+  }
+  for (const line of result.output ?? []) ctx.out(line);
+  if (result.state === "COMPLETE") ctx.out(`=> ${(result.results ?? []).map((v: unknown) => JSON.stringify(v)).join(", ") || "(nothing returned)"}`);
+  else ctx.err(`The cloud run ${result.state.toLowerCase()}${result.error ? `: ${result.error}` : ""}`);
+  ctx.out(`(${result.ms} ms on place ${result.placeId}${result.version ? ` version ${result.version}` : ""})`);
+  return result.state === "COMPLETE" ? EXIT.ok : EXIT.error;
+}
+
+const CONFIG_USAGE ="config get|draft|set|publish [place] [--universe <id>] [--keys a,b] [--value=<json object> | --file <json>] [--message <text>] [--repository <name>]";
+
+/** An experience's configs: read, the draft read and merged (free), the publish after the user's yes */
+async function configCommand(ctx: ControlContext, options: Options, args: string[]): Promise<number> {
+  const action = need(args[0], CONFIG_USAGE);
+  const universeId = await universeOf(ctx, options, args[1]);
+  const base = { universeId, ...(options.repository ? { repository: options.repository } : {}) };
+  let result: any;
+  if (action === "get") result = await cloudCall(ctx, "configGet", { ...base, ...(options.keys ? { keys: options.keys } : {}) });
+  else if (action === "draft") result = await cloudCall(ctx, "configDraft", base);
+  else if (action === "set") {
+    const entries = valueOption(ctx, options);
+    if (!entries || typeof entries !== "object" || Array.isArray(entries)) throw new UsageError("config set takes an object of key: value (--value='{\"Key\": 1}')");
+    result = await cloudCall(ctx, "configSet", { ...base, entries });
+  } else if (action === "publish") result = await cloudCall(ctx, "configPublish", { ...base, message: options.message });
+  else throw new UsageError(`usage: ${CONFIG_USAGE}`);
+  if (options.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return EXIT.ok;
+  }
+  if (action === "get") ctx.out(`Configs of experience ${result.universeId} (${result.repository}), version ${result.version ?? "?"}, ${result.count} keys:\n${Object.entries(result.entries).map(([k, v]) => `  ${k} = ${JSON.stringify(v)}`).join("\n")}`);
+  else if (action === "draft") ctx.out(result.draft ? `A draft is pending (${result.changes.length} change(s) from what is published):\n${result.changes.map((c: string) => `  ${c}`).join("\n")}` : `No draft is pending in experience ${result.universeId}.`);
+  else if (action === "set") ctx.out(`Merged ${result.merged.join(", ")} into the draft (not live: config publish ships it, after the user's yes).`);
+  else ctx.out(`Published the configs of experience ${result.universeId}${result.version ? ` (version ${result.version})` : ""}.`);
+  return EXIT.ok;
 }
 
 // ---------------------------------------------------------------------------------------

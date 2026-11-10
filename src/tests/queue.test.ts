@@ -807,7 +807,7 @@ test("hub API: capability, settings, the lock and its line, a job kept over a hu
   await hub.start();
   try {
     const state = (await api(port, "GET", "/api/state")).body;
-    assert.deepEqual(state.capabilities, ["queue"]);
+    assert.deepEqual(state.capabilities, ["queue", "approvals"]);
 
     assert.equal((await api(port, "POST", "/api/queue/settings", { settings: { capMin: -3 } })).status, 400);
     const set = await api(port, "POST", "/api/queue/settings", { settings: { capMin: 4 } });

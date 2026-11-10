@@ -6,6 +6,8 @@
 // the webview is one.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod approval;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -17,7 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tauri::image::Image;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, Rect, RunEvent, WebviewWindow, WindowEvent};
+use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, Rect, RunEvent, UserAttentionType, WebviewWindow, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as _};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_notification::NotificationExt;
@@ -83,11 +85,18 @@ const HUB_EXIT_CHECK_EVERY: Duration = Duration::from_millis(25);
 const UPDATE_CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 /** The hub restart an update asks for is done only this soon after the click */
 const UPDATE_RESTART_WINDOW_SECS: u64 = 10 * 60;
+/** How long a write waits for the user's answer in the hub (src/cloud/approve.ts) */
+const APPROVAL_WAIT: Duration = Duration::from_secs(5 * 60);
 
 use flavor::{ICON_BAD, ICON_OK, ICON_PAUSED, ICON_WARN};
 
 fn appdata() -> PathBuf {
     std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+}
+
+/** The flavor's settings folder: settings.json, the update marker, the approval token */
+fn settings_dir() -> PathBuf {
+    appdata().join(flavor::IDENTIFIER)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -193,17 +202,34 @@ struct Shared {
     tray_hidden_at: Mutex<Option<Instant>>,
     /** A new version, downloaded and checked against the signing key, waiting for the click */
     ready_update: Mutex<Option<(Update, Vec<u8>)>>,
+    /**
+     * The token that answers the hub's approvals: the one this app gave the hub it started, or
+     * the one an earlier app saved (approval.rs). Never sent to the windows.
+     */
+    approval_token: Mutex<Option<String>>,
 }
 
 fn hub_call(port: u16, method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    hub_call_with(port, method, path, body, None)
+}
+
+/**
+ * A call to the hub. Every one says it is the app (the hub then knows an app is there to ask
+ * the user); `token`, the approval token, only on the calls that read or answer approvals.
+ */
+fn hub_call_with(port: u16, method: &str, path: &str, body: Option<&Value>, token: Option<&str>) -> Result<Value, String> {
     if !path.starts_with("/api/") {
         return Err("not a hub API path".into());
     }
     let url = format!("http://127.0.0.1:{port}{path}");
     let agent = ureq::AgentBuilder::new().timeout_connect(CONNECT_TIMEOUT).timeout(Duration::from_secs(5)).build();
+    let mut request = agent.request(method, &url).set(approval::APP_HEADER, "1");
+    if let Some(token) = token {
+        request = request.set(approval::TOKEN_HEADER, token);
+    }
     let result = match body {
-        Some(body) => agent.request(method, &url).send_json(body.clone()),
-        None => agent.request(method, &url).call(),
+        Some(body) => request.send_json(body.clone()),
+        None => request.call(),
     };
     match result {
         Ok(response) => response.into_json::<Value>().map_err(|e| e.to_string()),
@@ -236,8 +262,25 @@ async fn hub_post(app: AppHandle, path: String, body: Value) -> Result<Value, St
     if path == "/api/shutdown" {
         return Err("the app stops the hub only when it quits".into());
     }
+    if path.starts_with("/api/approvals") {
+        return Err("a write is answered through approval_answer".into());
+    }
     let port = port_of(&app);
     tauri::async_runtime::spawn_blocking(move || hub_call(port, "POST", &path, Some(&body)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/**
+ * The user's click in the approval popup. The token is added here, in Rust: the windows never
+ * see it. Without one the hub knows, the popup says to restart the hub.
+ */
+#[tauri::command]
+async fn approval_answer(app: AppHandle, id: String, approve: bool) -> Result<Value, String> {
+    let port = port_of(&app);
+    let token = app.state::<Shared>().approval_token.lock().unwrap().clone();
+    let Some(token) = token else { return Err("restart the hub to approve writes".into()) };
+    tauri::async_runtime::spawn_blocking(move || hub_call_with(port, "POST", "/api/approvals/answer", Some(&json!({ "id": id, "approve": approve })), Some(&token)))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -377,7 +420,7 @@ fn unix_now() -> u64 {
 
 /** Written right before an update installs; the new version finds it and restarts the hub */
 fn update_marker() -> PathBuf {
-    appdata().join(flavor::IDENTIFIER).join("restart-hub-after-update")
+    settings_dir().join("restart-hub-after-update")
 }
 
 /**
@@ -471,7 +514,7 @@ async fn install_update(app: AppHandle) -> Result<(), String> {
  * measured 21/10/26. None when there was no update click, it is stale, no hub runs, or the one
  * running already is this build; finish_update and the poll loop cover what is left.
  */
-fn early_update_takeover(settings: &Settings) -> Option<Child> {
+fn early_update_takeover(settings: &Settings) -> Option<(Child, String)> {
     if cfg!(debug_assertions) {
         return None;
     }
@@ -487,7 +530,12 @@ fn early_update_takeover(settings: &Settings) -> Option<Child> {
     let build = fs::read_to_string(hub_dir.join("BUILD")).ok()?.trim().to_string();
     let entry = settings.hub_entry.as_deref().filter(|e| !e.trim().is_empty()).map(PathBuf::from).unwrap_or_else(|| hub_dir.join("hub.mjs"));
     match hub_call(settings.hub_port, "GET", "/api/state", None) {
-        Ok(state) if state["build"].as_str() != Some(build.as_str()) => start_hub_process(settings, &without_verbatim(entry), true).ok(),
+        Ok(state) if state["build"].as_str() != Some(build.as_str()) => {
+            let token = approval::new_token().ok()?;
+            let child = start_hub_process(settings, &without_verbatim(entry), true, &token).ok()?;
+            remember_token(&token);
+            Some((child, token))
+        }
         _ => None,
     }
 }
@@ -1094,6 +1142,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_token_reaches_the_hub_on_stdin_and_stdin_then_ends() {
+        let mut child = Command::new("node")
+            .args(["-e", "let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>process.stdout.write('['+s+']'))"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let token = approval::new_token().unwrap();
+        write_token(&mut child, &token);
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), format!("[{token}\n]"), "the whole token, then the end of stdin");
+    }
+
+    #[test]
+    fn the_poll_announces_each_waiting_write_once_and_rechecks_a_token_the_hub_does_not_take() {
+        let state = |pending: u64, started: u64| json!({ "capabilities": ["queue", "approvals"], "approvals": pending, "startedAt": started });
+        let list = |ids: &[&str], answerable: bool| json!({ "approvals": ids.iter().map(|id| json!({ "id": id, "title": "Quack: set" })).collect::<Vec<_>>(), "answerable": answerable });
+        let mut watch = ApprovalWatch::default();
+        let mut reads = 0;
+
+        // First poll: the token is checked even with nothing waiting
+        assert!(watch.poll(&state(0, 1), Some("t"), |_| { reads += 1; Ok(list(&[], true)) }).is_empty());
+        assert_eq!((reads, watch.answerable), (1, Some(true)));
+        // Nothing waits and the token is known good: no read
+        watch.poll(&state(0, 1), Some("t"), |_| { reads += 1; Ok(list(&[], true)) });
+        assert_eq!(reads, 1);
+
+        // A write waits: announced once, listed while it waits
+        let fresh = watch.poll(&state(1, 1), Some("t"), |_| Ok(list(&["a"], true)));
+        assert_eq!(fresh.len(), 1);
+        assert!(watch.poll(&state(1, 1), Some("t"), |_| Ok(list(&["a"], true))).is_empty(), "not announced twice");
+        assert!(watch.poll(&state(1, 1), Some("t"), |_| Err("down".into())).is_empty(), "a failed read announces nothing");
+        assert!(watch.poll(&state(1, 1), Some("t"), |_| Ok(list(&["a"], true))).is_empty(), "nor after it");
+        assert_eq!(watch.list.as_array().unwrap().len(), 1);
+        assert!(watch.is_waiting("a"), "its toast is kept");
+        assert!(!watch.just_emptied());
+        // Answered: the flash stops once
+        watch.poll(&state(0, 1), Some("t"), |_| panic!("no read"));
+        assert!(watch.just_emptied());
+        assert!(!watch.is_waiting("a"), "answered: its toast is let go");
+        assert_eq!(watch.list, json!([]));
+
+        // A new hub (another start time): checked again; one that refuses the token is checked every poll
+        let mut reads = 0;
+        watch.poll(&state(0, 2), Some("t"), |_| { reads += 1; Ok(list(&[], false)) });
+        watch.poll(&state(0, 2), Some("t"), |_| { reads += 1; Ok(list(&[], false)) });
+        assert_eq!((reads, watch.answerable), (2, Some(false)));
+
+        // A hub without approvals (an older build): nothing to answer, no notice
+        watch.poll(&json!({ "capabilities": ["queue"] }), Some("t"), |_| panic!("no read"));
+        assert_eq!(watch.answerable, None);
+    }
+
+    #[test]
     fn a_running_session_is_not_ending_so_the_hub_still_restarts() {
         // The shutdown side only shows on a real shutdown; this keeps the check from ever
         // blocking the restart after a crash or `quack restart-hub`
@@ -1388,14 +1490,32 @@ fn spawn_hub_with(app: &AppHandle, takeover: bool) {
         return;
     }
     *last = Some(Instant::now());
-    match start_hub_process(&settings, &hub_entry(app, &settings), takeover) {
-        Ok(child) => *hub = Some(child),
+    let token = match approval::new_token() {
+        Ok(token) => token,
+        Err(error) => return eprintln!("Could not make the approval token: {error}"),
+    };
+    match start_hub_process(&settings, &hub_entry(app, &settings), takeover, &token) {
+        Ok(child) => {
+            *hub = Some(child);
+            remember_token(&token);
+            *shared.approval_token.lock().unwrap() = Some(token);
+        }
         Err(error) => eprintln!("Could not start the hub: {error}"),
     }
 }
 
-/** The hub process itself, logging to the flavor's hub log; needs no running app (see main) */
-fn start_hub_process(settings: &Settings, entry: &Path, takeover: bool) -> Result<Child, String> {
+/** The token saved for the next app instance (the hub outlives this one) */
+fn remember_token(token: &str) {
+    if let Err(error) = approval::save_token(&settings_dir(), flavor::IDENTIFIER, token) {
+        eprintln!("Could not save the approval token: {error}");
+    }
+}
+
+/**
+ * The hub process itself, logging to the flavor's hub log; needs no running app (see main).
+ * `token` answers its approvals: written on its stdin, then stdin closes (--token-stdin).
+ */
+fn start_hub_process(settings: &Settings, entry: &Path, takeover: bool, token: &str) -> Result<Child, String> {
     // Each flavor's hub writes its own log: shared, the two read as one
     let log_file = appdata().join("quack").join(flavor::HUB_LOG);
     let _ = fs::create_dir_all(log_file.parent().unwrap());
@@ -1408,14 +1528,25 @@ fn start_hub_process(settings: &Settings, entry: &Path, takeover: bool) -> Resul
     let mut command = hidden_command(&settings.node);
     command
         .arg(entry)
-        .args(["--port", &settings.hub_port.to_string(), "--registry", &settings.registry])
-        .stdin(Stdio::null())
+        .args(["--port", &settings.hub_port.to_string(), "--registry", &settings.registry, "--token-stdin"])
+        .stdin(Stdio::piped())
         .stdout(log)
         .stderr(log_err);
     if takeover {
         command.arg("--takeover");
     }
-    command.spawn().map_err(|e| e.to_string())
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    write_token(&mut child, token);
+    Ok(child)
+}
+
+/** The token on the child's stdin, then the end of stdin */
+fn write_token(child: &mut Child, token: &str) {
+    use std::io::Write;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = writeln!(stdin, "{token}");
+        // Dropped here: the hub sees the end of stdin and keeps the token
+    }
 }
 
 fn tray_icon_for(online: bool, state: &Value) -> (&'static str, &'static [u8]) {
@@ -1426,7 +1557,7 @@ fn tray_icon_for(online: bool, state: &Value) -> (&'static str, &'static [u8]) {
         return ("paused", ICON_PAUSED);
     }
     let conflicts: u64 = state["places"].as_array().into_iter().flatten().filter_map(|p| p["conflicts"].as_u64()).sum();
-    let waiting = state["pending"].as_array().is_some_and(|p| !p.is_empty());
+    let waiting = state["pending"].as_array().is_some_and(|p| !p.is_empty()) || state["approvals"].as_u64().unwrap_or(0) > 0;
     if conflicts > 0 || waiting { ("warn", ICON_WARN) } else { ("ok", ICON_OK) }
 }
 
@@ -1447,11 +1578,111 @@ fn tooltip_for(language: &str, online: bool, state: &Value) -> String {
     text
 }
 
+/**
+ * What the poll knows of the hub's approvals. The list is read only while the hub reports one
+ * waiting, or until the hub says it takes this app's token (a new hub, or a new token, is
+ * checked again: one that just started may not have read its stdin yet).
+ */
+#[derive(Default)]
+struct ApprovalWatch {
+    /** The writes waiting, as GET /api/approvals gave them (what the window shows) */
+    list: Value,
+    /** Whether the hub takes this app's answers; None for a hub without approvals */
+    answerable: Option<bool>,
+    /** The hub (its start time) and the token `answerable` is about */
+    checked: Option<(Value, Option<String>)>,
+    known: std::collections::HashSet<String>,
+    waiting: bool,
+    emptied: bool,
+}
+
+impl ApprovalWatch {
+    /** One poll's /api/state (Null when offline); returns the approvals new since the last one */
+    fn poll(&mut self, state: &Value, token: Option<&str>, fetch: impl FnOnce(Option<&str>) -> Result<Value, String>) -> Vec<Value> {
+        let was_waiting = self.waiting;
+        self.emptied = false;
+        let supported = state["capabilities"].as_array().is_some_and(|c| c.iter().any(|x| x == "approvals"));
+        let key = (state["startedAt"].clone(), token.map(String::from));
+        let pending = state["approvals"].as_u64().unwrap_or(0);
+        if !supported || (pending == 0 && self.answerable == Some(true) && self.checked.as_ref() == Some(&key)) {
+            if !supported {
+                self.answerable = None;
+                self.checked = None;
+            }
+            self.list = json!([]);
+            self.known.clear();
+            self.waiting = false;
+            self.emptied = was_waiting;
+            return Vec::new();
+        }
+        // A failed read keeps what was known: the next poll must not announce the same write again
+        let Ok(answer) = fetch(token) else { return Vec::new() };
+        self.answerable = answer["answerable"].as_bool();
+        self.checked = Some(key);
+        self.list = if answer["approvals"].is_array() { answer["approvals"].clone() } else { json!([]) };
+        let mut fresh = Vec::new();
+        let mut now = std::collections::HashSet::new();
+        for approval in self.list.as_array().into_iter().flatten() {
+            if let Some(id) = approval["id"].as_str() {
+                if !self.known.contains(id) {
+                    fresh.push(approval.clone());
+                }
+                now.insert(id.to_string());
+            }
+        }
+        self.waiting = !now.is_empty();
+        self.emptied = was_waiting && !self.waiting;
+        self.known = now;
+        fresh
+    }
+
+    /** This write still waits for the user, as far as the last read knows */
+    fn is_waiting(&self, id: &str) -> bool {
+        self.known.contains(id)
+    }
+
+    /** The last write waiting was just answered (or expired): the taskbar stops flashing */
+    fn just_emptied(&self) -> bool {
+        self.emptied
+    }
+}
+
+/**
+ * A write started waiting for the user. In the background: the chime, the window back on the
+ * taskbar minimized with its button flashing (never over a fullscreen game: the tray's native
+ * menu lost the foreground to one, measured), and a toast whose click shows the popup.
+ */
+fn alert_approval(app: &AppHandle, language: &str, approval: &Value) -> Option<approval::ToastHold> {
+    approval::play_chime();
+    if let Some(window) = app.get_webview_window("main") {
+        if !window.is_visible().unwrap_or(false) {
+            // tao: a hidden window minimized stays hidden but iconic, and the show then puts it
+            // on the taskbar minimized
+            let _ = window.minimize();
+            let _ = window.show();
+        }
+        let _ = window.request_user_attention(Some(UserAttentionType::Critical));
+    }
+    let (head, body) = approval::toast_text(language, approval["title"].as_str().unwrap_or_default());
+    let handle = app.clone();
+    match approval::show_toast(flavor::IDENTIFIER, head.clone(), body.clone(), APPROVAL_WAIT, move || show_main_window(&handle)) {
+        Ok(hold) => Some(hold),
+        Err(_) => {
+            // No toast of its own (an unregistered app id): the plugin's, which has no click
+            let _ = app.notification().builder().title(head).body(body).show();
+            None
+        }
+    }
+}
+
 fn poll_loop(app: AppHandle) {
     let mut shown_icon = "";
     let mut shown_tooltip = String::new();
     let mut known_conflicts: Option<HashMap<String, u64>> = None;
     let mut known_choices: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut approvals = ApprovalWatch::default();
+    // Each waiting write's toast, kept alive until that write is answered or gone
+    let mut toasts: HashMap<String, approval::ToastHold> = HashMap::new();
     loop {
         let shared = app.state::<Shared>();
         let (port, language, notify) = {
@@ -1461,12 +1692,15 @@ fn poll_loop(app: AppHandle) {
         let result = hub_call(port, "GET", "/api/state", None);
         let online = result.is_ok();
         let state = result.clone().unwrap_or(Value::Null);
+        let token = shared.approval_token.lock().unwrap().clone();
+        let fresh = approvals.poll(&state, token.as_deref(), |token| hub_call_with(port, "GET", "/api/approvals", None, token));
         match &result {
             Ok(state) => {
                 // It came up: once it is gone, the next one starts at once (RESPAWN_AFTER)
                 *shared.last_spawn.lock().unwrap() = None;
                 *shared.last_state.lock().unwrap() = state.clone();
-                let _ = app.emit("hub-state", json!({ "online": true, "state": state }));
+                // The writes waiting for an answer, and whether this app's answers count
+                let _ = app.emit("hub-state", json!({ "online": true, "state": state, "approvals": approvals.list, "approvalsAnswerable": approvals.answerable }));
             }
             Err(error) => {
                 let _ = app.emit("hub-state", json!({ "online": false, "error": error }));
@@ -1519,7 +1753,21 @@ fn poll_loop(app: AppHandle) {
                 }
             }
             known_choices = current;
+
+            // A write that started waiting: the chime, the taskbar flash and a toast, once each
+            for approval in &fresh {
+                if let (Some(hold), Some(id)) = (alert_approval(&app, &language, approval), approval["id"].as_str()) {
+                    toasts.insert(id.to_string(), hold);
+                }
+            }
+            if approvals.just_emptied() {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.request_user_attention(None);
+                }
+            }
         }
+        // An answered (or expired) write lets its toast's thread end now, not after the full wait
+        toasts.retain(|id, _| approvals.is_waiting(id));
         if sleep_until_own_hub_exits(&shared.hub, POLL_EVERY) {
             // Its own hub stopped (quack restart-hub, a crash): the next one starts now, not at
             // the next poll; spawn_hub still holds back one that never came up
@@ -1569,11 +1817,15 @@ fn main() {
         .and_then(|text| serde_json::from_str::<Settings>(&text).ok())
         .unwrap_or_default();
     // After an update click: the new hub starts now, while Tauri is still building the windows
-    let early_hub = early_update_takeover(&settings);
+    let (early_hub, early_token) = early_update_takeover(&settings).unzip();
+    // A hub this app did not start (an earlier instance did; it outlives the app) answers to the
+    // token that instance saved. A hub this app starts later replaces it with its own
+    let approval_token = early_token.or_else(|| approval::load_token(&settings_dir(), flavor::IDENTIFIER));
     let shared = Shared {
         settings: Mutex::new(settings),
         settings_file,
         hub: Mutex::new(early_hub),
+        approval_token: Mutex::new(approval_token),
         last_spawn: Mutex::new(None),
         last_state: Mutex::new(Value::Null),
         tray_rect: Mutex::new(None),
@@ -1582,7 +1834,13 @@ fn main() {
     };
     tauri::Builder::default()
         .manage(shared)
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main_window(app)))
+        // A second start shows the window, except the hub's own (--hidden, when a write waits and
+        // it found no app polling): that one must not take the screen
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if !args.iter().any(|arg| arg == "--hidden") {
+                show_main_window(app);
+            }
+        }))
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec!["--hidden"])))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -1590,6 +1848,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             hub_get,
             hub_post,
+            approval_answer,
             get_settings,
             set_settings,
             get_autostart,

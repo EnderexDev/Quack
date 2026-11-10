@@ -1,4 +1,5 @@
 import test from "node:test";
+import { numbersOnly } from "../util/luauNumbers.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -11,6 +12,8 @@ import { IPCServer } from "../ipc/server.js";
 import { StudioTools } from "../studioTools.js";
 import { encodeGif, lzw } from "../util/gif.js";
 import { encodePng, halve, sheet } from "../util/png.js";
+import { readRoblox } from "../util/rbxl.js";
+import { buildRoblox, chunk as rbxChunk, samplePlace } from "./rbxlFixture.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const version = JSON.parse(fs.readFileSync(path.join(here, "..", "..", "package.json"), "utf8")).version;
@@ -203,6 +206,72 @@ test("a play socket that never says hello is an older plugin, and a peer leaving
     await waitFor(() => d.ipc.playPeers().server === "ready");
     await assert.rejects(d.tools.call("eval", { code: "x", timeoutMs: 300 }), /the play server did not answer in 0 s \(the code may still be running there\)/);
     deaf.close();
+    edit.close();
+  } finally {
+    await d.close();
+  }
+});
+
+// chrrxs's get_request_status (3 calls in a month): a timeout ends the wait, not the code. Its
+// answer was dropped, so the only way to learn what an exec did was to send it again
+test("a call that timed out keeps its id: get_request_status says pending, then the answer that came later, or lost when the play left", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    await assert.rejects(d.tools.call("requestStatus", { id: "nope" }), /id must be the request id a timeout named/);
+    const unknown: any = await d.tools.call("requestStatus", { id: "0123456789ab" });
+    assert.equal(unknown.state, "unknown");
+    assert.match(unknown.note, /cannot say whether it ran/);
+
+    // An edit call that takes longer than its wait: the timeout names its id
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const edit = await editStudio(d.url, async (tool) => {
+      if (tool === "exec") await gate;
+      return { ok: true, values: ["42"], output: ["done"] };
+    });
+    const error = await d.tools.call("exec", { code: "return 42", timeoutMs: 400 }).then(() => undefined, (e: Error) => e);
+    assert.ok(error);
+    const id = /Request ([0-9a-f]{12}): get_request_status/.exec(error.message)?.[1];
+    assert.ok(id, error.message);
+    const pending: any = await d.tools.call("requestStatus", { id });
+    assert.equal(pending.state, "pending");
+    assert.equal(pending.tool, "exec");
+    assert.equal(pending.peer, "edit");
+    release();
+    await waitFor(() => (d.tools as any).late.get(id)?.state === "answered");
+    const answered: any = await d.tools.call("requestStatus", { id });
+    assert.equal(answered.state, "answered");
+    assert.deepEqual(answered.result.values, ["42"]);
+    assert.deepEqual(answered.result.output, ["done"]);
+    assert.ok(answered.answeredAfterTimeoutMs >= 0);
+
+    // A late error is kept as the error
+    const failing = new Promise<void>((r) => setTimeout(r, 600));
+    edit.removeAllListeners("message");
+    answer(edit, async () => {
+      await failing;
+      throw new Error("attempt to index nil");
+    });
+    const second = await d.tools.call("exec", { code: "x.y = 1", timeoutMs: 300 }).then(() => undefined, (e: Error) => e);
+    const id2 = /Request ([0-9a-f]{12})/.exec(second!.message)![1];
+    await waitFor(() => (d.tools as any).late.get(id2)?.state === "failed");
+    assert.match(((await d.tools.call("requestStatus", { id: id2 })) as any).error, /attempt to index nil/);
+
+    // A play peer that leaves before answering: lost, never pending forever
+    const server = await playPeer(d.url, "server", () => new Promise(() => {}));
+    await waitFor(() => d.ipc.playPeers().server === "ready");
+    // wait_for's tries that time out keep no id: a long wait would push real calls out of the 50
+    const before = (d.tools as any).late.size;
+    await d.tools.call("waitFor", { code: "workspace.Never", timeoutMs: 700, tryTimeoutMs: 200, intervalMs: 50 }).catch(() => undefined);
+    assert.equal((d.tools as any).late.size, before, "no try of wait_for is kept");
+    // A try cut by the deadline says the time it had, not its own limit
+    const cut: any = await d.tools.call("waitFor", { code: "workspace.Never", timeoutMs: 400, tryTimeoutMs: 5000 }).catch((e: Error) => ({ thrown: e.message }));
+    assert.match(JSON.stringify(cut), /the try did not answer in [1-4]\d\d ms/, JSON.stringify(cut));
+    const third = await d.tools.call("eval", { code: "while true do end", timeoutMs: 300 }).then(() => undefined, (e: Error) => e);
+    const id3 = /Request ([0-9a-f]{12})/.exec(third!.message)![1];
+    server.close();
+    await waitFor(() => (d.tools as any).late.get(id3)?.state === "lost");
+    assert.match(((await d.tools.call("requestStatus", { id: id3 })) as any).error, /the play stopped before the play server answered/);
     edit.close();
   } finally {
     await d.close();
@@ -986,7 +1055,7 @@ test("logpoint: a file becomes the script's guid, a path goes as it is; export w
       fileOf: () => undefined,
     });
     const seen: any[] = [];
-    const model = Buffer.from("<roblox!fake model bytes>");
+    const model = buildRoblox([{ className: "Model", name: "Tower", children: [{ className: "Script", name: "A" }, { className: "Script", name: "B" }] }]);
     const edit = await editStudio(d.url, (tool, args) => {
       seen.push({ tool, args });
       if (tool === "exportRbxm") return { data: model.toString("base64"), bytes: model.length, instances: ["Workspace.Tower"] };
@@ -1017,6 +1086,106 @@ test("logpoint: a file becomes the script's guid, a path goes as it is; export w
     assert.equal(placed.scripts, 2);
     await assert.rejects(d.tools.call("importRbxm", { file: "relative.rbxm" }), /absolute path/);
     await assert.rejects(d.tools.call("importRbxm", { file: path.join(d.shots, "missing.rbxm") }), /cannot read/);
+    const broken = path.join(d.shots, "broken.rbxm");
+    fs.writeFileSync(broken, model.subarray(0, 40));
+    await assert.rejects(d.tools.call("importRbxm", { file: broken }), /broken\.rbxm: .*(runs past the end|no END chunk)/);
+    const xml = path.join(d.shots, "ui.rbxmx");
+    fs.writeFileSync(xml, '<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" version="4"><Item class="ScreenGui" referent="RBX0"><Item class="LocalScript" referent="RBX1"></Item></Item></roblox>');
+    // An XML model goes to Studio as an .rbxm does (Studio reads XML: measured 09/11/26 in PA), its
+    // scripts counted; an XML place and paths picked from XML ask for the binary file
+    const xmlModel: any = await d.tools.call("importRbxm", { file: xml });
+    assert.equal(xmlModel.xml, true);
+    assert.equal(xmlModel.xmlScripts, 1);
+    assert.equal(seen.at(-1).tool, "importRbxm", "sent to Studio whole");
+    const calls = seen.length;
+    await assert.rejects(d.tools.call("importRbxm", { file: xml, paths: ["Shop"] }), /paths are picked from a binary file: save this XML model as \.rbxm/);
+    const xmlPlace = path.join(d.shots, "v84.rbxlx");
+    fs.writeFileSync(xmlPlace, "<roblox version='4'><Item class = 'Workspace' referent='RBX0'><Item class='Script' referent='RBX1'></Item></Item></roblox>");
+    await assert.rejects(d.tools.call("importRbxm", { file: xmlPlace }), /v84\.rbxlx: an XML place \(\.rbxlx\): open it in Studio .* save it as \.rbxl/);
+    const junk = path.join(d.shots, "junk.rbxm");
+    fs.writeFileSync(junk, "PK\x03\x04 not a model");
+    await assert.rejects(d.tools.call("importRbxm", { file: junk }), /junk\.rbxm: not a Roblox file/);
+    assert.equal(seen.length, calls, "none of them reached Studio");
+    edit.close();
+  } finally {
+    await d.close();
+  }
+});
+
+test("import: a place file is read before Studio sees it; paths bring back only those items into their own parents, its scripts land only when asked", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    const seen: any[] = [];
+    const edit = await editStudio(d.url, (tool, args) => {
+      seen.push({ tool, args });
+      if (tool === "importPicks") return { placed: args.picks.map((p: any) => `${p.into}.${p.names.at(-1)} (${p.className})`), scripts: 0, alreadyThere: ["Workspace.MapA"] };
+      return { placed: ["ServerStorage.Workspace (Model)"], scripts: 3 };
+    });
+    // the extension says model, the classes say place: the classes win
+    const file = path.join(d.shots, "backup.rbxm");
+    fs.writeFileSync(file, buildRoblox(samplePlace()));
+
+    const listed: any = await d.tools.call("importRbxm", { file, list: true });
+    assert.equal(seen.length, 0, "list calls no Studio");
+    assert.equal(listed.place, true);
+    assert.equal(listed.scriptCount, 3);
+    assert.ok(listed.items.some((i: any) => i.path === "StarterGui.Shop"));
+
+    const picked: any = await d.tools.call("importRbxm", { file, paths: ["Workspace.My.Map", "StarterGui"] });
+    assert.equal(seen.at(-1).tool, "importPicks");
+    assert.deepEqual(seen.at(-1).args.picks, [
+      { names: ["Workspace", "My.Map"], className: "Model", count: 1, into: "Workspace" },
+      { names: ["StarterGui", "Shop"], className: "ScreenGui", count: 1, into: "StarterGui" },
+    ]);
+    const sent = readRoblox(Buffer.from(seen.at(-1).args.data, "base64"));
+    assert.equal(sent.place, false, "Studio gets the converted file");
+    assert.deepEqual(sent.roots.slice(0, 2).map((r) => r.className), ["Model", "Folder"]);
+    assert.deepEqual(picked.kept, ["Workspace.My.Map (Model) into Workspace", "StarterGui.Shop (ScreenGui) into StarterGui"]);
+    assert.deepEqual(picked.leftOut, ["Workspace.MapA", "Workspace.Baseplate", "ReplicatedStorage.Config", "StarterPlayer.StarterPlayerScripts", "Lighting.Sky"]);
+    assert.deepEqual(picked.scriptList, []);
+    assert.deepEqual(picked.alreadyThere, ["Workspace.MapA"]);
+
+    const before = seen.length;
+    await assert.rejects(d.tools.call("importRbxm", { file, paths: ["Workspace.MapA", "ReplicatedStorage"] }), /what you picked holds 2 script\(s\).*Workspace\.MapA\.Door \(Script\), ReplicatedStorage\.Config\.Prices \(ModuleScript\).*scripts: true/);
+    await assert.rejects(d.tools.call("importRbxm", { file }), /the file holds 3 script\(s\)/);
+    await assert.rejects(d.tools.call("importRbxm", { file, paths: ["Workspace.MapZ"] }), /the file has no Workspace\.MapZ; Workspace holds MapA, My\.Map, Baseplate/);
+    await assert.rejects(d.tools.call("importRbxm", { file, paths: "Workspace.MapA" }), /paths must be a list/);
+    assert.equal(seen.length, before, "nothing refused reached Studio");
+
+    const withScripts: any = await d.tools.call("importRbxm", { file, paths: ["Workspace.MapA", "StarterPlayer"], parent: "ServerStorage.Recovered", scripts: true });
+    assert.deepEqual(seen.at(-1).args.picks.map((p: any) => `${p.names.join(".")}>${p.into}`), ["Workspace.MapA>ServerStorage.Recovered", "StarterPlayer.StarterPlayerScripts.Camera>ServerStorage.Recovered"]);
+    assert.deepEqual(withScripts.scriptList, ["Workspace.MapA.Door (Script)", "StarterPlayer.StarterPlayerScripts.Camera (LocalScript)"]);
+
+    const whole: any = await d.tools.call("importRbxm", { file, scripts: true });
+    assert.equal(seen.at(-1).tool, "importRbxm");
+    assert.equal(seen.at(-1).args.parent, "ServerStorage", "a whole place lands where none of its scripts runs");
+    assert.equal(readRoblox(Buffer.from(seen.at(-1).args.data, "base64")).place, false);
+    assert.equal(whole.place, true);
+    assert.match(whole.note, /each service is a Folder/);
+
+    // a model file's own top level can be picked too: it goes under Workspace by default
+    const model = path.join(d.shots, "props.rbxm");
+    fs.writeFileSync(model, buildRoblox([{ className: "Model", name: "Tower" }, { className: "Model", name: "Shed" }]));
+    const fromModel: any = await d.tools.call("importRbxm", { file: model, paths: ["Tower"] });
+    assert.deepEqual(seen.at(-1).args.picks, [{ names: ["Tower"], className: "Model", count: 1, into: "Workspace" }]);
+    assert.deepEqual(fromModel.leftOut, ["Shed"]);
+
+    // zstd on a Node that cannot read it: refused, a place inside could not be checked for scripts
+    const zstd = (zlib as any).zstdCompressSync as ((b: Buffer) => Buffer) | undefined;
+    if (zstd) {
+      const packed = path.join(d.shots, "packed.rbxm");
+      fs.writeFileSync(packed, buildRoblox([{ className: "Model", name: "Tower" }], (name, payload) => (name === "END" ? undefined : rbxChunk(name, zstd(payload), zstd(payload).length, payload.length))));
+      const real = (zlib as any).zstdDecompressSync;
+      (zlib as any).zstdDecompressSync = undefined;
+      try {
+        const calls = seen.length;
+        await assert.rejects(d.tools.call("importRbxm", { file: packed }), /packed\.rbxm: chunk .* is zstd, which this Node .* cannot read: Node 22\.15 or newer/);
+        assert.equal(seen.length, calls, "nothing reached Studio");
+        await assert.rejects(d.tools.call("importRbxm", { file: packed, list: true }), /zstd, which this Node .* cannot read/);
+      } finally {
+        (zlib as any).zstdDecompressSync = real;
+      }
+    }
     edit.close();
   } finally {
     await d.close();
@@ -1390,4 +1559,155 @@ test("scene: edit mode with no play, the play server during one, mode and topN c
   } finally {
     await d.close();
   }
+});
+
+test("find with a peer searches that live DataModel; an attribute or a tag with no peer goes to the play server during a play, else edit mode; bad input is refused first", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    const seen: any[] = [];
+    const answerAs = (peer: string) => (tool: string, args: any) => {
+      seen.push({ peer, tool, args });
+      return { found: [{ path: "Workspace.Enemies.Boss", className: "Model", attributes: 2 }], total: 1, scanned: 900, classMatch: args.classes ? (args.exact ? "exact" : "IsA") : undefined, seconds: 0.01 };
+    };
+    const edit = await editStudio(d.url, answerAs("edit"));
+    const live: any = await d.tools.call("find", { attribute: "Level", attributeValue: 3 });
+    assert.deepEqual(seen.at(-1), { peer: "edit", tool: "find", args: { attribute: "Level", attributeValue: "3", limit: 50 } });
+    assert.equal(live.peer, "edit");
+    assert.equal(live.found[0].attributes, 2);
+    await assert.rejects(d.tools.call("find", { peer: "server", name: "Boss" }), /no play is running/);
+    const server = await playPeer(d.url, "server", answerAs("server"));
+    const client = await playPeer(d.url, "client", answerAs("client"));
+    await waitFor(() => d.ipc.playPeers().client === "ready" && d.ipc.playPeers().server === "ready");
+    await d.tools.call("find", { tag: "Enemy", under: "Workspace" });
+    assert.deepEqual(seen.at(-1), { peer: "server", tool: "find", args: { under: "Workspace", tag: "Enemy", limit: 50 } });
+    const byClass: any = await d.tools.call("find", { peer: "client", name: "*Button", className: "GuiButton, TextLabel", exact: true, limit: 5 });
+    assert.deepEqual(seen.at(-1), { peer: "client", tool: "find", args: { name: "*Button", classes: ["GuiButton", "TextLabel"], exact: true, limit: 5 } });
+    assert.equal(byClass.classMatch, "exact");
+    await assert.rejects(d.tools.call("find", { peer: "studio", name: "x" }), /peer must be server or client/);
+    await assert.rejects(d.tools.call("find", { peer: "server" }), /give a name .* an attribute or a tag/);
+    await assert.rejects(d.tools.call("find", { attribute: "has space" }), /attribute must be an attribute's name/);
+    await assert.rejects(d.tools.call("find", { peer: "server", name: "x", attributeValue: 1 }), /attributeValue needs attribute/);
+    await assert.rejects(d.tools.call("find", { peer: "server", name: "x", limit: 0 }), /limit must be a whole number from 1 to 5000/);
+    // With no peer and no attribute or tag, still the synced tree (no Studio call)
+    const before = seen.length;
+    await assert.rejects(d.tools.call("find", { name: "x" }), /this daemon has no synced tree/);
+    assert.equal(seen.length, before);
+    const { findText } = await import("../control/commands.js");
+    assert.equal(findText({ ...byClass, ms: 4 }), "Workspace.Enemies.Boss [Model]  2 attributes\n1 found among 900 instances of the play client; classes by exact ClassName (4 ms).");
+    assert.equal(findText({ peer: "server", found: [], total: 0, scanned: 10, classMatch: "IsA", unknownClasses: ["Bos"], ms: 1 }), "0 found among 10 instances of the play server; classes by IsA (subclasses too), except Bos: no class the API knows, so matched by exact ClassName (1 ms).");
+    for (const ws of [client, server, edit]) ws.close();
+  } finally {
+    await d.close();
+  }
+});
+
+test("move: the play server moves the character unless a player owns its physics, then that player's client does; peer server forces the server; the target and mode are checked first", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    const seen: any[] = [];
+    let owner: string | undefined = "Ender";
+    const moved = (peer: string, args: any) => ({ how: args.mode, player: "Ender", goal: args.position ?? [0, 5, 0], from: [9, 3, 9], at: args.position ?? [0, 5, 0], distanceLeft: 0.4, stopped: args.mode === "teleport" ? "teleported" : "arrived", arrived: true, seconds: 0.1, ...(peer === "server" ? { owner: owner ?? "server" } : {}) });
+    const edit = await editStudio(d.url, () => ({}));
+    await assert.rejects(d.tools.call("move", { position: [1, 2, 3] }), /no play is running/);
+    const server = await playPeer(d.url, "server", (tool, args) => {
+      seen.push({ peer: "server", tool, args });
+      if (owner && !args.stay) return { handOff: "client", owner, player: "Ender", position: args.position ?? [0, 5, 0], ...(args.path ? { target: `Workspace.${args.path.split(".").at(-1)}` } : {}) };
+      return moved("server", args);
+    });
+    const client = await playPeer(d.url, "client", (tool, args) => {
+      seen.push({ peer: "client", tool, args });
+      return moved("client", args);
+    });
+    await waitFor(() => d.ipc.playPeers().client === "ready" && d.ipc.playPeers().server === "ready");
+
+    // The client owns the root: the server hands the move over, the client gets the same request
+    const handed: any = await d.tools.call("move", { position: [1, 2, 3] });
+    assert.deepEqual(seen.slice(-2).map((m) => [m.peer, m.tool]), [["server", "move"], ["client", "move"]]);
+    assert.deepEqual(seen.at(-1).args, { mode: "teleport", position: [1, 2, 3], seconds: 15 });
+    assert.equal(handed.peer, "client");
+    assert.equal(handed.owner, "Ender");
+    assert.equal(handed.stopped, "teleported");
+    // A path is resolved by the server (the client may not have it streamed in): the client gets
+    // the server's position, and the path only as the answer's label
+    await d.tools.call("move", { path: "Workspace.Far.Shop", mode: "walk" });
+    assert.deepEqual(seen.at(-1), { peer: "client", tool: "move", args: { mode: "walk", position: [0, 5, 0], seconds: 15, target: "Workspace.Shop" } });
+    // peer server: the server moves it whoever owns it
+    const forced: any = await d.tools.call("move", { path: "Workspace.Shop", mode: "walk", peer: "server", timeoutMs: 4000 });
+    assert.deepEqual(seen.at(-1), { peer: "server", tool: "move", args: { mode: "walk", path: "Workspace.Shop", seconds: 4, stay: true } });
+    assert.equal(forced.peer, "server");
+    // The server owns it: no hand-off
+    owner = undefined;
+    const count = seen.length;
+    const onServer: any = await d.tools.call("move", { path: "Workspace.Shop", mode: "path", radius: 3 });
+    assert.equal(seen.length, count + 1);
+    assert.deepEqual(seen.at(-1).args, { mode: "path", path: "Workspace.Shop", seconds: 15, radius: 3 });
+    assert.equal(onServer.peer, "server");
+    // peer client goes straight to the client
+    await d.tools.call("move", { position: [0, 0, 0], peer: "client" });
+    assert.equal(seen.at(-1).peer, "client");
+    assert.equal(seen.length, count + 2);
+
+    await assert.rejects(d.tools.call("move", {}), /give a position \[x, y, z\] or a path/);
+    await assert.rejects(d.tools.call("move", { position: [1, 2, 3], path: "Workspace.Shop" }), /one of them/);
+    await assert.rejects(d.tools.call("move", { position: [1, 2] }), /position must be \[x, y, z\]/);
+    await assert.rejects(d.tools.call("move", { path: "Workspace.Shop", mode: "fly" }), /mode must be teleport, walk/);
+    await assert.rejects(d.tools.call("move", { path: "Workspace.Shop", radius: 0 }), /radius must be a number of studs from 0.5 to 50/);
+    await assert.rejects(d.tools.call("move", { path: "Workspace.Shop", peer: "edit" }), /peer must be server or client/);
+    assert.equal(seen.length, count + 2, "refusals never reach Studio");
+
+    const { moveText } = await import("../control/commands.js");
+    assert.equal(moveText(handed), `Teleported Ender to 1, 2, 3 from 9, 3, 9, on the play client (Ender owns the character's physics): feet at 1, 2, 3, 0.4 studs from the goal (${handed.ms} ms).`);
+    const stuck = { peer: "server", owner: "server", how: "path", player: "Ender", target: "Workspace.Shop", goal: [0, 5, 0], from: [9, 3, 9], at: [4, 3, 4], distanceLeft: 5.66, heightLeft: 2, stopped: "stuck", waypoints: 7, waypointReached: 3, seconds: 4.2, walkSpeed: 16, timeoutSeconds: 15, ms: 4300 };
+    assert.equal(moveText(stuck), "Ender walked along a path of 7 waypoints from 9, 3, 9 toward Workspace.Shop (its top at 0, 5, 0), on the play server: stopped: no closer for 2 s (a wall, a gap, or the game holding it), after waypoint 3. Feet at 4, 3, 4, 5.66 studs left; 4.2 s at WalkSpeed 16 (4300 ms in all).");
+    for (const ws of [client, server, edit]) ws.close();
+  } finally {
+    await d.close();
+  }
+});
+
+test("move in a multiplayer test: the hand-off goes to the owner's own client", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    const edit = await editStudio(d.url, () => ({}));
+    const serverSeen: any[] = [];
+    const server = await playPeer(d.url, "server", (_tool, args) => {
+      serverSeen.push(args);
+      return { handOff: "client", owner: args.player ?? "Player2", player: args.player ?? "Player2" };
+    });
+    const client = async (name: string) => {
+      const ws = new WebSocket(`${d.url}/studio-output`);
+      answer(ws, () => ({ how: "teleport", player: name, goal: [0, 0, 0], from: [0, 0, 0], at: [0, 0, 0], distanceLeft: 0, stopped: "teleported", arrived: true }));
+      await new Promise<void>((resolve) => ws.once("open", () => resolve()));
+      ws.send(JSON.stringify({ type: "peerHello", source: "client", log: false, player: name }));
+      return ws;
+    };
+    const one = await client("Player1");
+    const two = await client("Player2");
+    await waitFor(() => d.ipc.playPeers().players?.length === 2 && d.ipc.playPeers().server === "ready");
+    // No player named: the server picks (here Player2 owns it), and Player2's client moves it
+    const moved: any = await d.tools.call("move", { position: [0, 0, 0] });
+    assert.equal(moved.player, "Player2");
+    assert.equal(serverSeen.at(-1).player, undefined);
+    // A player named goes to the server too, so it moves that one
+    const named: any = await d.tools.call("move", { position: [0, 0, 0], player: "Player1" });
+    assert.equal(serverSeen.at(-1).player, "Player1");
+    assert.equal(named.player, "Player1");
+    for (const ws of [one, two, server, edit]) ws.close();
+  } finally {
+    await d.close();
+  }
+});
+
+test("numbersOnly: numbers, BigNum strings and a sign are tuning; comments are free; anything else is code", () => {
+  assert.equal(numbersOnly("return { Hp = 10, Cost = \"1e30\" } -- note\n", "return { Hp = 12, Cost = \"2.5K\" } -- other note\n"), null);
+  assert.equal(numbersOnly("local x = 5\n", "local x = -5\n"), null);
+  assert.equal(numbersOnly("local x = 5\n", "local x = 5 -- why\n"), "no number changed (spacing or comments only)");
+  assert.equal(numbersOnly("local x = 5\n", "local y = 6\n"), "code changed");
+  assert.equal(numbersOnly("local s = \"Bolt\"\n", "local s = \"Bolt2\"\n"), "code changed");
+  assert.match(numbersOnly("local s = `a{1}`\n", "local s = `a{2}`\n")!, /could not read it: an interpolated string/);
+  assert.equal(numbersOnly("local s = [[100]]\n", "local s = [[200]]\n"), null);
+  assert.equal(numbersOnly("local s = [[\n100]]\n", "local s = [[\n200]]\n"), null, "Luau drops the newline after [[");
+  assert.equal(numbersOnly("local n = 1e1_0\n", "local n = 1e1_1\n"), null, "an exponent with _ is one number");
+  const name = `v${"x".repeat(399)}`; // 400 characters, then a digit
+  assert.equal(numbersOnly(`local ${name}1 = 5\n`, `local ${name}2 = 5\n`), "code changed", "a long name is read whole");
 });

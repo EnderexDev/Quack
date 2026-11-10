@@ -21,6 +21,13 @@ tauri-plugin-updater = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2.12", features = ["json"], default-features = false }
+# The approval token the app gives the hub it starts (32 random bytes from the OS)
+getrandom = "0.2"
+
+# The "Quack is waiting for your answer" toast, with a click that shows the window (the
+# notification plugin's toast has no click on Windows)
+[target.'cfg(windows)'.dependencies]
+tauri-winrt-notification = "0.8"
 
 # Dev builds (cargo build, tauri dev, cargo test): line numbers only for this crate, so panics
 # and backtraces still name file:line, and no debug info for dependencies. Writing and linking

@@ -2,12 +2,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { run } from "../merge/cli.js";
+import { GUARD_MATCHER } from "./guard.js";
+import { markers, rule } from "./rule.js";
 import type { FlavorInfo } from "./hubClient.js";
 
 /**
  * Connects `quack mcp` to the AI clients on this computer: Claude Code and Codex through their
  * own `mcp add`, Cursor through its ~/.cursor/mcp.json. The app's "Connect to AI" button runs
- * this, so a person who installs Quack never writes an MCP config by hand.
+ * this, so a person who installs Quack never writes an MCP config by hand. The same click puts
+ * Quack's rule in Claude Code's CLAUDE.md and Codex's AGENTS.md (an older copy is replaced
+ * where it is), and Quack's guard in Claude Code's hooks. Cursor keeps its rules in its own
+ * settings, not a file: it gets the MCP server's instructions (the rule's short form).
  *
  * Claude Code and Codex keep their MCP servers in a config folder, and apps that run them
  * (T3 Code, a proxy like CLIProxyAPI) often give each account its own folder through
@@ -29,6 +34,10 @@ export interface ClientStatus {
   dir?: string;
   installed: boolean;
   connected: boolean;
+  /** Claude Code: Quack's guard is in this folder's settings.json */
+  guarded?: boolean;
+  /** Claude Code and Codex: Quack's rule in the folder's instructions, as this Quack has it or older */
+  rule?: "current" | "outdated" | "missing";
   problem?: string;
 }
 
@@ -53,6 +62,8 @@ export interface ClientsEnv {
 export interface ServerCommand {
   command: string;
   args: string[];
+  /** Quack's guard (guard.ts), installed as a PreToolUse hook in each Claude Code folder */
+  guard?: { command: string; args: string[] };
 }
 
 export const defaultClientsEnv = (): ClientsEnv => ({
@@ -185,7 +196,8 @@ function cli(target: Target, env: ClientsEnv): { bin: string; vars?: NodeJS.Proc
   return { bin, vars: { [variable]: target.dir } };
 }
 
-async function status(target: Target, name: string, env: ClientsEnv): Promise<ClientStatus> {
+async function status(target: Target, info: FlavorInfo, env: ClientsEnv): Promise<ClientStatus> {
+  const name = serverName(info);
   const base = { client: target.client, id: target.id, label: target.label, ...(target.dir ? { dir: target.dir } : {}) };
   try {
     if (target.client === "cursor") {
@@ -196,7 +208,10 @@ async function status(target: Target, name: string, env: ClientsEnv): Promise<Cl
     const { bin, vars } = cli(target, env);
     // `mcp get` exits 0 only when the server is there
     const r = await run(bin, ["mcp", "get", name], undefined, TIMEOUT_MS, os.tmpdir(), vars);
-    return { ...base, installed: true, connected: r.code === 0 };
+    const guarded = target.client === "claude" ? hasGuard(claudeSettings(target, env), name) : undefined;
+    const found = findRule(configDir(target, env), target.client, info);
+    const ruleState = !found ? "missing" : found.version === rule(info).version ? "current" : "outdated";
+    return { ...base, installed: true, connected: r.code === 0, ...(guarded === undefined ? {} : { guarded }), rule: ruleState };
   } catch (error) {
     if (missing(error)) return { ...base, installed: false, connected: false };
     return { ...base, installed: true, connected: false, problem: (error as Error).message };
@@ -204,10 +219,11 @@ async function status(target: Target, name: string, env: ClientsEnv): Promise<Cl
 }
 
 export function listClients(info: FlavorInfo, env: ClientsEnv): Promise<ClientStatus[]> {
-  return Promise.all(findTargets(env).map((target) => status(target, serverName(info), env)));
+  return Promise.all(findTargets(env).map((target) => status(target, info, env)));
 }
 
-async function connectOne(target: Target, name: string, server: ServerCommand, env: ClientsEnv): Promise<void> {
+async function connectOne(target: Target, info: FlavorInfo, server: ServerCommand, env: ClientsEnv): Promise<void> {
+  const name = serverName(info);
   if (target.client === "cursor") {
     const config = readCursor(env) ?? {};
     const servers = (config.mcpServers && typeof config.mcpServers === "object" ? config.mcpServers : {}) as Record<string, unknown>;
@@ -223,6 +239,158 @@ async function connectOne(target: Target, name: string, server: ServerCommand, e
   await run(bin, ["mcp", "remove", name, ...scope], undefined, TIMEOUT_MS, os.tmpdir(), vars);
   const r = await run(bin, ["mcp", "add", ...scope, name, "--", server.command, ...server.args], undefined, TIMEOUT_MS, os.tmpdir(), vars);
   if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || `${target.label} answered ${r.code}`);
+  if (target.client === "claude" && server.guard) installGuard(claudeSettings(target, env), name, server.guard);
+  installRule(configDir(target, env), target.client, info);
+}
+
+/** The client's config folder (CLAUDE_CONFIG_DIR / CODEX_HOME, or the default one) */
+function configDir(target: Target, env: ClientsEnv): string {
+  return target.dir ?? path.join(env.home, target.client === "claude" ? ".claude" : ".codex");
+}
+
+/** The instructions file each client loads in every session, in its config folder */
+const INSTRUCTIONS: Record<"claude" | "codex", string> = { claude: "CLAUDE.md", codex: "AGENTS.md" };
+/** A client's own data, never instructions: not searched for the rule */
+const NOT_INSTRUCTIONS = new Set(["projects", "plugins", "todos", "shell-snapshots", "statsig", "ide", "cache", "debug", "file-history", "sessions", "archived_sessions", "node_modules", "logs", "log", "tasks", "attachments", "backups", "downloads", "telemetry", "tmp", "worktrees"]);
+const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+interface RuleBlock {
+  file: string;
+  text: string;
+  start: number;
+  stop: number;
+  version: string;
+}
+
+/** This flavor's rule block in one file, or undefined */
+function blockIn(file: string, info: FlavorInfo): RuleBlock | undefined {
+  let text: string;
+  try {
+    if (fs.statSync(file).size > 2_000_000) return undefined;
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    return undefined;
+  }
+  const { begin, end } = markers(info);
+  const open = new RegExp(`${escapeRegExp(begin)} ([0-9a-f]{8}) -->`).exec(text);
+  if (!open) return undefined;
+  const close = text.indexOf(end, open.index);
+  if (close < 0) return undefined;
+  return { file, text, start: open.index, stop: close + end.length, version: open[1] };
+}
+
+/**
+ * Where this flavor's rule is: the instructions file first, then any .md the user keeps rules in
+ * (rules/, a folder of their own), three levels down at most. A user who moved the block keeps
+ * it where they put it.
+ */
+function findRule(dir: string, client: ClientKind, info: FlavorInfo): RuleBlock | undefined {
+  if (client === "cursor") return undefined;
+  const main = blockIn(path.join(dir, INSTRUCTIONS[client]), info);
+  if (main) return main;
+  const walk = (folder: string, depth: number): RuleBlock | undefined => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(folder, { withFileTypes: true });
+    } catch {
+      return undefined;
+    }
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name.toLowerCase().endsWith(".md")) {
+        const found = blockIn(path.join(folder, entry.name), info);
+        if (found) return found;
+      }
+    }
+    if (depth >= 3) return undefined;
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith(".") || NOT_INSTRUCTIONS.has(entry.name)) continue;
+      const found = walk(path.join(folder, entry.name), depth + 1);
+      if (found) return found;
+    }
+    return undefined;
+  };
+  return walk(dir, 0);
+}
+
+/**
+ * Quack's rule in the client's instructions: an older copy is replaced where it is, with nothing
+ * else in that file changed; without one it goes at the end of CLAUDE.md / AGENTS.md
+ */
+export function installRule(dir: string, client: ClientKind, info: FlavorInfo): void {
+  if (client === "cursor") return;
+  const { text: block } = rule(info);
+  const found = findRule(dir, client, info);
+  if (found) {
+    const newline = found.text.includes("\r\n") ? "\r\n" : "\n";
+    const next = found.text.slice(0, found.start) + block.replace(/\r?\n/g, newline) + found.text.slice(found.stop);
+    if (next !== found.text) fs.writeFileSync(found.file, next);
+    return;
+  }
+  const file = path.join(dir, INSTRUCTIONS[client]);
+  let before = "";
+  try {
+    before = fs.readFileSync(file, "utf8");
+  } catch (error) {
+    if (!missing(error)) throw error;
+  }
+  const newline = before.includes("\r\n") ? "\r\n" : "\n";
+  const gap = !before ? "" : before.endsWith(newline + newline) ? "" : before.endsWith(newline) ? newline : newline + newline;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(file, before + gap + block.replace(/\r?\n/g, newline) + newline);
+}
+
+/** The Claude Code folder's settings.json (its hooks live there) */
+function claudeSettings(target: Target, env: ClientsEnv): string {
+  return path.join(target.dir ?? path.join(env.home, ".claude"), "settings.json");
+}
+
+/** Marks the hook each flavor installs (by its MCP server's name), so a new connect replaces it */
+const guardMark = (name: string) => `--quack-guard ${name}`;
+const quote = (part: string) => `"${part.replace(/\\/g, "/")}"`;
+
+function isGuardEntry(entry: any, name: string): boolean {
+  // The mark ends the command: "--quack-guard quack" must not match Dev's "--quack-guard quack-dev"
+  return Array.isArray(entry?.hooks) && entry.hooks.some((h: any) => typeof h?.command === "string" && h.command.trimEnd().endsWith(` ${guardMark(name)}`));
+}
+
+/** Settings as JSON, {} when missing; a file that is not a JSON object is never written over */
+function readSettings(file: string): Record<string, any> {
+  let text: string;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch (error) {
+    if (missing(error)) return {};
+    throw error;
+  }
+  const parsed = JSON.parse(text);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${file} is not a JSON object`);
+  return parsed;
+}
+
+function hasGuard(file: string, name: string): boolean {
+  try {
+    const list = readSettings(file).hooks?.PreToolUse;
+    return Array.isArray(list) && list.some((entry) => isGuardEntry(entry, name));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Quack's guard as a PreToolUse hook in this settings.json: an older entry of this flavor is
+ * replaced, every other hook and key stays as it was
+ */
+export function installGuard(file: string, name: string, guard: { command: string; args: string[] }): void {
+  const settings = readSettings(file);
+  const hooks = settings.hooks && typeof settings.hooks === "object" && !Array.isArray(settings.hooks) ? settings.hooks : {};
+  const before = Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse.filter((entry: any) => !isGuardEntry(entry, name)) : [];
+  const command = [guard.command, ...guard.args].map(quote).join(" ") + ` ${guardMark(name)}`;
+  const next = {
+    ...settings,
+    hooks: { ...hooks, PreToolUse: [...before, { matcher: GUARD_MATCHER, hooks: [{ type: "command", command, timeout: 10 }] }] },
+  };
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`);
 }
 
 /**
@@ -231,12 +399,12 @@ async function connectOne(target: Target, name: string, server: ServerCommand, e
  */
 export async function connectClients(info: FlavorInfo, server: ServerCommand, env: ClientsEnv, only: string[] = []): Promise<ClientStatus[]> {
   const targets = findTargets(env);
-  const before = await Promise.all(targets.map((t) => status(t, serverName(info), env)));
+  const before = await Promise.all(targets.map((t) => status(t, info, env)));
   const problems = new Map<string, string>();
   for (const [i, found] of before.entries()) {
     if (!found.installed || (only.length && !only.includes(found.client) && !only.includes(found.id))) continue;
     try {
-      await connectOne(targets[i], serverName(info), server, env);
+      await connectOne(targets[i], info, server, env);
     } catch (error) {
       problems.set(found.id, (error as Error).message);
     }

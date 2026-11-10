@@ -10,9 +10,13 @@ import { instructions } from "./rule.js";
  * message per line). Each tool runs the terminal command of the same name through runControl,
  * so the terminal and the AI never read the hub two ways. Reading, waiting, play and the Studio
  * tools (evals, execute_luau, playtest, screenshots, keys, the device simulator, Creator Store
- * assets previewed and inserted, memory, the script profiler, scene analysis), and the Roblox web
- * tools that need no hub (the engine reference, the Creator Store, an Open Cloud upload): a
- * change to the hub (resolve, pause, register...) stays a person's, in the app or the terminal.
+ * assets previewed and inserted, memory, the script profiler, scene analysis, the MicroProfiler,
+ * the selection, a generated model, a timed-out call's answer), the Roblox web tools that need
+ * no hub (the engine reference, the Creator Store, an Open Cloud upload, a place's saved versions
+ * and one downloaded), the Open Cloud jobs the hub runs with its key (badges, developer
+ * products, game passes, the localization table, analytics; each write asks the user in
+ * Quack's app), and opening a place in Studio: a change to the hub (resolve, pause,
+ * register...) stays a person's, in the app or the terminal.
  */
 
 type Context = Omit<ControlContext, "out" | "err" | "confirm" | "interactive" | "color">;
@@ -383,6 +387,18 @@ export const TOOLS: Tool[] = [
     },
   },
   {
+    name: "studio_changes",
+    description: "Which uncommitted changes in the place's synced folder came from Studio (a game designer tuning values there; the sync writes them to disk), so they are not taken for someone's work in progress. Lists every file git sees as changed in the sync folder, new files too, each marked: studio (Studio wrote it and nothing touched it since; from the commit only Studio changed it), mixed (Studio wrote it, but the disk changed it after, or it already held another uncommitted edit, or a merge) or other (not from Studio). Quack knows because its daemon writes those files itself; no Studio call, so it answers with Studio closed. numbersOnly also says which of Studio's files differ from the commit only in numeric literals. Paths are from the repository's root. It commits nothing: whether to commit is the user's call.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        numbersOnly: { type: "boolean", description: "Also say which of Studio's files differ from the commit only in numbers" },
+        ...placeProp,
+      },
+    },
+    argv: (args) => ["changes", ...text(args, "place"), ...(args.numbersOnly === true ? ["--numbers-only"] : [])],
+  },
+  {
     name: "perf_sample",
     description: "Measures the running play for a few seconds in the server and the client at once (or one peer): fps, frame times p50 / p90 / p99 / max (the client's RenderStepped, the server's Heartbeat), hitches over 50 ms, memory and its change, the top memory tags, instances, network kbps, the server's physics fps. Take one before and one after a change, in the same play. A solo play runs both peers in one Studio process: the server's frame times carry the client's drawing, and memory is the whole Studio process (the same number in both). A minimized window draws no frames.",
     inputSchema: {
@@ -449,35 +465,65 @@ export const TOOLS: Tool[] = [
   },
   {
     name: "import_rbxm",
-    description: "Puts an .rbxm file's instances in the place in edit mode (default under Workspace), as one undo step; scripts inside sync to disk like any made in Studio. A worktree's play carries scripts only: this is how a model or UI from elsewhere comes in.",
+    description: "Puts an .rbxm file's instances, or a place file's (.rbxl from download_place, Workspace and StarterGui included), in the place in edit mode as one undo step; scripts inside sync to disk like any made in Studio. A worktree's play carries scripts only: this is how a model or UI from elsewhere comes in. For a place file: list true first (reads the file, no Studio: its items and scripts), then paths to bring back only what is missing, each item into its own parent here (Workspace.MapA into Workspace); a place with no paths lands whole under ServerStorage, each service a Folder. A place file is untrusted: its scripts land only with scripts true, after you read the list. Terrain voxels never come.",
     inputSchema: {
       type: "object",
       properties: {
-        file: { type: "string", description: "Absolute path of the .rbxm" },
-        parent: { type: "string", description: "Where to put them (default Workspace)" },
+        file: { type: "string", description: "Absolute path of the .rbxm or .rbxl" },
+        paths: { type: "array", items: { type: "string" }, description: "Only these items of the file: Workspace.MapA, StarterGui.Shop, ReplicatedStorage.Config; a service alone (StarterGui) is all its items" },
+        parent: { type: "string", description: "Where to put them (default Workspace for a model; for a place, each item's own parent, or ServerStorage with no paths)" },
+        list: { type: "boolean", description: "Only read the file: its top-level items, scripts and Terrain; no Studio" },
+        scripts: { type: "boolean", description: "Let a place file's scripts land (read them in list first)" },
         ...placeProp,
       },
       required: ["file"],
     },
-    argv: (args) => ["import", ...text(args, "file", true), ...text(args, "place"), ...(typeof args.parent === "string" && args.parent ? [`--parent=${args.parent}`] : [])],
+    argv: (args) => {
+      const paths = args.paths;
+      if (paths !== undefined && (!Array.isArray(paths) || !paths.length || paths.some((p) => typeof p !== "string" || !p.trim() || p.includes(",") || p.startsWith("-")))) throw new ToolInputError("paths must be a list of paths in the file, none with a comma");
+      return [
+        "import", ...text(args, "file", true), ...text(args, "place"),
+        ...(typeof args.parent === "string" && args.parent ? [`--parent=${args.parent}`] : []),
+        ...(Array.isArray(paths) ? [`--paths=${paths.join(",")}`] : []),
+        ...(args.list === true ? ["--list"] : []),
+        ...(args.scripts === true ? ["--scripts"] : []),
+      ];
+    },
   },
   {
     name: "find_instances",
-    description: "Finds instances in the place by name (wildcards * and ?, any case), class (one or several, comma-separated, exact ClassName) and where (under a path), read from Quack's own copy of the synced tree: no Studio call, the place in edit mode as of the last sync, every instance (not only scripts). Answers paths, classes and each script's file. For a running game's instances use the eval tools.",
+    description: "Finds instances by name (wildcards * and ?, any case), class (one or several, comma-separated) and where (under a path). With no peer: Quack's own copy of the synced tree, no Studio call, the place in edit mode as of the last sync, classes by exact ClassName, each script's file. With peer server or client: the RUNNING play's DataModel (what the game made, PlayerGui on the client), classes by IsA unless exact, and also by attribute (name, and value) and CollectionService tag; peer edit does the same in Studio's live edit mode. An attribute or a tag with no peer searches the play server during a play, else edit mode. Without under, a live search covers the game's services (Workspace, Players, ReplicatedStorage, ServerStorage, StarterGui...), not CoreGui. Answers paths, classes and each one's attribute count; inspect_instance reads one whole.",
     inputSchema: {
       type: "object",
       properties: {
         name: { type: "string", description: "Name pattern: Boss*, *Button, Shop" },
-        className: { type: "string", description: "ClassName, or several comma-separated (MeshPart,Part)" },
-        under: { type: "string", description: "Only below this path (ReplicatedStorage.Assets)" },
-        limit: { type: "number", description: "At most this many listed (default 100); the total is always counted" },
+        className: { type: "string", description: "A class, or several comma-separated (MeshPart,Part); live: IsA (BasePart finds every part)" },
+        exact: { type: "boolean", description: "Live search: the exact ClassName instead of IsA" },
+        under: { type: "string", description: "Only below this path (ReplicatedStorage.Assets, Workspace.Enemies, PlayerGui.Shop)" },
+        attribute: { type: "string", description: "Live search: has this attribute" },
+        attributeValue: { type: ["string", "number", "boolean"], description: "With attribute: that value (a number by value, true/false, a string as it is)" },
+        tag: { type: "string", description: "Live search: has this CollectionService tag" },
+        peer: { type: "string", enum: ["server", "client", "edit"], description: "Search this live DataModel instead of the synced tree" },
+        limit: { type: "number", description: "At most this many listed (default 100, live 50); the total is always counted" },
         ...placeProp,
       },
     },
     argv: (args) => {
-      if (![args.name, args.className, args.under].some((v) => typeof v === "string" && v.trim())) throw new ToolInputError("give name, className or under");
+      if (![args.name, args.className, args.under, args.attribute, args.tag].some((v) => typeof v === "string" && v.trim())) throw new ToolInputError("give name, className, under, attribute or tag");
+      if (args.peer !== undefined && !["server", "client", "edit"].includes(String(args.peer))) throw new ToolInputError("peer must be server, client or edit");
       const flag = (key: string, name: string) => (typeof args[key] === "string" && (args[key] as string).trim() ? [`--${name}=${args[key]}`] : []);
-      return ["find", ...text(args, "place"), ...flag("name", "name"), ...flag("className", "class"), ...flag("under", "under"), ...number(args, "limit", "--limit")];
+      let attr: string[] = [];
+      if (typeof args.attribute === "string" && args.attribute.trim()) {
+        const attribute = args.attribute.trim();
+        if (!/^[A-Za-z0-9_]+$/.test(attribute)) throw new ToolInputError("attribute must be an attribute's name (letters, digits and _)");
+        const value = args.attributeValue;
+        if (value !== undefined && value !== null && !["string", "number", "boolean"].includes(typeof value)) throw new ToolInputError("attributeValue must be a string, a number or true/false");
+        attr = [value === undefined || value === null ? `--attr=${attribute}` : `--attr=${attribute}=${value}`];
+      } else if (args.attributeValue !== undefined) throw new ToolInputError("attributeValue needs attribute");
+      return [
+        "find", ...text(args, "place"), ...flag("name", "name"), ...flag("className", "class"), ...flag("under", "under"), ...number(args, "limit", "--limit"),
+        ...(args.peer ? [`--peer=${args.peer}`] : []), ...attr, ...flag("tag", "tag"), ...(args.exact === true ? ["--exact"] : []),
+      ];
     },
   },
   {
@@ -836,7 +882,715 @@ export const TOOLS: Tool[] = [
       return ["scene", ...text(args, "place"), ...(args.mode ? [`--mode=${args.mode}`] : []), ...(args.peer ? [`--peer=${args.peer}`] : []), ...number(args, "topN", "--limit")];
     },
   },
+  {
+    name: "capture_micro_profiler",
+    description: "The MicroProfiler for durationMs (100 to 5000, default 1000), read through LibMP, Roblox's library: frame times (avg, p50, p90, p99, max, the slowest frames with their ids), the scopes that took the time in ms a frame (self: without the scopes inside it; inclusive: with them; the worst frame; calls), groups (Physics, Render, Script...) and threads. Engine work that capture_script_profiler cannot see. focus keeps one subsystem, filter a scope or group name. Edit mode with no play, the play server during one, or the peer named; a solo play and edit mode are one Studio process, so every peer reads the same profiler (a multiplayer client is its own). out saves the capture. A minimized or unfocused Studio throttles its frames.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        peer: { type: "string", enum: ["edit", "server", "client"] },
+        durationMs: { type: "number" },
+        frames: { type: "number", description: "The last frames read, 1 to 256 (default the ones that cover durationMs)" },
+        focus: { type: "string", enum: ["all", "script", "physics", "render", "network", "jobs"] },
+        filter: { type: "string" },
+        sort: { type: "string", enum: ["self", "inclusive"], description: "Default self" },
+        maxTimers: { type: "number", description: "1 to 100 (default 20)" },
+        includeGpu: { type: "boolean" },
+        includeIdle: { type: "boolean", description: "Keep the scopes of a thread waiting for work (Sleep), left out by default" },
+        keep: { type: "boolean", description: "Leave the MicroProfiler on after (default: turned off again)" },
+        out: { type: "string", description: "Absolute path of a .mpz for the capture (LZ4-compressed, LibMP opens it)" },
+        ...placeProp,
+      },
+    },
+    argv: (args) => {
+      if (args.peer !== undefined && !["edit", "server", "client"].includes(String(args.peer))) throw new ToolInputError("peer must be edit, server or client");
+      if (args.focus !== undefined && !["all", "script", "physics", "render", "network", "jobs"].includes(String(args.focus))) throw new ToolInputError("focus must be all, script, physics, render, network or jobs");
+      if (args.sort !== undefined && args.sort !== "self" && args.sort !== "inclusive") throw new ToolInputError("sort must be self or inclusive");
+      if (args.out !== undefined && (typeof args.out !== "string" || !/\.mpz$/i.test(args.out))) throw new ToolInputError("out must be a .mpz path");
+      return [
+        "micro", ...text(args, "place"),
+        ...(args.peer ? [`--peer=${args.peer}`] : []),
+        ...number(args, "durationMs", "--ms"), ...number(args, "frames", "--frames"), ...number(args, "maxTimers", "--limit"),
+        ...(args.focus ? [`--mode=${args.focus}`] : []), ...(args.sort ? [`--sort=${args.sort}`] : []),
+        ...(typeof args.filter === "string" && args.filter ? [`--filter=${args.filter}`] : []),
+        ...(args.includeGpu === true ? ["--gpu"] : []), ...(args.includeIdle === true ? ["--include-idle"] : []), ...(args.keep === true ? ["--keep"] : []),
+        ...(args.out ? [`--out=${args.out}`] : []),
+      ];
+    },
+  },
+  {
+    name: "get_request_status",
+    description: "What became of a Studio call that timed out, by the request id its timeout named: pending (Studio has not answered: the code may still be running), answered (with the answer that came later), failed (with its error), lost (the play stopped first) or unknown. A timeout ends only the wait; check here before sending the same call again, or it runs twice. Kept 15 minutes, the last 50.",
+    inputSchema: { type: "object", properties: { id: { type: "string", description: "The 12-character request id" }, ...placeProp }, required: ["id"] },
+    argv: (args) => ["result", ...text(args, "id", true), ...text(args, "place")],
+  },
+  {
+    name: "get_place_info",
+    description: "The place open in Studio: its place and experience ids, saved version, owner, published name and description, whether Studio is in edit mode or a play, StreamingEnabled and gravity.",
+    inputSchema: { type: "object", properties: { ...placeProp } },
+    argv: (args) => ["place", "info", ...text(args, "place")],
+  },
+  {
+    name: "list_place_versions",
+    description: "A place's saved versions on Roblox, newest first, with when each was saved (Open Cloud, the key in Quack's Settings with asset:read). Pick one for download_place. placeId: any place id, registered or not; left out, the place's own.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        placeId: { type: "string", description: "A place id; default the place's" },
+        limit: { type: "number", description: "1 to 50 (default 10)" },
+        pageToken: { type: "string", description: "The nextPageToken of the page before" },
+        ...placeProp,
+      },
+    },
+    argv: (args) => {
+      if (args.pageToken !== undefined && (typeof args.pageToken !== "string" || args.pageToken.startsWith("-"))) throw new ToolInputError("pageToken must be the token a page gave");
+      return ["place", "versions", ...text(args, "placeId").concat(args.placeId ? [] : text(args, "place")), ...number(args, "limit", "--limit"), ...(args.pageToken ? [`--page=${args.pageToken}`] : [])];
+    },
+  },
+  {
+    name: "download_place",
+    description: "One saved version of a place (default the latest) downloaded as an .rbxl through Open Cloud, to bring back instances the sync deleted when git has no copy: import_rbxm takes the file directly (list true to see its items and scripts, then paths with only what is missing). open true (or open_place with the file) shows it in a Studio of its own, which the user sees and Quack neither syncs nor reaches with its tools.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        placeId: { type: "string", description: "A place id; default the place's" },
+        version: { type: "number", description: "A version from list_place_versions; default the latest" },
+        out: { type: "string", description: "Absolute .rbxl path (default under Quack's data folder, places/)" },
+        open: { type: "boolean", description: "Open it in Studio after" },
+        ...placeProp,
+      },
+    },
+    argv: (args) => {
+      if (args.out !== undefined && (typeof args.out !== "string" || !/\.rbxlx?$/i.test(args.out))) throw new ToolInputError("out must be an .rbxl path");
+      return ["place", "download", ...text(args, "placeId").concat(args.placeId ? [] : text(args, "place")), ...number(args, "version", "--version"), ...(args.out ? [`--out=${args.out}`] : []), ...(args.open === true ? ["--open"] : [])];
+    },
+  },
+  {
+    name: "open_place",
+    description: "Opens a place in Studio, which the user sees: a registered place (or any place id) to edit, or a local .rbxl / .rbxlx file (a version from download_place) in a Studio of its own. wait (a registered place) returns once its Studio connects to Quack.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        place: { type: "string", description: "A place id or a registered place's name" },
+        file: { type: "string", description: "Absolute path of an .rbxl or .rbxlx instead" },
+        wait: { type: "boolean" },
+        timeoutSeconds: { type: "number", description: "wait: give up after this long (default 300)" },
+      },
+    },
+    argv: (args) => {
+      if (args.file !== undefined) {
+        if (typeof args.file !== "string" || !/\.rbxlx?$/i.test(args.file)) throw new ToolInputError("file must be an .rbxl or .rbxlx path");
+        return ["open", `--file=${args.file}`];
+      }
+      return ["open", ...text(args, "place", true), ...(args.wait === true ? ["--wait"] : []), ...number(args, "timeoutSeconds", "--timeout")];
+    },
+  },
+  {
+    name: "selection",
+    description: "Studio's selection in edit mode: get it, set it to instance paths (mode add or remove changes it; an empty list clears it), or view: point the edit camera at a path or the selection (from: degrees around, 0 is +X and 90 is +Z, default 45; angleY: degrees up, default 30; padding scales the distance). view leaves the camera there, so a capture_screenshot after shows it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["get", "set", "view"] },
+        paths: { type: "array", items: { type: "string" }, description: "set: instance paths" },
+        mode: { type: "string", enum: ["set", "add", "remove"] },
+        path: { type: "string", description: "view: what to frame (default the selection)" },
+        from: { type: "number" },
+        angleY: { type: "number" },
+        padding: { type: "number" },
+        ...placeProp,
+      },
+    },
+    argv: (args) => {
+      const action = args.action ?? "get";
+      if (!["get", "set", "view"].includes(String(action))) throw new ToolInputError("action must be get, set or view");
+      if (action === "set") {
+        const paths = args.paths;
+        if (!Array.isArray(paths) || paths.some((p) => typeof p !== "string" || !p || p.includes(",") || p.startsWith("-"))) throw new ToolInputError("paths must be a list of instance paths (none with a comma)");
+        if (args.mode !== undefined && !["set", "add", "remove"].includes(String(args.mode))) throw new ToolInputError("mode must be set, add or remove");
+        return ["selection", "set", paths.length ? paths.join(",") : "none", ...text(args, "place"), ...(args.mode ? [`--mode=${args.mode}`] : [])];
+      }
+      if (action === "view") {
+        const signed = (key: string, flag: string) => {
+          const v = args[key];
+          if (v === undefined || v === null) return [];
+          if (typeof v !== "number" || !Number.isFinite(v)) throw new ToolInputError(`${key} must be a number`);
+          return [`${flag}=${v}`];
+        };
+        if (typeof args.path === "string" && args.path && !args.path.includes(".") && !/^(Workspace|workspace)$/.test(args.path)) throw new ToolInputError("path must be an instance path like Workspace.Map.Door");
+        return ["selection", "view", ...text(args, "path"), ...text(args, "place"), ...signed("from", "--from"), ...signed("angleY", "--angle"), ...signed("padding", "--padding")];
+      }
+      return ["selection", "get", ...text(args, "place")];
+    },
+  },
+  {
+    name: "generate_model",
+    description: "A 3D model made by Roblox's generation (GenerationService) from a text prompt, an image, or both, put in the place in edit mode (default in Workspace where the camera looks), one undo step, selected; it syncs to disk like anything made in Studio. Takes minutes (118 s for a crate). image: an image asset id, or an absolute .png path that is uploaded first (Open Cloud; the same file never twice). schema Body1 is one mesh, Car5 a car's five parts; groups names the parts instead.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        prompt: { type: "string" },
+        image: { type: "string", description: "An image asset id or an absolute .png path" },
+        size: { type: "array", items: { type: "number" }, description: "[x, y, z] studs, approximate" },
+        position: { type: "array", items: { type: "number" }, description: "[x, y, z] where its pivot goes" },
+        parent: { type: "string", description: "Default Workspace" },
+        name: { type: "string" },
+        maxTriangles: { type: "number" },
+        textures: { type: "boolean", description: "Default true" },
+        schema: { type: "string", enum: ["Body1", "Car5"] },
+        groups: { type: "array", items: { type: "string" } },
+        timeoutSeconds: { type: "number", description: "Default 300" },
+        ...placeProp,
+      },
+    },
+    argv: (args) => {
+      const vec = (key: string, flag: string) => {
+        const v = args[key];
+        if (v === undefined || v === null) return [];
+        if (!Array.isArray(v) || v.length !== 3 || v.some((n) => typeof n !== "number" || !Number.isFinite(n))) throw new ToolInputError(`${key} must be [x, y, z]`);
+        return [`${flag}=${v.join(",")}`];
+      };
+      if (args.image !== undefined && (typeof args.image !== "string" || !(/^\d+$/.test(args.image) || /\.png$/i.test(args.image)))) throw new ToolInputError("image must be an image asset id or a .png path");
+      if (args.schema !== undefined && !["Body1", "Car5"].includes(String(args.schema))) throw new ToolInputError("schema must be Body1 or Car5");
+      const groups = args.groups;
+      if (groups !== undefined && (!Array.isArray(groups) || groups.some((g) => typeof g !== "string" || !g || g.includes(",")))) throw new ToolInputError("groups must be a list of part names");
+      const prompt = typeof args.prompt === "string" && args.prompt.trim() ? args.prompt.trim() : undefined;
+      if (!prompt && args.image === undefined) throw new ToolInputError("give a prompt, an image, or both");
+      // The prompt as --text=: it may start with "-" and the place stays the one positional
+      return ["generate", ...text(args, "place")].concat(
+        prompt ? [`--text=${prompt}`] : [],
+        args.image !== undefined ? [`--image=${args.image}`] : [],
+        vec("size", "--size"), vec("position", "--at"),
+        typeof args.parent === "string" && args.parent ? [`--parent=${args.parent}`] : [],
+        typeof args.name === "string" && args.name ? [`--name=${args.name}`] : [],
+        number(args, "maxTriangles", "--triangles"),
+        args.textures === false ? ["--no-textures"] : [],
+        args.schema ? [`--schema=${args.schema}`] : [],
+        Array.isArray(groups) && groups.length ? [`--groups=${groups.join(",")}`] : [],
+        number(args, "timeoutSeconds", "--timeout"),
+      );
+    },
+  },  {
+    name: "badges",
+    description: "A universe's badges through Open Cloud (run by Quack's hub, which holds the key). quota: free badges left today (5 a UTC day; past them each costs 100 Robux). list: every badge. create: IRREVERSIBLE, a badge is never deleted, only disabled; past the free quota it refuses unless spend is true, and sends the cost as expectedCost so Roblox charges nothing else. icon: replaces a badge's icon. create and icon ask the user in Quack's app and run only after their Accept; never create one to test, or in a test place's universe. Only when the user asked for it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["quota", "list", "create", "icon"] },
+        universeId: { type: "string", description: "quota, list, create" },
+        name: { type: "string", description: "create" },
+        description: { type: "string", description: "create" },
+        iconPath: { type: "string", description: "create (optional) and icon: absolute .png or .jpg path" },
+        spend: { type: "boolean", description: "create: allow the 100 Robux a badge costs past the free quota" },
+        badgeId: { type: "string", description: "icon" },
+      },
+      required: ["action"],
+    },
+    argv: (args) => {
+      const action = String(args.action);
+      if (action === "quota" || action === "list") return ["badge", action, universeIdArg(args)];
+      if (action === "create") {
+        if (typeof args.name !== "string" || !args.name.trim()) throw new ToolInputError("name is required");
+        return ["badge", "create", universeIdArg(args), `--name=${args.name}`, ...optionText(args, "description", "--description"), ...optionText(args, "iconPath", "--icon"), ...(args.spend === true ? ["--spend"] : [])];
+      }
+      if (action === "icon") return ["badge", "icon", wholeArg(args, "badgeId"), ...text(args, "iconPath", true)];
+      throw new ToolInputError("action must be quota, list, create or icon");
+    },
+  },
+  ...(["developer_products", "game_passes"] as const).map((name): Tool => {
+    const product = name === "developer_products";
+    const idKey = product ? "productId" : "gamePassId";
+    return {
+      name,
+      description: product
+        ? "A universe's developer products through Open Cloud (run by Quack's hub, which holds the key). list, get: read. create: IRREVERSIBLE, a product is never deleted, only taken off sale; it is made on sale. update: changes only the fields given (forSale false takes it off sale). create and update ask the user in Quack's app and run only after their Accept. Make them in the published game's universe, only when the user asked for it."
+        : "A universe's game passes through Open Cloud (run by Quack's hub, which holds the key). list, get: read. create: IRREVERSIBLE, a pass is never deleted, only taken off sale; forSale false keeps it off sale until the code that grants it is live (a pass on sale can be bought from the game's page at once). update: changes only the fields given. create and update ask the user in Quack's app and run only after their Accept. Make them in the published game's universe, only when the user asked for it.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["list", "get", "create", "update"] },
+          universeId: { type: "string" },
+          [idKey]: { type: "string", description: "get, update" },
+          name: { type: "string" },
+          price: { type: "number", description: "Robux" },
+          description: { type: "string" },
+          forSale: { type: "boolean" },
+          imagePath: { type: "string", description: "Absolute .png or .jpg path" },
+        },
+        required: ["action", "universeId"],
+      },
+      argv: (args) => {
+        const command = product ? "product" : "gamepass";
+        const action = String(args.action);
+        if (action === "list") return [command, "list", universeIdArg(args)];
+        if (action === "get") return [command, "get", universeIdArg(args), wholeArg(args, idKey)];
+        if (action !== "create" && action !== "update") throw new ToolInputError("action must be list, get, create or update");
+        if (args.forSale !== undefined && typeof args.forSale !== "boolean") throw new ToolInputError("forSale must be true or false");
+        return [
+          command, action, universeIdArg(args), ...(action === "update" ? [wholeArg(args, idKey)] : []),
+          ...optionText(args, "name", "--name"), ...number(args, "price", "--price"), ...optionText(args, "description", "--description"),
+          ...(typeof args.forSale === "boolean" ? [`--for-sale=${args.forSale}`] : []), ...optionText(args, "imagePath", "--image"),
+        ];
+      },
+    };
+  }),
+  {
+    name: "localization",
+    description: "A universe's auto-localization table through Open Cloud (run by Quack's hub, which holds the key). Read: info (entries of the 10,000 the table holds, untranslated, settings), dump (every entry to a .json file, the copy to keep before a delete), lint (a translations file checked alone: placeholders, RichText tags, icons, redeem codes, the 300-character limit, locales; no Roblox call), check (one string's latest translation per locale), langs (which languages get automatic translation). Write, each asking the user in Quack's app and running only after their Accept, only when the user asked: push (adds a JSON array's English strings the table lacks, untranslated; automatic translation then fills them and spends the universe's translation quota), delete (removes those entries and their translations, no undo; a deleted string cannot be added back as it was), translate ({ \"<English source>\": { \"<locale>\": \"<text>\" } }, checked as lint does first; spends no quota and Roblox never overwrites it), langs with changes (automatic translation on or off per language). dryRun on push, delete and translate only reports what would happen.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["info", "dump", "push", "delete", "translate", "lint", "check", "langs"] },
+        universeId: { type: "string" },
+        filePath: { type: "string", description: "push, delete: JSON array of strings; translate, lint: the translations file. Absolute" },
+        out: { type: "string", description: "dump: absolute .json path" },
+        dryRun: { type: "boolean" },
+        locales: { type: "array", items: { type: "string" }, description: "translate, lint: locales every string must have; check: which to read (default pt, es, fr, ru, vi, th)" },
+        source: { type: "string", description: "check: the English text" },
+        changes: { type: "object", additionalProperties: { type: "boolean" }, description: "langs: { \"de\": false, \"pt\": true } (asks first)" },
+        unchecked: { type: "boolean", description: "translate: send even with problems the check found" },
+      },
+      required: ["action"],
+    },
+    argv: (args) => {
+      const action = String(args.action);
+      const locales = () => {
+        const v = args.locales;
+        if (v === undefined || v === null) return [];
+        if (!Array.isArray(v) || v.some((l) => typeof l !== "string" || !/^[a-z]{2,3}(-[a-z]{2,4})?$/i.test(l))) throw new ToolInputError("locales must be a list of locale codes");
+        return v.length ? [`--locales=${v.join(",")}`] : [];
+      };
+      const dry = args.dryRun === true ? ["--dry-run"] : [];
+      switch (action) {
+        case "lint":
+          return ["loc", "lint", ...text(args, "filePath", true), ...locales()];
+        case "info":
+          return ["loc", "info", universeIdArg(args)];
+        case "dump":
+          if (typeof args.out !== "string" || !/\.json$/i.test(args.out)) throw new ToolInputError("out must be a .json path");
+          return ["loc", "dump", universeIdArg(args), ...text(args, "out", true)];
+        case "push":
+        case "delete":
+          return ["loc", action, universeIdArg(args), ...text(args, "filePath", true), ...dry];
+        case "translate":
+          return ["loc", "translate", universeIdArg(args), ...text(args, "filePath", true), ...locales(), ...dry, ...(args.unchecked === true ? ["--unchecked"] : [])];
+        case "check":
+          if (typeof args.source !== "string" || !args.source) throw new ToolInputError("source is required");
+          return ["loc", "check", universeIdArg(args), `--text=${args.source}`, ...locales()];
+        case "langs": {
+          const changes = args.changes;
+          if (changes !== undefined && (typeof changes !== "object" || changes === null || Array.isArray(changes))) throw new ToolInputError("changes must be { \"<code>\": true | false }");
+          const list = Object.entries((changes ?? {}) as Record<string, unknown>).map(([code, on]) => {
+            if (!/^[a-z]{2,3}(-[a-z]{2,4})?$/i.test(code) || typeof on !== "boolean") throw new ToolInputError("changes must be { \"<code>\": true | false }");
+            return `${code}=${on ? "on" : "off"}`;
+          });
+          return ["loc", "langs", universeIdArg(args), ...list];
+        }
+      }
+      throw new ToolInputError("action must be info, dump, push, delete, translate, lint, check or langs");
+    },
+  },
+  {
+    name: "analytics_query",
+    description: "Roblox's Analytics Query API for a universe, read-only (run by Quack's hub, which holds the key): the numbers TelemetryService sends and the standard metrics. query is the API's body: { metric, granularity (OneDay, OneHour, None), startTime, endTime, breakdown, filter }; left out, daily active users for the last 3 days. kind dimension-values lists a dimension's values. Daily data arrives about two days late, hourly within 1 to 2 hours. Names: https://create.roblox.com/docs/cloud/guides/analytics/metrics",
+    inputSchema: {
+      type: "object",
+      properties: {
+        universeId: { type: "string" },
+        query: { type: "object" },
+        kind: { type: "string", enum: ["metrics", "dimension-values"] },
+      },
+      required: ["universeId"],
+    },
+    argv: (args) => {
+      if (args.query !== undefined && (typeof args.query !== "object" || args.query === null || Array.isArray(args.query))) throw new ToolInputError("query must be an object");
+      if (args.kind !== undefined && !["metrics", "dimension-values"].includes(String(args.kind))) throw new ToolInputError("kind must be metrics or dimension-values");
+      return ["analytics", universeIdArg(args), ...(args.query ? [`--body=${JSON.stringify(args.query)}`] : []), ...(args.kind ? [`--kind=${args.kind}`] : []), "--json"];
+    },
+  },
+  {
+    name: "move_player",
+    description: "Moves the player's character in a running play instead of an eval that sets HumanoidRootPart.CFrame. mode teleport (default): onto a part's or model's top, to an attachment, or the feet to a position; facing kept, velocity zeroed, a seat left first. mode walk: Humanoid:MoveTo in a straight line; mode path: along a PathfindingService path (jumps included). A walk waits until the feet are within radius studs (flat, default 2), no closer for 2 s (stuck), the character dies, or timeoutSeconds (default 15). Runs on the play server, or on the player's client when that player owns the character's physics (the answer says which and who owns it); peer forces one side. Answers where the feet ended, the distance (and height) left, why it stopped, the time.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Where to: Workspace.Map.Shop, an Attachment, Players.Player2 (that player's character)" },
+        position: { type: "array", items: { type: "number" }, description: "Or [x, y, z]: where the feet go" },
+        mode: { type: "string", enum: ["teleport", "walk", "path"] },
+        radius: { type: "number", description: "Walk: arrived within this many studs, flat (default 2)" },
+        timeoutSeconds: { type: "number", description: "Walk: give up after this long (default 15)" },
+        peer: { type: "string", enum: ["server", "client"], description: "Default: the server, or the owner's client" },
+        ...placeProp,
+      },
+    },
+    argv: (args) => {
+      const position = args.position;
+      const hasPath = typeof args.path === "string" && args.path.trim() !== "";
+      if ((position === undefined || position === null) === !hasPath) throw new ToolInputError("give path or position, one of them");
+      if (position !== undefined && position !== null && (!Array.isArray(position) || position.length !== 3 || position.some((n) => typeof n !== "number" || !Number.isFinite(n)))) throw new ToolInputError("position must be [x, y, z]");
+      if (args.mode !== undefined && !["teleport", "walk", "path"].includes(String(args.mode))) throw new ToolInputError("mode must be teleport, walk or path");
+      if (args.peer !== undefined && !["server", "client"].includes(String(args.peer))) throw new ToolInputError("peer must be server or client");
+      return [
+        "move", ...(hasPath ? text(args, "path", true) : []), ...text(args, "place"),
+        ...(Array.isArray(position) ? [`--at=${position.join(",")}`] : []),
+        ...(args.mode ? [`--mode=${args.mode}`] : []),
+        ...number(args, "radius", "--radius"), ...number(args, "timeoutSeconds", "--timeout"),
+        ...(args.peer ? [`--peer=${args.peer}`] : []),
+      ];
+    },
+  },
+  ...LIVE_TOOLS(),
 ];
+
+/** The experience a cloud tool works on: universeId, or the place's (place: a registered place or a place id) */
+function universeArgs(args: Record<string, unknown>): string[] {
+  if (args.universeId !== undefined) {
+    const n = Number(args.universeId);
+    if (!Number.isSafeInteger(n) || n <= 0) throw new ToolInputError("universeId must be an experience (universe) id");
+    return [`--universe=${n}`];
+  }
+  return text(args, "place");
+}
+
+const WRITE_RULE = "A write runs only when the user asked for this exact change in so many words; otherwise refuse and ask them first. Even then Quack asks the user in its app and changes nothing without their Accept (5 minutes, then No). An answer saying Quack is opening means its app was closed: ask again in a few seconds.";
+
+TOOLS.push(
+  {
+    name: "datastore",
+    description: `A live game's DataStores through Open Cloud (the key never leaves Quack's hub). Reads: stores (list), keys (of a store; prefix, scope or allScopes), get (an entry: version, size, users; fields picks dot paths like Coins,Pets.Count; a big value goes to a file; version reads an old one), versions (the history, with start and end times). Writes: set (value: the new JSON; the approval lists every field that changes and the write fails if the game saved in between), increment (by), delete. ${WRITE_RULE} The experience is universeId, or the place's.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["stores", "keys", "get", "versions", "set", "increment", "delete"] },
+        store: { type: "string" },
+        key: { type: "string" },
+        scope: { type: "string", description: "Default global" },
+        allScopes: { type: "boolean" },
+        prefix: { type: "string" },
+        fields: { type: "array", items: { type: "string" } },
+        version: { type: "string", description: "get: an old version's id from versions" },
+        start: { type: "string", description: "versions: ISO time" },
+        end: { type: "string" },
+        oldestFirst: { type: "boolean" },
+        value: { description: "set: the entry's new value (any JSON)" },
+        by: { type: "number", description: "increment: a whole number" },
+        limit: { type: "number" },
+        cursor: { type: "string" },
+        out: { type: "string", description: "get: absolute .json path for the value" },
+        universeId: { type: "number" },
+        ...placeProp,
+      },
+      required: ["action"],
+    },
+    argv: (args) => {
+      const action = String(args.action);
+      if (!["stores", "keys", "get", "versions", "set", "increment", "delete"].includes(action)) throw new ToolInputError("action must be stores, keys, get, versions, set, increment or delete");
+      const positional = [action, ...(action !== "stores" ? text(args, "store", true) : []), ...(!["stores", "keys"].includes(action) ? text(args, "key", true) : [])];
+      const flag = (key: string, name = key) => (typeof args[key] === "string" && args[key] !== "" ? [`--${name}=${args[key]}`] : []);
+      const fields = args.fields;
+      if (fields !== undefined && (!Array.isArray(fields) || fields.some((f) => typeof f !== "string" || f.includes(",")))) throw new ToolInputError("fields must be a list of dot paths");
+      if (action === "set" && args.value === undefined) throw new ToolInputError("set needs value");
+      if (action === "increment" && (typeof args.by !== "number" || !Number.isInteger(args.by) || args.by === 0)) throw new ToolInputError("increment needs by, a whole number other than 0");
+      return [
+        "datastore", ...positional, ...universeArgs(args),
+        ...flag("scope"), ...flag("prefix"), ...flag("version"), ...flag("start"), ...flag("end"), ...flag("cursor"), ...flag("out"),
+        ...(args.allScopes === true ? ["--all-scopes"] : []), ...(args.oldestFirst === true ? ["--oldest-first"] : []),
+        ...(Array.isArray(fields) && fields.length ? [`--fields=${fields.join(",")}`] : []),
+        ...(action === "set" ? [`--value=${JSON.stringify(args.value)}`] : []),
+        ...(action === "increment" ? [`--by=${args.by}`] : []),
+        ...number(args, "limit", "--limit"),
+      ];
+    },
+  },
+  {
+    name: "experience_config",
+    description: `An experience's configs (In-Experience Config, what ConfigService reads in the game) through Open Cloud. get: the published values (keys picks some); draft: the pending draft and what it changes; set: merges entries into the draft (the game does not see a draft; no other key is touched); publish: the draft goes live on every server. publish is a write: ${WRITE_RULE}`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["get", "draft", "set", "publish"] },
+        keys: { type: "array", items: { type: "string" } },
+        entries: { type: "object", description: "set: key: value to merge into the draft" },
+        message: { type: "string", description: "publish: the version's note" },
+        repository: { type: "string", description: "Default InExperienceConfig" },
+        universeId: { type: "number" },
+        ...placeProp,
+      },
+      required: ["action"],
+    },
+    argv: (args) => {
+      const action = String(args.action);
+      if (!["get", "draft", "set", "publish"].includes(action)) throw new ToolInputError("action must be get, draft, set or publish");
+      const keys = args.keys;
+      if (keys !== undefined && (!Array.isArray(keys) || keys.some((k) => typeof k !== "string" || k.includes(",")))) throw new ToolInputError("keys must be a list of config keys");
+      const entries = args.entries;
+      if (action === "set" && (!entries || typeof entries !== "object" || Array.isArray(entries))) throw new ToolInputError("set needs entries, an object of key: value");
+      return [
+        "config", action, ...universeArgs(args),
+        ...(Array.isArray(keys) && keys.length ? [`--keys=${keys.join(",")}`] : []),
+        ...(action === "set" ? [`--value=${JSON.stringify(entries)}`] : []),
+        ...(typeof args.message === "string" && args.message ? [`--message=${args.message}`] : []),
+        ...(typeof args.repository === "string" && args.repository ? [`--repository=${args.repository}`] : []),
+      ];
+    },
+  },
+);
+
+TOOLS.push(
+  {
+    name: "cloud_permissions",
+    description: "What the Open Cloud key saved in Quack may do (Roblox's own check: the key's state and scopes, never the key), and which Quack tools each missing permission leaves out. When a cloud tool is refused for a permission, this says what the user adds to the key in the Creator Hub.",
+    inputSchema: { type: "object", properties: {} },
+    argv: () => ["cloud", "check"],
+  },
+  {
+    name: "luau_run",
+    description: `Luau run by Roblox in a cloud server of its own against the latest saved version of a place (or version), with no Studio open: returns what it printed and returned. It runs as the experience and can change its DataStores, so it is a write: ${WRITE_RULE} For the running game in Studio use eval_server_runtime.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        code: { type: "string" },
+        version: { type: "number", description: "A saved version (list_place_versions); default the latest" },
+        timeoutSeconds: { type: "number", description: "1 to 300 (default 60)" },
+        universeId: { type: "number" },
+        ...placeProp,
+      },
+      required: ["code"],
+    },
+    argv: (args) => ["luau", ...text(args, "place"), codeFlag(args), ...universeArgs(args), ...number(args, "version", "--version"), ...number(args, "timeoutSeconds", "--timeout")],
+  },
+);
+/** A universe id from the AI, as one argv entry */
+function universeIdArg(args: Record<string, unknown>): string {
+  return wholeArg(args, "universeId");
+}
+
+/** A whole-number id (universe, badge, product, pass) */
+function wholeArg(args: Record<string, unknown>, key: string): string {
+  const s = String(args[key] ?? "").trim();
+  if (!/^\d+$/.test(s) ||Number(s) <= 0) throw new ToolInputError(`${key} must be a whole number above 0`);
+  return s;
+}
+
+/** An option's value as one --flag=value entry, so a value starting with "-" stays the value */
+function optionText(args: Record<string, unknown>, key: string, flag: string): string[] {
+  const v = args[key];
+  if (v === undefined || v === null || v === "") return [];
+  if (typeof v !== "string") throw new ToolInputError(`${key} must be a string`);
+  return [`${flag}=${v}`];
+}
+
+/**
+ * The live game's Open Cloud (src/cloud, run by the hub): every change is a write that the hub
+ * asks the user about in Quack's app and runs only after their Accept; the AI never approves one. The
+ * experience is universeId, or the place's (place, or the place the AI runs in).
+ */
+function LIVE_TOOLS(): Tool[] {
+  const WRITE_NOTE = "A write: the hub asks the user in Quack's app first and does nothing without their Accept (no answer in 5 minutes is a No); a refusal comes back as an error that says nothing changed. Never retry a refused write: ask the user. An answer saying Quack is opening means its app was closed and is starting: ask again in a few seconds.";
+  const target = {
+    universeId: { type: "string", description: "The experience (universe) id; left out, the experience of `place`" },
+    ...placeProp,
+  };
+  const universe = (args: Record<string, unknown>): string[] => {
+    if (args.universeId === undefined || args.universeId === null || args.universeId === "") return text(args, "place");
+    if (!/^[1-9]\d{0,18}$/.test(String(args.universeId))) throw new ToolInputError("universeId must be a whole number");
+    if (args.place !== undefined && args.place !== "") throw new ToolInputError("give universeId or place, not both");
+    return [`--universe=${args.universeId}`];
+  };
+  const action = (args: Record<string, unknown>, allowed: string[]): string => {
+    const a = String(args.action ?? "");
+    if (!allowed.includes(a)) throw new ToolInputError(`action must be ${allowed.join(", ")}`);
+    return a;
+  };
+  /** A value that goes as --flag=<value>: a negative number or a JSON text stays one entry */
+  const flag = (args: Record<string, unknown>, key: string, name: string, kind: "number" | "string" | "json"): string[] => {
+    const v = args[key];
+    if (v === undefined || v === null) return [];
+    if (kind === "number" && (typeof v !== "number" || !Number.isFinite(v))) throw new ToolInputError(`${key} must be a number`);
+    if (kind === "string" && typeof v !== "string") throw new ToolInputError(`${key} must be a string`);
+    return [`--${name}=${kind === "json" ? JSON.stringify(v) : String(v)}`];
+  };
+  const bool = (args: Record<string, unknown>, key: string, name: string) => (args[key] === true ? [`--${name}`] : []);
+  const paging = { limit: { type: "number", description: "1 to 100 (default 20)" }, pageToken: { type: "string", description: "The nextPageToken of the page before" } };
+  const pages = (args: Record<string, unknown>) => [...number(args, "limit", "--limit"), ...flag(args, "pageToken", "page", "string")];
+  const id = (value: unknown) => /^[1-9]\d{0,18}$/.test(String(value));
+
+  return [
+    {
+      name: "get_universe",
+      description: "A live experience's settings from Roblox (Open Cloud, read only): name, visibility, owner, root place, voice chat, which devices can join, the private server price, age rating.",
+      inputSchema: { type: "object", properties: { ...target } },
+      argv: (args) => ["universe", "get", ...universe(args)],
+    },
+    {
+      name: "update_universe",
+      description: `Changes a live experience's settings. ${WRITE_NOTE} settings by Open Cloud name: voiceChatEnabled, desktopEnabled, mobileEnabled, tabletEnabled, consoleEnabled, vrEnabled (true/false), visibility (PUBLIC or PRIVATE: PRIVATE removes every player from every server at once), privateServerPriceRobux (Robux; a new price cancels every private server subscription; null turns private servers off).`,
+      inputSchema: { type: "object", properties: { settings: { type: "object", description: "{ field: new value }" }, ...target }, required: ["settings"] },
+      argv: (args) => {
+        if (!args.settings || typeof args.settings !== "object" || Array.isArray(args.settings)) throw new ToolInputError("settings must be an object of fields");
+        return ["universe", "set", ...universe(args), `--props=${JSON.stringify(args.settings)}`];
+      },
+    },
+    {
+      name: "restart_servers",
+      description: `Restarts a live experience's servers (after a publish): by default only the servers on an older version than the latest published; allVersions: every server. The players in them are disconnected. bleedOffMinutes (1 to 60): those servers take no new players and close after that long. ${WRITE_NOTE}`,
+      inputSchema: {
+        type: "object",
+        properties: { placeIds: { type: "array", items: { type: "string" }, description: "Only these places (default every place)" }, allVersions: { type: "boolean" }, bleedOffMinutes: { type: "number" }, ...target },
+      },
+      argv: (args) => {
+        const ids = args.placeIds;
+        if (ids !== undefined && (!Array.isArray(ids) || ids.some((p) => !id(p)))) throw new ToolInputError("placeIds must be a list of place ids");
+        return ["servers", "restart", ...universe(args), ...(Array.isArray(ids) && ids.length ? [`--places=${ids.join(",")}`] : []), ...bool(args, "allVersions", "all-versions"), ...number(args, "bleedOffMinutes", "--bleed")];
+      },
+    },
+    {
+      name: "publish_message",
+      description: `Publishes a MessagingService message to every live server of an experience (the servers that subscribed to the topic with SubscribeAsync run their code on it). Topic up to 80 characters, message up to 1,024 (a table goes as its JSON). ${WRITE_NOTE}`,
+      inputSchema: { type: "object", properties: { topic: { type: "string" }, message: { type: "string" }, ...target }, required: ["topic", "message"] },
+      argv: (args) => {
+        if (typeof args.message !== "string") throw new ToolInputError("message must be a string");
+        return ["message", "publish", ...text(args, "topic", true), ...universe(args), `--message=${args.message}`];
+      },
+    },
+    {
+      name: "memory_store_sorted_map",
+      description: `A live experience's MemoryStore sorted map. list and get read; create, update (upsert: create if missing) and delete are writes. ${WRITE_NOTE} value: any JSON value (32 KB at most); ttlSeconds: how long it lives (1 to 3888000, 45 days), required to create or update; sortKey: a number or a string.`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["list", "get", "create", "update", "delete"] },
+          map: { type: "string", description: "The sorted map's name" },
+          item: { type: "string", description: "The item's key (all but list)" },
+          value: { description: "create/update: the item's value (any JSON)" },
+          ttlSeconds: { type: "number" },
+          sortKey: { type: ["number", "string"] },
+          upsert: { type: "boolean" },
+          descending: { type: "boolean", description: "list: keys from last to first" },
+          filter: { type: "string", description: "list: CEL on id and sortKey, like id > \"a\" && id < \"m\"" },
+          ...paging, ...target,
+        },
+        required: ["action", "map"],
+      },
+      argv: (args) => {
+        const a = action(args, ["list", "get", "create", "update", "delete"]);
+        const head = ["memory-store", "map", a, ...text(args, "map", true)];
+        if (a === "list") return [...head, ...universe(args), ...pages(args), ...bool(args, "descending", "descending"), ...flag(args, "filter", "filter", "string")];
+        const out = [...head, ...text(args, "item", true), ...universe(args)];
+        if (a === "get" || a === "delete") return out;
+        if (args.value === undefined) throw new ToolInputError("value is required");
+        if (args.sortKey !== undefined && typeof args.sortKey !== "number" && typeof args.sortKey !== "string") throw new ToolInputError("sortKey must be a number or a string");
+        return [...out, ...flag(args, "value", "value", "json"), ...number(args, "ttlSeconds", "--ttl"), ...(args.sortKey !== undefined ? [`--sort-key=${args.sortKey}`] : []), ...(a === "update" ? bool(args, "upsert", "upsert") : [])];
+      },
+    },
+    {
+      name: "memory_store_queue",
+      description: `A live experience's MemoryStore queue. All three are writes: read takes up to count items from the front and hides them from the game's own servers for invisibleSeconds (default 30), after which they come back unless discarded with the readId it answers; add puts an item in (ttlSeconds required, priority optional); discard removes the items of a read for good. ${WRITE_NOTE}`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["read", "add", "discard"] },
+          queue: { type: "string" },
+          count: { type: "number", description: "read: 1 to 200 (default 1)" },
+          invisibleSeconds: { type: "number" },
+          allOrNothing: { type: "boolean", description: "read: fail unless count items are there" },
+          value: { description: "add: the item (any JSON)" },
+          ttlSeconds: { type: "number" },
+          priority: { type: "number" },
+          readId: { type: "string", description: "discard: the readId a read answered" },
+          ...target,
+        },
+        required: ["action", "queue"],
+      },
+      argv: (args) => {
+        const a = action(args, ["read", "add", "discard"]);
+        const head = ["memory-store", "queue", a, ...text(args, "queue", true)];
+        if (a === "read") return [...head, ...universe(args), ...number(args, "count", "--count"), ...number(args, "invisibleSeconds", "--invisible"), ...bool(args, "allOrNothing", "all-or-nothing")];
+        if (a === "discard") return [...head, ...text(args, "readId", true), ...universe(args)];
+        if (args.value === undefined) throw new ToolInputError("value is required");
+        return [...head, ...universe(args), ...flag(args, "value", "value", "json"), ...number(args, "ttlSeconds", "--ttl"), ...flag(args, "priority", "priority", "number")];
+      },
+    },
+    {
+      name: "flush_memory_store",
+      description: `Erases a live experience's whole MemoryStore: every sorted map, queue and hash map (scope LIVE, what the running servers use; TEST: Studio's). It cannot be undone. ${WRITE_NOTE}`,
+      inputSchema: { type: "object", properties: { scope: { type: "string", enum: ["LIVE", "TEST"] }, ...target } },
+      argv: (args) => {
+        if (args.scope !== undefined && args.scope !== "LIVE" && args.scope !== "TEST") throw new ToolInputError("scope must be LIVE or TEST");
+        return ["memory-store", "flush", ...universe(args), ...(args.scope === "TEST" ? ["--test"] : [])];
+      },
+    },
+    {
+      name: "ordered_data_store",
+      description: `A live experience's ordered data store (a leaderboard): list (highest first; ascending for lowest; min/max bound the values) and get read; create, set (upsert: create if missing), increment (amount, may be negative) and delete are writes. ${WRITE_NOTE} Values are whole numbers; scope defaults to global.`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["list", "get", "create", "set", "increment", "delete"] },
+          store: { type: "string" },
+          entry: { type: "string", description: "The entry's key (all but list), often a user id" },
+          scope: { type: "string" },
+          value: { type: "number" },
+          amount: { type: "number" },
+          upsert: { type: "boolean" },
+          ascending: { type: "boolean" },
+          min: { type: "number" },
+          max: { type: "number" },
+          ...paging, ...target,
+        },
+        required: ["action", "store"],
+      },
+      argv: (args) => {
+        const a = action(args, ["list", "get", "create", "set", "increment", "delete"]);
+        const head = ["leaderboard", a, ...text(args, "store", true)];
+        const scope = flag(args, "scope", "scope", "string");
+        if (a === "list") return [...head, ...universe(args), ...scope, ...pages(args), ...bool(args, "ascending", "ascending"), ...flag(args, "min", "min", "number"), ...flag(args, "max", "max", "number")];
+        const out = [...head, ...text(args, "entry", true), ...universe(args), ...scope];
+        if (a === "create" || a === "set") {
+          if (typeof args.value !== "number") throw new ToolInputError("value is required: a whole number");
+          return [...out, ...flag(args, "value", "value", "number"), ...(a === "set" ? bool(args, "upsert", "upsert") : [])];
+        }
+        if (a === "increment") {
+          if (typeof args.amount !== "number") throw new ToolInputError("amount is required: a whole number");
+          return [...out, ...flag(args, "amount", "amount", "number")];
+        }
+        return out;
+      },
+    },
+    {
+      name: "user_restriction",
+      description: `A live experience's bans. list, get and logs read (logs: every ban and unban, filtered by userId and placeId). ban and unban are writes: ban kicks the user from any server they are in and keeps them out of the experience (or placeId only) for durationSeconds or permanently, and Roblox also bans their alt accounts unless excludeAltAccounts; displayReason is shown to them (400 characters), privateReason only in the log (1,000). Roblox takes 2 ban changes a minute for the same user. ${WRITE_NOTE}`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["list", "get", "ban", "unban", "logs"] },
+          userId: { type: "string" },
+          placeId: { type: "string", description: "One place of the experience instead of all of it" },
+          durationSeconds: { type: "number", description: "ban: left out, permanent" },
+          displayReason: { type: "string" },
+          privateReason: { type: "string" },
+          excludeAltAccounts: { type: "boolean" },
+          ...paging, ...target,
+        },
+        required: ["action"],
+      },
+      argv: (args) => {
+        const a = action(args, ["list", "get", "ban", "unban", "logs"]);
+        if (args.placeId !== undefined && !id(args.placeId)) throw new ToolInputError("placeId must be a place id");
+        if (args.userId !== undefined && !id(args.userId)) throw new ToolInputError("userId must be a Roblox user id");
+        const inPlace = args.placeId !== undefined ? [`--in-place=${args.placeId}`] : [];
+        if (a === "list") return ["ban", "list", ...universe(args), ...inPlace, ...pages(args)];
+        if (a === "logs") return ["ban", "logs", ...universe(args), ...inPlace, ...(args.userId !== undefined ? [`--user=${args.userId}`] : []), ...pages(args)];
+        const user = text(args, "userId", true);
+        if (a === "get") return ["ban", "get", ...user, ...universe(args), ...inPlace];
+        if (a === "unban") return ["ban", "lift", ...user, ...universe(args), ...inPlace, ...flag(args, "privateReason", "reason", "string")];
+        const d = args.durationSeconds;
+        if (d !== undefined && (typeof d !== "number" || !Number.isSafeInteger(d) || d < 1)) throw new ToolInputError("durationSeconds must be a whole number of seconds");
+        return ["ban", "set", ...user, ...universe(args), ...inPlace, ...(d !== undefined ? [`--duration=${d}`] : []), ...flag(args, "displayReason", "display", "string"), ...flag(args, "privateReason", "reason", "string"), ...bool(args, "excludeAltAccounts", "keep-alts")];
+      },
+    },
+  ];
+}
 
 /** A Creator Store id from the AI: a whole number, as one argv entry */
 function assetIdArg(args: Record<string, unknown>): string {
@@ -846,7 +1600,7 @@ function assetIdArg(args: Record<string, unknown>): string {
 }
 
 /** In a multiplayer test these reach one player's client: they take `player` */
-const PLAYER_TOOLS = new Set(["eval_client_runtime", "inspect_instance", "set_properties", "simulate_conditions", "simulate_keyboard_input", "click_gui", "wait_for", "inspect_gui", "simulate_mouse_input", "perf_sample", "get_memory_breakdown", "capture_script_profiler", "get_scene_analysis"]);
+const PLAYER_TOOLS = new Set(["eval_client_runtime", "find_instances", "inspect_instance", "set_properties", "simulate_conditions", "simulate_keyboard_input", "click_gui", "wait_for", "inspect_gui", "simulate_mouse_input", "perf_sample", "get_memory_breakdown", "capture_script_profiler", "get_scene_analysis", "capture_micro_profiler", "move_player"]);
 for (const tool of TOOLS) {
   if (!PLAYER_TOOLS.has(tool.name)) continue;
   const schema = tool.inputSchema as { properties: Record<string, unknown> };

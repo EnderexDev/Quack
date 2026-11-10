@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Quack hub entry point.
-//   node dist/hub/main.js [--port 3825] [--registry <file>]
+//   node dist/hub/main.js [--port 3825] [--registry <file>] [--token-stdin] [--app <quack-app.exe>]
 //   node dist/hub/main.js register <placeId> <folder> [name] [--registry <file>]
 //   node dist/hub/main.js unregister <placeId> [--registry <file>]
 //   node dist/hub/main.js list [--registry <file>]
@@ -64,7 +64,23 @@ if (command === "register") {
   const shutdown = (options: { handoff?: boolean; replaceDaemons?: boolean } = {}) => void hub.stop(options).then(() => process.exit(0));
   // --takeover: replace the hub on this port with a gap of ms (the app's restarts and updates)
   const takeover = args.includes("--takeover");
-  const hub = new QuackHub({ port, registryFile, daemonCli, daemonBuild, takeover, onShutdownRequest: shutdown });
+  // The app that answers Open Cloud writes: the bundled hub sits in <install>/resources/hub,
+  // next to the app's quack-app.exe two folders up; from dist/ only --app names one
+  const appExe = option("--app") ?? (BUNDLED && process.platform === "win32" ? path.join(here, "..", "..", "quack-app.exe") : undefined);
+  const hub = new QuackHub({ port, registryFile, daemonCli, daemonBuild, takeover, onShutdownRequest: shutdown, cloud: { appExe } });
+  // --token-stdin: the app's approval token comes on stdin (never argv, env or a file), and only
+  // answers carrying it accept or refuse a write. Without the flag stdin is never read
+  if (args.includes("--token-stdin")) {
+    const chunks: Buffer[] = [];
+    process.stdin.on("data", (chunk: Buffer) => {
+      chunks.push(chunk);
+      if (Buffer.concat(chunks).length > 1024) process.stdin.destroy();
+    });
+    process.stdin.on("end", () => {
+      if (!hub.setApprovalToken(Buffer.concat(chunks).toString("utf8"))) console.error("The approval token on stdin is not 64 hex characters: no write can be approved until the app restarts the hub");
+    });
+    process.stdin.on("error", () => {});
+  }
   hub.start().catch((error) => {
     console.error(`Quack hub could not start: ${error.message}`);
     process.exit(1);

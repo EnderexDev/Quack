@@ -4,11 +4,11 @@
 	answers the ones that run there:
 	  edit    exec, playStart (solo, Run mode, or a multiplayer test with players), playState,
 	          capture, captureRead, captureBurst, key, device, gui, sourceCheck, logpoint,
-	          exportRbxm, importRbxm, inspect, setProps, simulate, tabs, assetPreview, assetInsert,
-	          memory, scene
-	  server  eval, stop, perf, inspect, setProps, memory, profiler, scene
+	          exportRbxm, importRbxm, importPicks, inspect, setProps, simulate, tabs, assetPreview, assetInsert,
+	          memory, scene, placeInfo, selection, generate, micro, find
+	  server  eval, stop, perf, inspect, setProps, memory, profiler, scene, micro, move, find
 	  client  eval, captureBegin, captureBurst, key, click, gui, mouse, perf, inspect, setProps,
-	          simulate, memory, profiler, scene
+	          simulate, memory, profiler, scene, micro, move, find
 
 	Evals run in the game VM with the game's require cache: a bridge Script (server) or
 	LocalScript (client) made at runtime in the play DataModel holds a BindableFunction that
@@ -1328,15 +1328,32 @@ local function exportRbxm(args: { [string]: any }): { [string]: any }
 	return { data = base64(data), bytes = buffer.len(data), instances = names }
 end
 
-local function importRbxm(args: { [string]: any }): { [string]: any }
-	if type(args.data) ~= "string" or args.data == "" then error("the file's bytes did not come", 0) end
-	local parent = resolvePath(if type(args.parent) == "string" and args.parent ~= "" then args.parent else "Workspace")
+--- The file's top-level instances, made but parented nowhere
+local function deserialize(data: any): { Instance }
+	if type(data) ~= "string" or data == "" then error("the file's bytes did not come", 0) end
 	local EncodingService = (game :: any):GetService("EncodingService")
 	local SerializationService = (game :: any):GetService("SerializationService")
-	local decoded, raw = pcall(function() return EncodingService:Base64Decode(buffer.fromstring(args.data)) end)
+	local decoded, raw = pcall(function() return EncodingService:Base64Decode(buffer.fromstring(data)) end)
 	if not decoded then error(`could not decode the file: {raw}`, 0) end
 	local ok, made = pcall(function() return SerializationService:DeserializeInstancesAsync(raw) end)
 	if not ok then error(`SerializationService:DeserializeInstancesAsync failed (not an .rbxm?): {made}`, 0) end
+	return made
+end
+
+local function countScripts(instances: { Instance }): number
+	local scripts = 0
+	for _, instance in instances do
+		if instance:IsA("LuaSourceContainer") then scripts += 1 end
+		for _, d in instance:GetDescendants() do
+			if d:IsA("LuaSourceContainer") then scripts += 1 end
+		end
+	end
+	return scripts
+end
+
+local function importRbxm(args: { [string]: any }): { [string]: any }
+	local parent = resolvePath(if type(args.parent) == "string" and args.parent ~= "" then args.parent else "Workspace")
+	local made = deserialize(args.data)
 	local ChangeHistoryService = game:GetService("ChangeHistoryService")
 	local recording = if RunService:IsEdit() then ChangeHistoryService:TryBeginRecording("Quack: import .rbxm") else nil
 	local placed = {}
@@ -1358,15 +1375,124 @@ local function importRbxm(args: { [string]: any }): { [string]: any }
 	end
 	if recording then ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit) end
 	local names = {}
-	local scripts = 0
 	for _, instance in placed do
 		table.insert(names, `{instance:GetFullName()} ({instance.ClassName})`)
-		if instance:IsA("LuaSourceContainer") then scripts += 1 end
-		for _, d in instance:GetDescendants() do
-			if d:IsA("LuaSourceContainer") then scripts += 1 end
+	end
+	return { placed = names, scripts = countScripts(placed) }
+end
+
+--[=[
+	Only some of a file's instances, each put in its own parent: a place file (made importable by
+	the daemon, every service a Folder and Workspace a Model) brings back Workspace.MapA into
+	Workspace and StarterGui.Shop into StarterGui, and the rest of the file is dropped. Each pick
+	is { names = the names from the file's top level down, className = the class at the end,
+	into = the path of the parent in this place }; every sibling with that name and class comes.
+	Every parent is found before anything moves; one undo step.
+]=]
+local function importPicks(args: { [string]: any }): { [string]: any }
+	local picks = if type(args.picks) == "table" then args.picks else {}
+	if #picks == 0 then error("picks is required", 0) end
+	local made = deserialize(args.data)
+	-- the file's roots still parented nowhere: a root picked from a model file sits in the place by now
+	local function dropAll()
+		for _, root in made do
+			if root.Parent == nil then pcall(function() root:Destroy() end) end
 		end
 	end
-	return { placed = names, scripts = scripts }
+	-- each instance's children by name, made once: a whole service is one pick per item, and
+	-- rescanning its children for every one of them grows with the square of its size
+	local byName: { [Instance]: { [string]: { Instance } } } = {}
+	local function childrenNamed(parent: Instance, name: string): { Instance }
+		local index = byName[parent]
+		if index == nil then
+			local made: { [string]: { Instance } } = {}
+			for _, child in parent:GetChildren() do
+				local list = made[child.Name]
+				if list then table.insert(list, child) else made[child.Name] = { child } end
+			end
+			byName[parent] = made
+			index = made
+		end
+		return (index :: { [string]: { Instance } })[name] or {}
+	end
+	-- the file's top level by name too: a model file's picks are its roots
+	local rootsNamed: { [string]: { Instance } } = {}
+	for _, root in made do
+		local list = rootsNamed[root.Name]
+		if list then table.insert(list, root) else rootsNamed[root.Name] = { root } end
+	end
+	local plan = {}
+	local planError: string? = nil
+	for _, pick in picks do
+		local names = if type(pick.names) == "table" then pick.names else {}
+		local label = table.concat(names, ".")
+		local ok, into = pcall(resolvePath, tostring(pick.into))
+		if not ok then
+			planError = `{label}: its parent {pick.into} is not in this place ({into})`
+			break
+		end
+		local level: { Instance } = rootsNamed[tostring(names[1])] or {}
+		for i = 2, #names do
+			local nextLevel = {}
+			for _, at in level do
+				for _, child in childrenNamed(at, names[i]) do
+					table.insert(nextLevel, child)
+				end
+			end
+			level = nextLevel
+		end
+		local found = {}
+		for _, instance in level do
+			if pick.className == nil or instance.ClassName == pick.className then table.insert(found, instance) end
+		end
+		if #found == 0 then
+			planError = `the deserialized file has no {label}{if pick.className then ` ({pick.className})` else ""}: Studio dropped it`
+			break
+		end
+		-- the daemon checked the scripts of exactly this many: never land one it did not see
+		if type(pick.count) == "number" and #found ~= pick.count then
+			planError = `the deserialized file has {#found} {label} ({pick.className}), the daemon read {pick.count}: nothing imported`
+			break
+		end
+		for _, instance in found do
+			table.insert(plan, { instance = instance, into = into :: Instance, existed = #childrenNamed(into :: Instance, instance.Name) > 0 })
+		end
+	end
+	if planError then
+		dropAll()
+		error(planError, 0)
+	end
+	local ChangeHistoryService = game:GetService("ChangeHistoryService")
+	local recording = if RunService:IsEdit() then ChangeHistoryService:TryBeginRecording("Quack: import from a place file") else nil
+	local placed = {}
+	local failure: string? = nil
+	for _, step in plan do
+		local parented, err = pcall(function() step.instance.Parent = step.into end)
+		if not parented then
+			failure = `could not put {step.instance.Name} ({step.instance.ClassName}) in {step.into:GetFullName()}: {err}`
+			break
+		end
+		table.insert(placed, step.instance)
+	end
+	if failure then
+		for _, instance in placed do
+			pcall(function() instance:Destroy() end)
+		end
+		if recording then ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Cancel) end
+		dropAll()
+		error(failure, 0)
+	end
+	if recording then ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit) end
+	-- the rest of the file: the picked instances were moved out of it first
+	dropAll()
+	local names = {}
+	local already = {}
+	for _, step in plan do
+		local full = step.instance:GetFullName()
+		table.insert(names, `{full} ({step.instance.ClassName})`)
+		if step.existed then table.insert(already, full) end
+	end
+	return { placed = names, scripts = countScripts(placed), alreadyThere = already }
 end
 
 --------------------------------------------------------------------------------------------
@@ -2345,6 +2471,972 @@ local function sceneAnalysis(args: { [string]: any }): { [string]: any }
 end
 
 --------------------------------------------------------------------------------------------
+-- The place itself: its ids, version, creator, the published name, and the state of edit mode
+-- and the play (chrrxs's get_place_info gave the ids and names only).
+
+local function placeInfo(_args: { [string]: any }): { [string]: any }
+	local info: { [string]: any } = {
+		placeId = game.PlaceId,
+		gameId = game.GameId,
+		creatorId = game.CreatorId,
+		creatorType = game.CreatorType.Name,
+		placeVersion = game.PlaceVersion,
+		dataModelName = game.Name,
+		editMode = StudioTestService.EditModeActive,
+		streamingEnabled = workspace.StreamingEnabled,
+		gravity = round(workspace.Gravity, 2),
+	}
+	if game.JobId ~= "" then info.jobId = game.JobId end
+	if game.PlaceId > 0 then
+		local ok, product = pcall(function()
+			return game:GetService("MarketplaceService"):GetProductInfoAsync(game.PlaceId)
+		end)
+		if ok and type(product) == "table" then
+			info.name = product.Name
+			info.description = if type(product.Description) == "string" and product.Description ~= "" then string.sub(product.Description, 1, 300) else nil
+			info.updated = product.Updated
+		else
+			info.nameError = tostring(product)
+		end
+	end
+	return info
+end
+
+--------------------------------------------------------------------------------------------
+-- Studio's selection, and the edit camera framing it (chrrxs's selection: 82 calls in a
+-- month, 36 of them view). Unlike a screenshot's focus, view leaves the camera where it put it.
+
+local function selectionPaths(): { { [string]: string } }
+	local out = {}
+	for _, instance in game:GetService("Selection"):Get() do
+		table.insert(out, { path = instance:GetFullName(), className = instance.ClassName })
+	end
+	return out
+end
+
+--- The box around every part and model in `targets`: its center and size (axis-aligned)
+local function boundsOf(targets: { Instance }): (Vector3?, Vector3?)
+	local lo: Vector3?, hi: Vector3? = nil, nil
+	local function add(cf: CFrame, size: Vector3)
+		local h = size / 2
+		for _, sx in { -1, 1 } do
+			for _, sy in { -1, 1 } do
+				for _, sz in { -1, 1 } do
+					local p = cf:PointToWorldSpace(Vector3.new(h.X * sx, h.Y * sy, h.Z * sz))
+					lo = if lo then (lo :: Vector3):Min(p) else p
+					hi = if hi then (hi :: Vector3):Max(p) else p
+				end
+			end
+		end
+	end
+	for _, target in targets do
+		if target:IsA("Model") then
+			local cf, size = target:GetBoundingBox()
+			add(cf, size)
+		elseif target:IsA("BasePart") then
+			add(target.CFrame, target.Size)
+		elseif target:IsA("Attachment") then
+			add(CFrame.new(target.WorldPosition), Vector3.one)
+		else
+			-- A folder or a service: what it holds
+			for _, d in target:GetDescendants() do
+				if d:IsA("BasePart") then add(d.CFrame, d.Size) end
+			end
+		end
+	end
+	if not lo or not hi then return nil, nil end
+	return ((lo :: Vector3) + (hi :: Vector3)) / 2, (hi :: Vector3) - (lo :: Vector3)
+end
+
+local function selection(args: { [string]: any }): { [string]: any }
+	local Selection = game:GetService("Selection")
+	local action = args.action or "get"
+	if action == "get" then
+		local paths = selectionPaths()
+		return { action = action, selected = paths, count = #paths }
+	end
+	if action == "set" then
+		if type(args.paths) ~= "table" then error("paths must be a list of instance paths (empty clears the selection)", 0) end
+		local found = {}
+		for _, raw in args.paths do
+			table.insert(found, resolvePath(tostring(raw)))
+		end
+		local mode = args.mode or "set"
+		if mode == "set" then
+			Selection:Set(found)
+		elseif mode == "add" then
+			Selection:Add(found)
+		elseif mode == "remove" then
+			Selection:Remove(found)
+		else
+			error("mode must be set, add or remove", 0)
+		end
+		local paths = selectionPaths()
+		return { action = action, mode = mode, selected = paths, count = #paths }
+	end
+	if action == "view" then
+		if RunService:IsRunning() then error("view moves the edit camera: stop the play first (the player's camera belongs to the game)", 0) end
+		local targets: { Instance } = if type(args.path) == "string" and args.path ~= "" then { resolvePath(args.path) } else Selection:Get()
+		if #targets == 0 then error("nothing to frame: name a path or select something first", 0) end
+		local center, size = boundsOf(targets)
+		if not center or not size then error("nothing with a place in the world in what was named (no part, model or attachment)", 0) end
+		local camera = workspace.CurrentCamera
+		if not camera then error("there is no camera to move", 0) end
+		local azimuth = math.rad(tonumber(args.from) or 45)
+		local elevation = math.rad(math.clamp(tonumber(args.angleY) or 30, -89, 89))
+		local padding = math.clamp(tonumber(args.padding) or 1, 0.1, 10)
+		-- FieldOfView is vertical; the bounding sphere fits the shorter side
+		local radius = math.max((size :: Vector3).Magnitude / 2, 0.5)
+		local half = math.rad(camera.FieldOfView) / 2
+		local aspect = camera.ViewportSize.X / math.max(camera.ViewportSize.Y, 1)
+		local fit = math.min(math.tan(half), math.tan(half) * aspect)
+		local distance = radius / fit * 1.1 * padding
+		local direction = Vector3.new(math.cos(elevation) * math.cos(azimuth), math.sin(elevation), math.cos(elevation) * math.sin(azimuth))
+		local at = (center :: Vector3) + direction * distance
+		camera.CameraType = Enum.CameraType.Fixed
+		camera.CFrame = CFrame.lookAt(at, center :: Vector3)
+		camera.Focus = CFrame.new(center :: Vector3)
+		local c, s = center :: Vector3, size :: Vector3
+		return {
+			action = action,
+			framed = #targets,
+			center = { round(c.X, 2), round(c.Y, 2), round(c.Z, 2) },
+			size = { round(s.X, 2), round(s.Y, 2), round(s.Z, 2) },
+			camera = { round(at.X, 2), round(at.Y, 2), round(at.Z, 2) },
+			distance = round(distance, 2),
+		}
+	end
+	error("action must be get, set or view", 0)
+end
+
+--------------------------------------------------------------------------------------------
+-- A model made by Roblox's generation (GenerationService:GenerateModelAsync): a text prompt
+-- or an image (an image asset id only; the daemon uploads a local PNG first), measured
+-- 09/11/26 in PA at 118 s for "a small wooden crate" (a Model with one MeshPart). It goes in
+-- the place as one undo step, selected, and syncs to disk like anything made in Studio.
+
+local function isModeration(message: any): boolean
+	return string.find(tostring(message), "Moderation failed", 1, true) ~= nil
+end
+
+local function generateModel(args: { [string]: any }): { [string]: any }
+	if not RunService:IsEdit() then error("a model is generated in edit mode, not in a play", 0) end
+	local inputs: { [string]: any } = {}
+	if type(args.prompt) == "string" and args.prompt ~= "" then inputs.TextPrompt = args.prompt end
+	if args.imageAssetId ~= nil then
+		local id = tonumber(args.imageAssetId)
+		if not id or id <= 0 then error("imageAssetId must be an image asset id", 0) end
+		inputs.Image = Content.fromUri(`rbxassetid://{math.floor(id)}`)
+	end
+	if inputs.TextPrompt == nil and inputs.Image == nil then error("give a prompt, an image, or both", 0) end
+	if type(args.size) == "table" then
+		inputs.Size = Vector3.new(tonumber(args.size[1]) or 4, tonumber(args.size[2]) or 4, tonumber(args.size[3]) or 4)
+	end
+	if tonumber(args.maxTriangles) then inputs.MaxTriangles = math.floor(tonumber(args.maxTriangles) :: number) end
+	if type(args.textures) == "boolean" then inputs.GenerateTextures = args.textures end
+	local schema: { [string]: any } = if type(args.groups) == "table" and #args.groups > 0
+		then { SchemaDefinition = { Groups = args.groups } }
+		else { PredefinedSchema = if type(args.schema) == "string" and args.schema ~= "" then args.schema else "Body1" }
+	local parent = resolvePath(if type(args.parent) == "string" and args.parent ~= "" then args.parent else "Workspace")
+	local GenerationService = game:GetService("GenerationService")
+	local started = os.clock()
+	local ok, result = false, nil
+	-- A moderation refusal is sometimes a fluke: one more try, as chrrxs does
+	for attempt = 1, 2 do
+		ok, result = pcall(function() return (GenerationService :: any):GenerateModelAsync(inputs, schema, {}) end)
+		if ok or not isModeration(result) or attempt == 2 then break end
+		task.wait(0.5)
+	end
+	local seconds = round(os.clock() - started, 1)
+	if not ok then
+		error(if isModeration(result) then `Roblox's moderation refused the prompt or image twice ({seconds} s)` else `GenerateModelAsync failed after {seconds} s: {result}`, 0)
+	end
+	if typeof(result) ~= "Instance" or not (result :: Instance):IsA("Model") then
+		error(`GenerateModelAsync answered a {typeof(result)}, not a Model`, 0)
+	end
+	local model = result :: Model
+	local base = if type(args.name) == "string" and args.name ~= "" then string.sub(args.name, 1, 80) else "GeneratedModel"
+	local name = base
+	local n = 1
+	while parent:FindFirstChild(name) do
+		n += 1
+		name = `{base}_{n}`
+	end
+	model.Name = name
+	-- Anchored, as Roblox's own examples do: unanchored, the parts fall apart in the world
+	for _, d in model:GetDescendants() do
+		if d:IsA("BasePart") then (d :: BasePart).Anchored = true end
+	end
+	-- Size is only approximate (asked 4, got 1.9 in PA): scaled so its longest side is the longest asked
+	local scaled: number? = nil
+	if inputs.Size then
+		local extents = model:GetExtentsSize()
+		local longest = math.max(extents.X, extents.Y, extents.Z)
+		local wanted = math.max(inputs.Size.X, inputs.Size.Y, inputs.Size.Z)
+		if longest > 0 and wanted > 0 and math.abs(wanted / longest - 1) > 0.02 then
+			local factor = wanted / longest
+			-- Reported only when the engine took it
+			if pcall(function() model:ScaleTo(model:GetScale() * factor) end) then scaled = factor end
+		end
+	end
+	-- Where the camera looks, or the position given: its bottom rests there
+	local position: Vector3? = nil
+	if type(args.position) == "table" then
+		position = Vector3.new(tonumber(args.position[1]) or 0, tonumber(args.position[2]) or 0, tonumber(args.position[3]) or 0)
+	elseif parent == workspace and workspace.CurrentCamera then
+		position = workspace.CurrentCamera.Focus.Position
+	end
+	if position then
+		local moved = pcall(function()
+			-- The world box (its eight corners): GetBoundingBox's extents follow a tilted PrimaryPart
+			local center, size = boundsOf({ model })
+			if not center or not size then error("the model has no parts", 0) end
+			local pivot = model:GetPivot()
+			local lift = pivot.Position.Y - ((center :: Vector3).Y - (size :: Vector3).Y / 2)
+			-- The pivot's own rotation kept: only where it is changes
+			model:PivotTo(pivot.Rotation + (position :: Vector3) + Vector3.new(0, lift, 0))
+		end)
+		if not moved then position = nil end
+	end
+	local ChangeHistoryService = game:GetService("ChangeHistoryService")
+	local recording = ChangeHistoryService:TryBeginRecording(`Quack: generate model {name}`)
+	local parented, err = pcall(function() model.Parent = parent end)
+	if not parented then
+		if recording then ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Cancel) end
+		pcall(function() model:Destroy() end)
+		error(`could not put the model in {parent:GetFullName()}: {err}`, 0)
+	end
+	if recording then ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit) end
+	pcall(function() game:GetService("Selection"):Set({ model }) end)
+	local parts = {}
+	local opaque = 0
+	for _, d in model:GetDescendants() do
+		if d:IsA("MeshPart") then
+			local mesh = d :: MeshPart
+			local kind = ""
+			pcall(function() kind = mesh.MeshContent.SourceType.Name end)
+			if kind == "Opaque" then opaque += 1 end
+			table.insert(parts, { name = mesh.Name, size = { round(mesh.Size.X, 2), round(mesh.Size.Y, 2), round(mesh.Size.Z, 2) }, meshId = if mesh.MeshId ~= "" then mesh.MeshId else nil, mesh = kind })
+		end
+	end
+	local _, size = model:GetBoundingBox()
+	return {
+		path = model:GetFullName(),
+		seconds = seconds,
+		parts = parts,
+		scaled = if scaled then round(scaled :: number, 3) else nil,
+		-- Measured 09/11/26 in PA: the generated mesh is Opaque content, and an export_rbxm of the
+		-- model came back with no mesh at all (SourceType None, 0 triangles)
+		opaqueMeshes = if opaque > 0 then opaque else nil,
+		size = { round(size.X, 2), round(size.Y, 2), round(size.Z, 2) },
+		position = if position then { round((position :: Vector3).X, 2), round((position :: Vector3).Y, 2), round((position :: Vector3).Z, 2) } else nil,
+	}
+end
+
+--------------------------------------------------------------------------------------------
+-- The MicroProfiler (engine and game frame time by scope), through LibMP, Roblox's own library
+-- (Vendor/LibMP.luau; Studio's copy is the Assistant's only). A capture of durationMs, then a
+-- snapshot read here: frame times, the scopes that took the time (self time: the scope minus
+-- the scopes inside it; inclusive: with them), groups, threads. Scopes that cross a frame
+-- boundary are split between the frames, as LibMP's SKILL.md does. The profiler is process
+-- wide: in a solo play edit mode, the server and the client are one Studio process and read
+-- the same data; a multiplayer client is its own process.
+
+local libMP: any = nil
+
+local function requireLibMP(): any
+	if libMP then return libMP end
+	local vendor = (script.Parent :: any):FindFirstChild("Vendor")
+	local module = vendor and vendor:FindFirstChild("LibMP")
+	if not module then error("this plugin has no Vendor/LibMP (an older or partial build)", 0) end
+	local ok, lib = pcall(require, module)
+	if not ok then error(`LibMP did not load: {lib}`, 0) end
+	libMP = lib
+	return lib
+end
+
+local MICRO_FOCUS: { [string]: string } = {
+	script = "script|lua|luau",
+	physics = "physic|simulation|aerodynamic",
+	render = "render|gfx|graphic|draw",
+	network = "network|net|replicat|raknet",
+	jobs = "job",
+}
+
+local function microProfiler(args: { [string]: any }): { [string]: any }
+	local lib = requireLibMP()
+	local control = lib.Control
+	local backend = {
+		accessible = control:IsBackendAccessible(),
+		ready = control:IsBackendReady(),
+		compatible = control:IsBackendVersionCompatible(),
+		library = lib.Versions.Library,
+		dataFormat = lib.Versions.DataFormat,
+	}
+	if not (backend.accessible and backend.ready and backend.compatible) then
+		error(`the MicroProfiler is not reachable here (accessible {backend.accessible}, ready {backend.ready}, version compatible {backend.compatible}, LibMP {backend.library})`, 0)
+	end
+	local durationMs = math.clamp(math.floor(tonumber(args.durationMs) or 1000), 100, 5000)
+	local frameWindow = math.clamp(math.floor(tonumber(args.frames) or 256), 1, 256)
+	local maxTimers = math.clamp(math.floor(tonumber(args.maxTimers) or 20), 1, 100)
+	local maxSteps = math.clamp(math.floor(tonumber(args.maxEvents) or 400000), 10000, 2000000)
+	local sortBy = if args.sort == "inclusive" then "inclusive" else "self"
+	local includeGpu = args.includeGpu == true
+	local includeIdle = args.includeIdle == true
+	local filter = if type(args.filter) == "string" and args.filter ~= "" then string.lower(args.filter) else nil
+	local focus = if type(args.focus) == "string" and args.focus ~= "all" then MICRO_FOCUS[args.focus] else nil
+	if args.focus ~= nil and args.focus ~= "all" and not focus then error("focus must be all, script, physics, render, network or jobs", 0) end
+
+	control:SetFrameLimit(256)
+	control:EnableProfiler(true)
+	control:EnableCapture(true)
+	task.wait(durationMs / 1000)
+	-- Read while capture is live (a paused read can return a stale cache), then put it back
+	local captured, snapshotOrError = pcall(function()
+		if args.save == true then return control:CaptureToBufferSync({ ContainerFormat = lib.Enums.ContainerFormat.Compressed }) end
+		return control:CaptureToBufferSync()
+	end)
+	if args.keep ~= true then
+		pcall(function() control:EnableCapture(false) end)
+		pcall(function() control:EnableProfiler(false) end)
+	end
+	if not captured then error(`the MicroProfiler capture failed: {snapshotOrError}`, 0) end
+	local snapshot = snapshotOrError :: buffer
+	local session = lib.Session.OpenFromBuffer(snapshot)
+	if not session or not session:IsValid() then
+		if session then session:Dispose() end
+		error(`LibMP could not open the capture ({buffer.len(snapshot)} bytes)`, 0)
+	end
+
+	local result: { [string]: any } = { durationMs = durationMs, backend = backend, bytes = buffer.len(snapshot) }
+	local ok, err = pcall(function()
+		local global = session:FetchGlobalDesc()
+		local tickMs = global.TickToMsCpu
+		local tickMsGpu = global.TickToMsGpu
+		local frameMin, frameMax = session:GetFrameIdMin(), session:GetFrameIdMax()
+		if frameMax == 0 then error("the capture holds no frame: the window may not be drawing (minimized or covered)", 0) end
+		-- This capture's frames only: back from the last one while the absolute ids run on (a gap
+		-- is an earlier capture still in the buffer: in PA frame 1387 sat before 28857, and a scope
+		-- across the gap read as 166 s), and, with no frames asked, until they cover durationMs
+		local first = frameMax
+		local covered = 0
+		local nextAbsolute: number? = nil
+		local gap = false
+		for id = frameMax, frameMin, -1 do
+			if frameMax - id + 1 > frameWindow then break end
+			local d = session:FetchFrameDesc(id)
+			if nextAbsolute and d.FrameAbsoluteId ~= (nextAbsolute :: number) - 1 then
+				gap = true
+				break
+			end
+			nextAbsolute = d.FrameAbsoluteId
+			first = id
+			covered += (d.TickEndCpu - d.TickStartCpu) * tickMs
+			if args.frames == nil and covered >= durationMs then break end
+		end
+		result.earlierCaptureLeftOut = if gap then true else nil
+
+		-- Frame times
+		local times = {}
+		local frames = {}
+		for id = first, frameMax do
+			local d = session:FetchFrameDesc(id)
+			if d.IsIncomplete or d.IsPaused then continue end
+			local ms = (d.TickEndCpu - d.TickStartCpu) * tickMs
+			table.insert(times, ms)
+			table.insert(frames, { id = id, absoluteId = d.FrameAbsoluteId, ms = round(ms, 2) })
+		end
+		if #times == 0 then error("every frame in the capture is incomplete or paused", 0) end
+		local sorted = table.clone(times)
+		table.sort(sorted)
+		local total = 0
+		for _, t in times do
+			total += t
+		end
+		table.sort(frames, function(a, b) return a.ms > b.ms end)
+		local slowest = {}
+		for i = 1, math.min(5, #frames) do
+			slowest[i] = frames[i]
+		end
+		result.frames = {
+			count = #times,
+			firstId = first,
+			lastId = frameMax,
+			msAvg = round(total / #times, 2),
+			msP50 = round(percentile(sorted, 0.5), 2),
+			msP90 = round(percentile(sorted, 0.9), 2),
+			msP99 = round(percentile(sorted, 0.99), 2),
+			msMax = round(sorted[#sorted], 2),
+			over50ms = (function()
+				local n = 0
+				for _, t in times do
+					if t > 50 then n += 1 end
+				end
+				return n
+			end)(),
+			slowest = slowest,
+		}
+
+		-- Names, cached
+		local groupNames: { [number]: string } = {}
+		local timerInfo: { [number]: { name: string, group: string, idle: boolean } } = {}
+		local function groupName(id: number): string
+			local known = groupNames[id]
+			if known then return known end
+			local okDesc, desc = pcall(function() return session:FetchGroupDesc(id) end)
+			local name = if okDesc and desc and desc.GroupName ~= "" then desc.GroupName else tostring(id)
+			groupNames[id] = name
+			return name
+		end
+		local function timer(id: number): { name: string, group: string, idle: boolean }
+			local known = timerInfo[id]
+			if known then return known end
+			local okDesc, desc = pcall(function() return session:FetchTimerDesc(id) end)
+			local name = if okDesc and desc and desc.TimerName ~= "" then desc.TimerName else tostring(id)
+			local lower = string.lower(name)
+			local info = {
+				name = name,
+				group = if okDesc and desc then groupName(desc.GroupId) else "?",
+				-- A thread waiting, not working: the engine's own Sleep or Idle, never a game's
+				-- scope (debug.profilebegin("SleepController") is work)
+				idle = not (okDesc and desc and desc.IsUserTimer) and (lower == "idle" or string.match(lower, "^sleep") ~= nil),
+			}
+			timerInfo[id] = info
+			return info
+		end
+		local threadNames: { [number]: string } = {}
+		for _, id in session:FetchThreadIds() or {} do
+			local okDesc, desc = pcall(function() return session:FetchThreadDesc(id) end)
+			local name = if okDesc and desc then string.gsub(desc.ThreadName, "^%s+", "") else ""
+			threadNames[id] = if name ~= "" then name else tostring(id)
+		end
+
+		-- Scopes, frame-local (iterateLogFrameLocal in LibMP's SKILL.md), with self time from
+		-- each thread's stack: a scope's children exit before it does
+		local stats: { [number]: { incl: number, self: number, count: number, maxFrame: number, cur: number } } = {}
+		local childSum: { [number]: { [number]: number } } = {}
+		local threadBusy: { [number]: number } = {}
+		local touched: { number } = {}
+		local lastFrame = -1
+		local function foldFrame()
+			for _, id in touched do
+				local s = stats[id]
+				if s.cur > s.maxFrame then s.maxFrame = s.cur end
+				s.cur = 0
+			end
+			table.clear(touched)
+		end
+		local function scope(frameId: number, threadId: number, depth: number, timerId: number, enter: number, exit: number, gpu: boolean)
+			if frameId ~= lastFrame then
+				foldFrame()
+				lastFrame = frameId
+			end
+			local ms = math.max(0, exit - enter) * (if gpu then tickMsGpu else tickMs)
+			local sums = childSum[threadId]
+			if not sums then
+				sums = {}
+				childSum[threadId] = sums
+			end
+			local children = sums[depth + 1] or 0
+			sums[depth + 1] = 0
+			sums[depth] = (sums[depth] or 0) + ms
+			-- A worker waiting for work is not busy (Sleep on every RBX Worker, 53 ms a frame in PA)
+			if depth == 0 and (includeIdle or not timer(timerId).idle) then threadBusy[threadId] = (threadBusy[threadId] or 0) + ms end
+			local s = stats[timerId]
+			if not s then
+				s = { incl = 0, self = 0, count = 0, maxFrame = 0, cur = 0 }
+				stats[timerId] = s
+			end
+			s.incl += ms
+			s.self += math.max(0, ms - children)
+			s.count += 1
+			if s.cur == 0 then table.insert(touched, timerId) end
+			s.cur += ms
+		end
+
+		local iter = session:CreateLogIterator()
+		iter:Configure({ SkipEvents = true, SkipGpuThreads = not includeGpu, EmitThreadFrameEnd = true, StartFrameId = first, EndFrameId = frameMax })
+		local state = iter:GetState()
+		iter:RewindTo(first, frameMax)
+		local steps = 0
+		local truncated = false
+		while iter:Step() do
+			steps += 1
+			if steps > maxSteps then
+				truncated = true
+				break
+			end
+			if state:IsThreadFrameEnd() then
+				local exitTs = state:Timestamp()
+				local depth = state:ThreadStackDepth()
+				local gpu = state:IsGpuThread()
+				for d = depth - 1, 0, -1 do
+					local el = iter:GetCurrentThreadStackElement(d)
+					if el then scope(state:FrameId(), state:ThreadId(), d, el:EnterTimerId(), el:EnterTimestampFrameLocal(), exitTs, gpu) end
+				end
+				-- The open scopes' next portions start from the next frame
+				local sums = childSum[state:ThreadId()]
+				if sums then table.clear(sums) end
+			elseif state:IsExit() and not state:ThreadStackWasOverflowed() then
+				local depth = state:ThreadStackDepth()
+				local enter
+				if not state:ThreadStackIsUnderflowed() then
+					enter = iter:GetCurrentThreadStackElement(depth):EnterTimestampFrameLocal()
+				else
+					local d = session:FetchFrameDesc(state:FrameId())
+					enter = if state:IsGpuThread() then d.TickStartGpu else d.TickStartCpu
+				end
+				scope(state:FrameId(), state:ThreadId(), depth, state:TimerId(), enter, state:Timestamp(), state:IsGpuThread())
+			end
+		end
+		foldFrame()
+		iter:Dispose()
+
+		-- Timers, groups, threads
+		local rows = {}
+		local groups: { [string]: number } = {}
+		local allSelf = 0
+		local idleLeftOut = 0
+		for id, s in stats do
+			local info = timer(id)
+			if info.idle and not includeIdle then
+				idleLeftOut += 1
+				continue
+			end
+			groups[info.group] = (groups[info.group] or 0) + s.self
+			allSelf += s.self
+			if s.incl <= 0 then continue end
+			local text = string.lower(`{info.name} {info.group}`)
+			if filter and not string.find(text, filter, 1, true) then continue end
+			if focus then
+				local hit = false
+				for _, word in string.split(focus, "|") do
+					if string.find(text, word, 1, true) then
+						hit = true
+						break
+					end
+				end
+				if not hit then continue end
+			end
+			table.insert(rows, {
+				name = info.name,
+				group = info.group,
+				selfMs = s.self,
+				inclusiveMs = s.incl,
+				count = s.count,
+				maxFrameMs = s.maxFrame,
+			})
+		end
+		table.sort(rows, function(a, b)
+			if sortBy == "inclusive" then return a.inclusiveMs > b.inclusiveMs end
+			return a.selfMs > b.selfMs
+		end)
+		local top = {}
+		local n = #times
+		for i = 1, math.min(maxTimers, #rows) do
+			local r = rows[i]
+			top[i] = {
+				rank = i,
+				name = r.name,
+				group = r.group,
+				selfMsPerFrame = round(r.selfMs / n, 3),
+				inclusiveMsPerFrame = round(r.inclusiveMs / n, 3),
+				maxFrameMs = round(r.maxFrameMs, 2),
+				calls = r.count,
+			}
+		end
+		local groupRows = {}
+		for name, ms in groups do
+			if ms > 0 then table.insert(groupRows, { name = name, selfMsPerFrame = round(ms / n, 3), pct = round(ms / math.max(allSelf, 1e-9) * 100, 1) }) end
+		end
+		table.sort(groupRows, function(a, b) return a.selfMsPerFrame > b.selfMsPerFrame end)
+		local threadRows = {}
+		for id, ms in threadBusy do
+			table.insert(threadRows, { name = threadNames[id] or tostring(id), busyMsPerFrame = round(ms / n, 3) })
+		end
+		table.sort(threadRows, function(a, b) return a.busyMsPerFrame > b.busyMsPerFrame end)
+		result.timers = top
+		result.timersKept = #rows
+		result.timersSeen = (function()
+			local c = 0
+			for _ in stats do
+				c += 1
+			end
+			return c
+		end)()
+		result.groups = { table.unpack(groupRows, 1, math.min(20, #groupRows)) }
+		result.threads = { table.unpack(threadRows, 1, math.min(12, #threadRows)) }
+		result.steps = steps
+		result.idleLeftOut = if idleLeftOut > 0 then idleLeftOut else nil
+		result.truncated = if truncated then true else nil
+		result.sort = sortBy
+	end)
+	session:Dispose()
+	if not ok then error(err, 0) end
+	if args.save == true then result.raw = base64(snapshot) end
+	result.profilerLeftOn = if args.keep == true then true else nil
+	return result
+end
+
+--------------------------------------------------------------------------------------------
+-- The player's character moved in a running play (move_player): teleported to a position or
+-- onto an instance, or walked there by Humanoid:MoveTo or a PathfindingService path, until it
+-- arrives, stops getting closer for STUCK_SECONDS, dies or runs out of time. 928 of a month's
+-- evals touched HumanoidRootPart and 640 PivotTo, each session writing its own teleport.
+-- The server hands the move to the play client when a player owns the root's physics: the
+-- owner is the one that simulates it.
+
+local PathfindingService = game:GetService("PathfindingService")
+
+local STUCK_SECONDS = 2
+local ARRIVE_STUDS = 2
+local WAYPOINT_STUDS = 1.5
+
+local function triple(v: Vector3): { number }
+	return { round(v.X, 2), round(v.Y, 2), round(v.Z, 2) }
+end
+
+local function flat(v: Vector3): Vector3
+	return Vector3.new(v.X, 0, v.Z)
+end
+
+--- The player a move is for: the client's own; on the server the one named, or the only one
+local function movingPlayer(role: string, name: any): Player
+	if role == "client" then
+		local me = Players.LocalPlayer
+		if not me then error("the play client has no LocalPlayer yet", 0) end
+		return me
+	end
+	local all = Players:GetPlayers()
+	local names = {}
+	for _, p in all do
+		table.insert(names, p.Name)
+	end
+	if type(name) == "string" and name ~= "" then
+		local found = Players:FindFirstChild(name)
+		if found and found:IsA("Player") then return found end
+		error(`no player named {name} in the play (players: {if #names > 0 then table.concat(names, ", ") else "none"})`, 0)
+	end
+	if #all == 1 then return all[1] end
+	if #all == 0 then error("no player has joined the play yet", 0) end
+	error(`the play has {#all} players ({table.concat(names, ", ")}): name one with player`, 0)
+end
+
+--- Where the feet go: a position as given, an attachment's own point, or the top of a part or model
+local function moveGoal(args: { [string]: any }, character: Model): (Vector3, string?)
+	if type(args.position) == "table" then
+		local x, y, z = tonumber(args.position[1]), tonumber(args.position[2]), tonumber(args.position[3])
+		if not (x and y and z) then error("position must be [x, y, z]", 0) end
+		return Vector3.new(x :: number, y :: number, z :: number), nil
+	end
+	if type(args.path) ~= "string" or args.path == "" then error("give a position [x, y, z] or the path of a part, model or attachment", 0) end
+	local target = resolvePath(args.path)
+	if target:IsA("Player") then
+		local theirs = (target :: Player).Character
+		if not theirs then error(`{target.Name} has no character to go to`, 0) end
+		target = theirs :: Model
+	end
+	if target == character or target:IsDescendantOf(character) then error(`{target:GetFullName()} is the moving character itself`, 0) end
+	if target:IsA("Attachment") then return (target :: Attachment).WorldPosition, target:GetFullName() end
+	local center, size = boundsOf({ target })
+	if not center or not size then error(`{target:GetFullName()} has no place in the world (no part, model or attachment in it)`, 0) end
+	local c, s = center :: Vector3, size :: Vector3
+	return Vector3.new(c.X, c.Y + s.Y / 2, c.Z), target:GetFullName()
+end
+
+local function movePlayer(args: { [string]: any }, role: string): { [string]: any }
+	local started = os.clock()
+	local mode = args.mode or "teleport"
+	if mode ~= "teleport" and mode ~= "walk" and mode ~= "path" then error("mode must be teleport, walk or path", 0) end
+	local player = movingPlayer(role, args.player)
+	local character = player.Character
+	if not character or not character.Parent then error(`{player.Name} has no character (not spawned yet, or dead and waiting to respawn)`, 0) end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = (humanoid and humanoid.RootPart) or character:FindFirstChild("HumanoidRootPart")
+	if not root or not root:IsA("BasePart") then error(`{player.Name}'s character has no HumanoidRootPart`, 0) end
+	local rootPart = root :: BasePart
+	if humanoid and humanoid.Health <= 0 then error(`{player.Name}'s character is dead`, 0) end
+
+	-- The server finds the goal even when it hands the move over: with StreamingEnabled the
+	-- client may not have the target part at all
+	local goal, targetPath = moveGoal(args, character)
+
+	-- Who owns the character's physics (only the server can ask)
+	local owner: string? = nil
+	if role == "server" then
+		local ok, who = pcall(rootPart.GetNetworkOwner, rootPart)
+		owner = if not ok then "unknown (anchored?)" elseif who then (who :: Player).Name else "server"
+		if ok and who and args.stay ~= true then
+			return { handOff = "client", owner = (who :: Player).Name, player = player.Name, position = { goal.X, goal.Y, goal.Z }, target = targetPath }
+		end
+	end
+	if type(args.target) == "string" and args.target ~= "" then targetPath = args.target end
+	-- The feet's height below the root, from the character's box (R6 and R15 alike)
+	local box, boxSize = character:GetBoundingBox()
+	local footOffset = math.clamp(rootPart.Position.Y - (box.Position.Y - boxSize.Y / 2), 0, 50)
+	local function feet(): Vector3
+		return rootPart.Position - Vector3.new(0, footOffset, 0)
+	end
+	local from = feet()
+	local answer: { [string]: any } = {
+		how = mode,
+		player = player.Name,
+		owner = owner,
+		target = targetPath,
+		goal = triple(goal),
+		from = triple(from),
+	}
+
+	if mode == "teleport" then
+		-- A seated character would drag its seat along
+		if humanoid and humanoid.SeatPart then
+			local weld = (humanoid.SeatPart :: BasePart):FindFirstChild("SeatWeld")
+			if weld then weld:Destroy() end
+			humanoid.Sit = false
+			answer.leftSeat = true
+		end
+		local turn = rootPart.CFrame.Rotation
+		local rootAt = CFrame.new(goal + Vector3.new(0, footOffset + 0.05, 0)) * turn
+		-- The whole model moves so the root lands there, whatever its PrimaryPart (R6's is the Head)
+		character:PivotTo(rootAt * rootPart.CFrame:Inverse() * character:GetPivot())
+		rootPart.AssemblyLinearVelocity = Vector3.zero
+		rootPart.AssemblyAngularVelocity = Vector3.zero
+		RunService.Heartbeat:Wait()
+		RunService.Heartbeat:Wait()
+		local at = feet()
+		answer.at = triple(at)
+		answer.distanceLeft = round((at - goal).Magnitude, 2)
+		answer.stopped = "teleported"
+		answer.arrived = true
+		answer.seconds = round(os.clock() - started, 2)
+		return answer
+	end
+
+	if not humanoid then error(`{player.Name}'s character has no Humanoid to walk with (mode teleport moves it)`, 0) end
+	local walker = humanoid :: Humanoid
+	if rootPart.Anchored then error("the HumanoidRootPart is anchored: it cannot walk (mode teleport moves it)", 0) end
+	if walker.WalkSpeed <= 0 then error("the Humanoid's WalkSpeed is 0: it cannot walk (mode teleport moves it)", 0) end
+	local seconds = math.clamp(tonumber(args.seconds) or 15, 0.5, 600)
+	local deadline = started + seconds
+
+	--- One leg of the walk: until within `radius` studs (flat), no progress, death or the deadline
+	local function leg(point: Vector3, radius: number): string
+		walker:MoveTo(point)
+		local issued = os.clock()
+		local best = math.huge
+		local lastProgress = os.clock()
+		while true do
+			task.wait(0.05)
+			if walker.Health <= 0 or not rootPart:IsDescendantOf(workspace) then return "died" end
+			local left = (flat(feet()) - flat(point)).Magnitude
+			if left <= radius then return "arrived" end
+			if left < best - 0.5 then
+				best = left
+				lastProgress = os.clock()
+			end
+			if os.clock() - lastProgress >= STUCK_SECONDS then return "stuck" end
+			if os.clock() >= deadline then return "timeout" end
+			-- MoveTo gives up by itself after 8 s
+			if os.clock() - issued > 6 then
+				walker:MoveTo(point)
+				issued = os.clock()
+			end
+		end
+	end
+
+	local radius = math.clamp(tonumber(args.radius) or ARRIVE_STUDS, 0.5, 50)
+	local stopped: string
+	if mode == "walk" then
+		stopped = leg(goal, radius)
+	else
+		local path = PathfindingService:CreatePath({
+			AgentRadius = math.clamp(math.max(boxSize.X, boxSize.Z) / 2, 0.5, 20),
+			AgentHeight = math.clamp(boxSize.Y, 1, 50),
+			AgentCanJump = true,
+		})
+		local ok, err = pcall(function() path:ComputeAsync(from, goal) end)
+		if not ok then error(`PathfindingService could not compute a path: {err}`, 0) end
+		if path.Status ~= Enum.PathStatus.Success then
+			error(`PathfindingService found no path from {describe(from)} to {describe(goal)} ({path.Status.Name}); mode walk tries a straight line`, 0)
+		end
+		local waypoints = path:GetWaypoints()
+		answer.waypoints = #waypoints
+		stopped = "arrived"
+		for i, waypoint in waypoints do
+			if i == 1 then continue end
+			if waypoint.Action == Enum.PathWaypointAction.Jump then walker.Jump = true end
+			stopped = leg(waypoint.Position, if i == #waypoints then radius else WAYPOINT_STUDS)
+			if stopped ~= "arrived" then
+				answer.waypointReached = i - 1
+				break
+			end
+		end
+	end
+	-- Stop where it is instead of walking on to the old point
+	if stopped ~= "arrived" and walker.Health > 0 then walker:MoveTo(rootPart.Position) end
+	local at = feet()
+	answer.at = triple(at)
+	answer.distanceLeft = round((flat(at) - flat(goal)).Magnitude, 2)
+	answer.heightLeft = round(goal.Y - at.Y, 2)
+	answer.stopped = stopped
+	answer.arrived = stopped == "arrived"
+	answer.walkSpeed = round(walker.WalkSpeed, 2)
+	answer.timeoutSeconds = seconds
+	answer.seconds = round(os.clock() - started, 2)
+	return answer
+end
+
+--------------------------------------------------------------------------------------------
+-- Instances found in a running DataModel (find_instances with a peer): by name (* and ?, any
+-- case), class (IsA unless exact), under a path, an attribute (and its value), a tag. 3869 of
+-- a month's evals walked GetDescendants by hand in a play. Without `under`, the game's own
+-- services are searched (not CoreGui and the other engine ones).
+
+local CollectionService = game:GetService("CollectionService")
+
+local SEARCHED = {
+	"Workspace", "Players", "Lighting", "MaterialService", "ReplicatedFirst", "ReplicatedStorage",
+	"ServerScriptService", "ServerStorage", "StarterGui", "StarterPack", "StarterPlayer",
+	"SoundService", "Teams", "TextChatService", "Chat",
+}
+local SORTED_UP_TO = 20000
+
+--- A name pattern with * and ? as a Lua pattern on the lower-cased name
+local function globPattern(glob: string): string
+	local out = { "^" }
+	for i = 1, #glob do
+		local c = string.sub(glob, i, i)
+		if c == "*" then
+			table.insert(out, ".*")
+		elseif c == "?" then
+			table.insert(out, ".")
+		elseif string.find(c, "^[%^%$%(%)%%%.%[%]%+%-]$") then
+			table.insert(out, "%" .. c)
+		else
+			table.insert(out, string.lower(c))
+		end
+	end
+	table.insert(out, "$")
+	return table.concat(out)
+end
+
+--- An attribute's value against the text asked: a number by value, a boolean as true or false,
+--- a string as it is, anything else as `describe` writes it
+local function attributeIs(value: any, wanted: string): boolean
+	local kind = typeof(value)
+	if kind == "string" then return value == wanted end
+	if kind == "number" then return tonumber(wanted) == value end
+	if kind == "boolean" then return string.lower(wanted) == tostring(value) end
+	return describe(value) == wanted
+end
+
+local function findLive(args: { [string]: any }): { [string]: any }
+	local started = os.clock()
+	local name = if type(args.name) == "string" and args.name ~= "" then globPattern(args.name) else nil
+	local classes: { string }? = nil
+	if type(args.classes) == "table" and #args.classes > 0 then
+		local list = {}
+		for _, c in args.classes do
+			table.insert(list, tostring(c))
+		end
+		classes = list
+	end
+	local exact = args.exact == true
+	local attribute = if type(args.attribute) == "string" and args.attribute ~= "" then args.attribute else nil
+	local wanted = if args.attributeValue ~= nil then tostring(args.attributeValue) else nil
+	local tag = if type(args.tag) == "string" and args.tag ~= "" then args.tag else nil
+	-- A class the API database does not know is matched by ClassName only, and named in the answer
+	local unknownClasses: { string } = {}
+	if classes then
+		for _, c in classes do
+			if not rbxDatabase.Classes[c] then table.insert(unknownClasses, c) end
+		end
+	end
+	local limit = math.clamp(math.floor(tonumber(args.limit) or 50), 1, 5000)
+	local under = if type(args.under) == "string" and args.under ~= "" then resolvePath(args.under) else nil
+	if not (name or classes or attribute or tag or under) then error("give a name, a className, an attribute, a tag or under", 0) end
+
+	local function matches(instance: Instance): boolean
+		if name and not string.find(string.lower(instance.Name), name) then return false end
+		if classes then
+			local hit = false
+			for _, c in classes do
+				local byName = exact or rbxDatabase.Classes[c] == nil
+				if (byName and instance.ClassName == c) or (not byName and instance:IsA(c)) then
+					hit = true
+					break
+				end
+			end
+			if not hit then return false end
+		end
+		if attribute then
+			local value = instance:GetAttribute(attribute)
+			if value == nil then return false end
+			if wanted ~= nil and not attributeIs(value, wanted) then return false end
+		end
+		return true
+	end
+
+	local hits: { Instance } = {}
+	local scanned = 0
+	local function visit(list: { Instance })
+		for _, instance in list do
+			scanned += 1
+			if matches(instance) then table.insert(hits, instance) end
+		end
+	end
+	if tag then
+		-- The tagged ones are few: start from them
+		local tagged = {}
+		for _, instance in CollectionService:GetTagged(tag) do
+			if not under or instance:IsDescendantOf(under) then table.insert(tagged, instance) end
+		end
+		visit(tagged)
+	elseif under then
+		visit(under:GetDescendants())
+	else
+		for _, serviceName in SEARCHED do
+			local ok, service = pcall(game.FindService, game, serviceName)
+			if ok and service then visit(service:GetDescendants()) end
+		end
+	end
+
+	local rows: { { path: string, instance: Instance } } = {}
+	local sorted = #hits <= SORTED_UP_TO
+	if sorted then
+		local named = {}
+		for _, instance in hits do
+			table.insert(named, { path = instance:GetFullName(), instance = instance })
+		end
+		table.sort(named, function(a, b) return a.path < b.path end)
+		for i = 1, math.min(limit, #named) do
+			table.insert(rows, named[i])
+		end
+	else
+		for i = 1, limit do
+			table.insert(rows, { path = hits[i]:GetFullName(), instance = hits[i] })
+		end
+	end
+	local found = {}
+	for _, row in rows do
+		local count = 0
+		for _ in row.instance:GetAttributes() do
+			count += 1
+		end
+		table.insert(found, { path = row.path, className = row.instance.ClassName, attributes = count })
+	end
+	return {
+		found = found,
+		total = #hits,
+		scanned = scanned,
+		classMatch = if classes then (if exact then "exact" else "IsA") else nil,
+		unknownClasses = if #unknownClasses > 0 then unknownClasses else nil,
+		unsorted = if sorted then nil else true,
+		seconds = round(os.clock() - started, 3),
+	}
+end
+
+--------------------------------------------------------------------------------------------
 
 export type Role = "edit" | "server" | "client"
 
@@ -2405,12 +3497,22 @@ local HANDLERS: { [string]: { [Role]: (args: { [string]: any }) -> any } } = {
 	tabs = { edit = scriptTabs },
 	exportRbxm = { edit = exportRbxm },
 	importRbxm = { edit = importRbxm },
+	importPicks = { edit = importPicks },
 	device = { edit = device },
 	assetPreview = { edit = previewAsset },
 	assetInsert = { edit = insertAsset },
 	memory = { edit = memoryBreakdown, server = memoryBreakdown, client = memoryBreakdown },
 	profiler = { server = scriptProfiler, client = scriptProfiler },
 	scene = { edit = sceneAnalysis, server = sceneAnalysis, client = sceneAnalysis },
+	placeInfo = { edit = placeInfo },
+	selection = { edit = selection },
+	generate = { edit = generateModel },
+	micro = { edit = microProfiler, server = microProfiler, client = microProfiler },
+	move = {
+		server = function(args) return movePlayer(args, "server") end,
+		client = function(args) return movePlayer(args, "client") end,
+	},
+	find = { edit = findLive, server = findLive, client = findLive },
 }
 
 --[=[

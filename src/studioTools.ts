@@ -6,6 +6,7 @@ import type { StudioOutputMessage, ToolRequestMessage, ToolResultMessage } from 
 import type { IPCServer, PeerRole, PlayRole } from "./ipc/server.js";
 import { encodeGif } from "./util/gif.js";
 import { encodePng, halve, mosaic, sheet } from "./util/png.js";
+import { pathOf, RbxlError, readRoblox, resolvePicks, scriptsUnder, summarize, toModelFile, topItems, type FileInstance, type Pick, type RobloxFile } from "./util/rbxl.js";
 
 /**
  * Quack: the Studio tools an AI uses most (08/11/26, a month of chrrxs calls): evals in the play
@@ -14,9 +15,12 @@ import { encodePng, halve, mosaic, sheet } from "./util/png.js";
  * Luau turns truthy or an output line shows up, and a short recording of the play view; then a
  * GUI's tree, the mouse by pixel, a performance sample, logpoints, .rbxm files both ways and
  * multiplayer tests; then a Creator Store asset previewed or inserted with its scripts stripped,
- * memory by tag, the script profiler and Studio's scene analysis; plus two read in the daemon
- * itself: whether Studio holds each script's disk
- * text (verify) and instances of the synced tree (find). Every answer carries the play errors the
+ * memory by tag, the script profiler and Studio's scene analysis; then what only chrrxs had
+ * (09/11/26): the MicroProfiler through LibMP, the place's info, the selection and the edit
+ * camera on it, a model from Roblox's generation, and the answer of a call that timed out; then
+ * the player's character moved (teleported or walked) and instances found in a running play; plus
+ * three read in the daemon itself: whether Studio holds each script's disk text (verify),
+ * instances of the synced tree (find) and the calls that timed out (requestStatus). Every answer carries the play errors the
  * caller has not seen, and evals get the place's quack-prelude/<peer>.luau first. Each one
  * is a toolRequest to the right DataModel's Quack plugin: the edit one on its sync socket, a
  * play peer on its /studio-output socket. Every refusal says why: no Studio, no play, no client,
@@ -52,6 +56,8 @@ export interface PlaceView {
   nodes(): Iterable<{ guid: string; name: string; className: string; path: string[] }>;
   /** A script's file, from the sync folder */
   fileOf(guid: string): string | undefined;
+  /** The files git sees as changed in the sync folder, each marked by whether Studio wrote it */
+  changes?(options: { numbersOnly?: boolean }): Promise<unknown>;
 }
 
 /** FNV-1a, 32 bits, over UTF-8 bytes: the plugin hashes Studio's text the same way */
@@ -89,6 +95,24 @@ interface Pending {
   /** Edit calls: the connection they were sent on */
   since?: number | true;
 }
+
+interface LateCall {
+  tool: string;
+  role: PeerRole;
+  player?: string;
+  state: "pending" | "answered" | "failed" | "lost";
+  timedOutAt: number;
+  answeredAt?: number;
+  result?: unknown;
+  /** The answer's size when it was too big to keep */
+  tooBig?: number;
+  error?: string;
+}
+
+/** Calls that timed out, kept for request_status: how many, how long, how big an answer */
+const LATE_KEPT = 50;
+const LATE_KEPT_MS = 15 * 60_000;
+const LATE_RESULT_MAX_CHARS = 1_000_000;
 
 const LOG_MAX_ENTRIES = 10_000;
 const LOG_MAX_BYTES = 4 * 1024 * 1024;
@@ -152,6 +176,17 @@ export class StudioTools {
         this.lateEdit.delete(message.id);
         this.markAnswered(since);
       }
+      // ...and its answer is kept for request_status
+      const late = this.late.get(message.id);
+      if (late && late.state === "pending") {
+        late.state = message.ok ? "answered" : "failed";
+        late.answeredAt = this.now();
+        if (message.ok) {
+          const json = JSON.stringify(message.result ?? null);
+          if (json.length > LATE_RESULT_MAX_CHARS) late.tooBig = json.length;
+          else late.result = message.result ?? null;
+        } else late.error = typeof message.error === "string" && message.error ? message.error : `${LABEL[late.role]} failed without a reason`;
+      }
       return;
     }
     this.pending.delete(message.id);
@@ -177,7 +212,59 @@ export class StudioTools {
       clearTimeout(waiting.timer);
       waiting.reject(new ToolError(`the play stopped before ${LABEL[waiting.role]} answered`));
     }
+    // A timed-out call to a play peer that left never gets its answer
+    for (const late of this.late.values()) {
+      if (late.state !== "pending" || late.role === "edit") continue;
+      const playerGone = late.player !== undefined && !(peers.players ?? []).includes(late.player);
+      if (peers[late.role] === "ready" && !playerGone) continue;
+      late.state = "lost";
+      late.answeredAt = this.now();
+      late.error = `the play stopped before ${LABEL[late.role]} answered: whatever the call had done by then stays done`;
+    }
     for (const wake of [...this.peerWaiters]) wake();
+  }
+
+  /**
+   * Calls that timed out, by request id, for request_status: still pending, answered later (the
+   * answer kept, up to LATE_RESULT_MAX_CHARS), failed, or lost with the play. A timeout ends
+   * only the wait: the code may still be running in Studio, and sending it again runs it twice
+   * (chrrxs's get_request_status, 3 calls in a month).
+   */
+  private late = new Map<string, LateCall>();
+
+  private keepLate(id: string, tool: string, role: PeerRole, player: string | undefined): void {
+    this.pruneLate();
+    this.late.set(id, { tool, role, player, state: "pending", timedOutAt: this.now() });
+    while (this.late.size > LATE_KEPT) this.late.delete(this.late.keys().next().value!);
+  }
+
+  private pruneLate(): void {
+    const now = this.now();
+    for (const [id, late] of this.late) if (now - late.timedOutAt > LATE_KEPT_MS) this.late.delete(id);
+  }
+
+  /** What became of a call that timed out: request_status */
+  private requestStatus(args: Record<string, any>) {
+    const id = typeof args.id === "string" ? args.id.trim() : "";
+    if (!/^[0-9a-f]{12}$/.test(id)) throw new ToolError("id must be the request id a timeout named (12 hex digits)");
+    this.pruneLate();
+    const late = this.late.get(id);
+    if (!late) {
+      return { id, state: "unknown", note: `no call that timed out has this id in the last ${LATE_KEPT_MS / 60_000} min (or the daemon restarted since): Quack cannot say whether it ran; read its effect in Studio before sending it again` };
+    }
+    const now = this.now();
+    return {
+      id,
+      state: late.state,
+      tool: late.tool,
+      peer: late.role,
+      ...(late.player ? { player: late.player } : {}),
+      timedOutAgoMs: now - late.timedOutAt,
+      ...(late.answeredAt !== undefined ? { answeredAfterTimeoutMs: late.answeredAt - late.timedOutAt } : {}),
+      ...(late.state === "answered" ? (late.tooBig ? { note: `the answer came (${late.tooBig} characters of JSON), too big to keep` } : { result: late.result }) : {}),
+      ...(late.error ? { error: late.error } : {}),
+      ...(late.state === "pending" ? { note: `${LABEL[late.role]} has not answered yet: the call may still be running there` } : {}),
+    };
   }
 
   /** One line of the play's output, kept for `logs` whether or not the daemon log shows it */
@@ -353,6 +440,20 @@ export class StudioTools {
         return this.profiler(args);
       case "scene":
         return this.scene(args);
+      case "requestStatus":
+        return this.requestStatus(args);
+      case "placeInfo":
+        return this.placeInfo(args);
+      case "selection":
+        return this.selection(args);
+      case "generate":
+        return this.generate(args);
+      case "micro":
+        return this.micro(args);
+      case "move":
+        return this.move(args);
+      case "changes":
+        return this.changes(args);
     }
     throw new ToolError(`unknown Studio tool ${tool}`);
   }
@@ -377,7 +478,8 @@ export class StudioTools {
     return "no play is running in this place (start one with solo_playtest, or `playtest start` in the terminal)";
   }
 
-  private request<T = any>(role: PeerRole, tool: string, args: Record<string, unknown>, timeoutMs: number): Promise<T> {
+  /** `unkept`: a timeout keeps no id for get_request_status (wait_for's tries: a 600 s wait would push real calls out of the 50 kept) */
+  private request<T = any>(role: PeerRole, tool: string, args: Record<string, unknown>, timeoutMs: number, unkept = false): Promise<T> {
     const why = this.missing(role);
     if (why) return Promise.reject(new ToolError(why));
     const id = randomBytes(6).toString("hex");
@@ -401,7 +503,10 @@ export class StudioTools {
           : tool === "eval" || tool === "exec"
             ? "the code may still be running there"
             : "Studio may be busy: try again";
-        const error = new ToolError(`${LABEL[role]} did not answer in ${Math.round(timeoutMs / 1000)} s (${why})`);
+        // A play-state question has no answer worth keeping (the probe, status, stop)
+        const kept = !unkept && tool !== "playState";
+        if (kept) this.keepLate(id, tool, role, player);
+        const error = new ToolError(`${LABEL[role]} did not answer in ${Math.round(timeoutMs / 1000)} s (${why})${kept ? `. Request ${id}: get_request_status (the terminal's \`result ${id}\`) gives its answer if it comes later; check it before sending the call again` : ""}`);
         error.timedOut = true;
         reject(error);
       }, timeoutMs);
@@ -814,14 +919,16 @@ export class StudioTools {
         if (why && !pattern) throw new ToolError(tries ? `${why} (after ${tries} tries in ${this.now() - started} ms)` : why);
         if (!why) {
           tries++;
+          // Near the deadline a try gets what is left, not its own limit: the message says which
+          const thisTryMs = Math.max(100, Math.min(tryMs, deadline - this.now()));
           try {
-            const result = await this.request(peer, "eval", { code, ...prelude }, Math.max(100, Math.min(tryMs, deadline - this.now())));
+            const result = await this.request(peer, "eval", { code, ...prelude }, thisTryMs, true);
             const values: string[] = Array.isArray(result?.values) ? result.values : [];
             if (result?.ok && values[0] === "true") return done({ met: true, by: "code", peer, values: values.slice(1), output: result.output ?? [] });
             last = result?.ok ? { values: values.slice(1), output: result.output ?? [] } : { error: String(result?.error ?? "the try failed without a reason"), output: result?.output ?? [] };
           } catch (error) {
             if (!(error instanceof ToolError)) throw error;
-            if (error.timedOut) last = { error: `the try did not answer in ${Math.round(tryMs)} ms` };
+            if (error.timedOut) last = { error: `the try did not answer in ${Math.round(thisTryMs)} ms` };
             else if (!pattern) throw new ToolError(`${error.message} (after ${tries} tries in ${this.now() - started} ms)`);
             else last = { error: error.message };
           }
@@ -1036,11 +1143,26 @@ export class StudioTools {
   }
 
   /**
+   * Which uncommitted changes in the sync folder came from Studio, read in the daemon from what it
+   * wrote there itself: no Studio call, so it answers with Studio closed too
+   */
+  private async changes(args: Record<string, any>) {
+    if (!this.place?.changes) throw new ToolError("this daemon does not record Studio's writes");
+    if (args.numbersOnly !== undefined && typeof args.numbersOnly !== "boolean") throw new ToolError("numbersOnly must be true or false");
+    return this.place.changes({ numbersOnly: args.numbersOnly === true });
+  }
+
+  /**
    * Instances of the synced tree by name (* and ? wildcards), class, and where they are, read in
    * the daemon without asking Studio: the edit-mode place as of the last sync. Sessions scanned
-   * with GetDescendants in 2011 of the month's execute_luau.
+   * with GetDescendants in 2011 of the month's execute_luau. With a peer (or an attribute or a
+   * tag, which the synced tree does not hold) the search runs in that live DataModel instead.
    */
   private find(args: Record<string, any>) {
+    if (args.peer !== undefined && !["edit", "server", "client"].includes(args.peer)) throw new ToolError("peer must be server or client (a running play), or edit (Studio in edit mode, live)");
+    const byAttribute = typeof args.attribute === "string" && args.attribute.trim() !== "";
+    const byTag = typeof args.tag === "string" && args.tag.trim() !== "";
+    if (args.peer || byAttribute || byTag) return this.findLive(args);
     if (!this.place) throw new ToolError("this daemon has no synced tree");
     const name = typeof args.name === "string" && args.name.trim() ? globRegExp(args.name.trim()) : undefined;
     const classes = typeof args.className === "string" && args.className.trim() ? new Set(args.className.split(",").map((c: string) => c.trim()).filter(Boolean)) : undefined;
@@ -1065,6 +1187,96 @@ export class StudioTools {
       return { path: m.path, className: m.className, ...(file ? { file } : {}) };
     });
     return { found, total: matches.length, scanned, studioConnected: this.link.editConnected(), ms: this.now() - started };
+  }
+
+  /**
+   * Instances of a live DataModel (the play server or client, or edit mode): by name, class (IsA,
+   * or the exact ClassName with `exact`), under a path, an attribute (and its value), a tag.
+   * 3869 of a month's evals walked GetDescendants by hand in a play. With no peer named (an
+   * attribute or a tag asked), the play server during a play, else edit mode.
+   */
+  private async findLive(args: Record<string, any>) {
+    const trimmed = (key: string) => (typeof args[key] === "string" && args[key].trim() ? (args[key] as string).trim() : undefined);
+    const name = trimmed("name");
+    const classes = trimmed("className")?.split(",").map((c) => c.trim()).filter(Boolean);
+    const under = trimmed("under");
+    const attribute = trimmed("attribute");
+    const tag = trimmed("tag");
+    if (attribute !== undefined && !/^[A-Za-z0-9_]{1,100}$/.test(attribute)) throw new ToolError("attribute must be an attribute's name (letters, digits and _)");
+    let attributeValue: string | undefined;
+    if (args.attributeValue !== undefined && args.attributeValue !== null) {
+      if (!["string", "number", "boolean"].includes(typeof args.attributeValue)) throw new ToolError("attributeValue must be a string, a number or true/false");
+      if (attribute === undefined) throw new ToolError("attributeValue needs attribute: the attribute's name");
+      attributeValue = String(args.attributeValue);
+    }
+    const limit = args.limit === undefined ? 50 : Number(args.limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 5000) throw new ToolError("limit must be a whole number from 1 to 5000");
+    if (!name && !classes?.length && !under && !attribute && !tag) throw new ToolError("give a name (wildcards * and ?), a className, under (a path), an attribute or a tag, or several");
+    const peer: PeerRole = args.peer ?? (this.link.playPeers().server === "ready" ? "server" : "edit");
+    const request = {
+      ...(name ? { name } : {}),
+      ...(classes?.length ? { classes } : {}),
+      ...(args.exact === true ? { exact: true } : {}),
+      ...(under ? { under } : {}),
+      ...(attribute ? { attribute } : {}),
+      ...(attributeValue !== undefined ? { attributeValue } : {}),
+      ...(tag ? { tag } : {}),
+      limit,
+    };
+    const started = this.now();
+    const result = await this.request(peer, "find", request, StudioTools.timeout(args, 30_000));
+    return { peer, ...result, ms: this.now() - started };
+  }
+
+  /**
+   * The player's character moved in a running play: teleported to a position or onto an instance
+   * (a part's or model's top, an attachment), or walked there (Humanoid:MoveTo, or a
+   * PathfindingService path), until it arrives, stops getting closer for 2 s or the timeout.
+   * The server moves it unless a player owns the root's physics: then that player's client does
+   * (the owner simulates it), and the answer names the owner. `peer` picks one side by force.
+   */
+  private async move(args: Record<string, any>) {
+    let position: number[] | undefined;
+    if (args.position !== undefined && args.position !== null) {
+      if (!Array.isArray(args.position) || args.position.length !== 3 || args.position.some((n: unknown) => typeof n !== "number" || !Number.isFinite(n))) throw new ToolError("position must be [x, y, z]");
+      position = args.position;
+    }
+    const target = typeof args.path === "string" && args.path.trim() ? args.path.trim() : undefined;
+    if (!position === !target) throw new ToolError("give a position [x, y, z] or a path (a part, model or attachment to stand on), one of them");
+    const mode = args.mode ?? "teleport";
+    if (!["teleport", "walk", "path"].includes(mode)) throw new ToolError("mode must be teleport, walk (Humanoid:MoveTo in a straight line) or path (PathfindingService)");
+    if (args.peer !== undefined && !["server", "client"].includes(args.peer)) throw new ToolError("peer must be server or client");
+    let radius: number | undefined;
+    if (args.radius !== undefined && args.radius !== null) {
+      radius = Number(args.radius);
+      if (!Number.isFinite(radius) || radius < 0.5 || radius > 50) throw new ToolError("radius must be a number of studs from 0.5 to 50");
+    }
+    const timeoutMs = StudioTools.timeout(args, 15_000);
+    const request = {
+      mode,
+      ...(position ? { position } : { path: target }),
+      seconds: timeoutMs / 1000,
+      ...(radius !== undefined ? { radius } : {}),
+      ...(typeof args.player === "string" && args.player ? { player: args.player } : {}),
+    };
+    // A path is computed first (up to a few seconds), then the walk has its own timeout
+    const waitMs = mode === "teleport" ? 15_000 : timeoutMs + 20_000;
+    const started = this.now();
+    const peer: PlayRole = args.peer ?? "server";
+    let result = await this.request(peer, "move", { ...request, ...(peer === "server" && args.peer === "server" ? { stay: true } : {}) }, waitMs);
+    let owner: string | undefined;
+    if (result?.handOff === "client") {
+      owner = String(result.owner);
+      // In a multiplayer test the owner's own client; in a solo play the only one
+      const players = this.link.playPeers().players ?? [];
+      const who = (typeof args.player === "string" && args.player) || (players.length > 1 || this.multiplayer !== undefined ? owner : undefined);
+      // The goal as the server found it: with StreamingEnabled the client may not have the target
+      const { path: _named, ...rest } = request as typeof request & { path?: string };
+      const handed = { ...rest, ...(Array.isArray(result.position) ? { position: result.position } : {}), ...(typeof result.target === "string" ? { target: result.target } : {}) };
+      result = await this.callPlayer.run(who, () => this.request("client", "move", handed, waitMs));
+      return { peer: "client", ...result, owner, ms: this.now() - started };
+    }
+    return { peer, ...result, ms: this.now() - started };
   }
 
   /**
@@ -1138,10 +1350,18 @@ export class StudioTools {
     return { file, bytes: data.length, instances: result.instances, ms: this.now() - started };
   }
 
-  /** An .rbxm file's instances put under a parent in edit mode (their scripts then sync to disk) */
+  /**
+   * An .rbxm or .rbxl file's instances put in edit mode (their scripts then sync to disk). A place
+   * file (a binary file holding services, told by its classes, not its extension) is made
+   * importable first (see util/rbxl.ts). `paths` keeps only some of the file, each item put back
+   * in its own parent in this place (Workspace.MapA into Workspace); a place with no paths lands
+   * whole under `parent`, by default ServerStorage, where none of its scripts runs. A downloaded
+   * place is untrusted: its scripts are listed, and they land only with `scripts: true`. `list`
+   * reads the file and calls no Studio.
+   */
   private async importRbxm(args: Record<string, any>) {
     const file = typeof args.file === "string" ? args.file : "";
-    if (!file || !path.isAbsolute(file)) throw new ToolError("file must be the absolute path of an .rbxm");
+    if (!file || !path.isAbsolute(file)) throw new ToolError("file must be the absolute path of an .rbxm or .rbxl");
     let data: Buffer;
     try {
       data = fs.readFileSync(file);
@@ -1149,9 +1369,89 @@ export class StudioTools {
       throw new ToolError(`cannot read ${file}: ${(error as Error).message}`);
     }
     if (data.length > 50 * 1024 * 1024) throw new ToolError(`${file} is ${Math.round(data.length / 1024 / 1024)} MB: at most 50 MB`);
+    if (args.paths !== undefined && (!Array.isArray(args.paths) || !args.paths.length || args.paths.some((p: unknown) => typeof p !== "string" || !p.trim()))) {
+      throw new ToolError("paths must be a list of paths in the file, like Workspace.MapA or StarterGui.Shop");
+    }
+    const paths: string[] | undefined = args.paths;
+    const parent = typeof args.parent === "string" && args.parent ? args.parent : undefined;
+    // An XML model (.rbxmx) goes to Studio as an .rbxm does: Studio deserializes XML too (measured
+    // 09/11/26 in PA, a Model with a Part and a Script). An XML place (.rbxlx) or paths picked
+    // from XML need the binary reader, so those ask for the binary file (Studio saves binary by
+    // default); a place must never skip the script check and the ServerStorage default.
+    if (data.subarray(0, 8).toString("latin1") !== "<roblox!" && /^\s*<roblox[\s>]/.test(data.subarray(0, 200).toString("latin1"))) {
+      const head = data.toString("latin1", 0, Math.min(data.length, 2_000_000));
+      const placeXml = /<Item\s+class\s*=\s*["'](?:Workspace|Lighting|ReplicatedStorage|ServerScriptService|ServerStorage|StarterGui|StarterPlayer|SoundService|Teams)["']/i.test(head);
+      if (placeXml) throw new ToolError(`${file}: an XML place (.rbxlx): open it in Studio (open_place) and save it as .rbxl, then import that`);
+      if (paths) throw new ToolError(`${file}: paths are picked from a binary file: save this XML model as .rbxm, or import it whole`);
+      if (args.list === true) throw new ToolError(`${file}: list reads binary files only: save it as .rbxm to list it`);
+      const xmlScripts = (head.match(/<Item\s+class\s*=\s*["'](?:Script|LocalScript|ModuleScript)["']/gi) ?? []).length;
+      const started = this.now();
+      const result = await this.request("edit", "importRbxm", { data: data.toString("base64"), parent }, 120_000);
+      return { file, bytes: data.length, xml: true, xmlScripts, ...result, ms: this.now() - started };
+    }
+    let parsed: RobloxFile;
+    try {
+      parsed = readRoblox(data);
+    } catch (error) {
+      if (!(error instanceof RbxlError)) throw error;
+      const xml = /an XML file/.test(error.message) ? " (open it in Studio, open_place for a place, and save it as .rbxm / .rbxl)" : "";
+      throw new ToolError(`${file}: ${error.message}${xml}`);
+    }
+    if (args.list === true) return { file, bytes: data.length, ...summarize(parsed) };
+    if (!parsed.place && !paths) {
+      const started = this.now();
+      const result = await this.request("edit", "importRbxm", { data: data.toString("base64"), parent }, 120_000);
+      return { file, bytes: data.length, ...result, ms: this.now() - started };
+    }
+
+    let picks: Pick[] | undefined;
+    try {
+      picks = paths ? resolvePicks(parsed, paths) : undefined;
+    } catch (error) {
+      if (error instanceof RbxlError) throw new ToolError(`${file}: ${error.message}`);
+      throw error;
+    }
+    const chosen = picks ? picks.flatMap((p) => p.instances) : parsed.roots;
+    const found = scriptsUnder(chosen, 200);
+    const scripts = found.paths;
+    if (found.count && args.scripts !== true) {
+      const shown = scripts.slice(0, 50).join(", ") + (found.count > 50 ? `, ... (${found.count})` : "");
+      throw new ToolError(`${picks ? "what you picked" : "the file"} holds ${found.count} script(s), which sync to disk and run in a play: ${shown}. Read them first (the file came from outside; list true shows them), then import again with scripts: true, or pick paths without them`);
+    }
+    const payload = toModelFile(parsed);
+    if (payload.length > 50 * 1024 * 1024) throw new ToolError(`${file} as a model is ${Math.round(payload.length / 1024 / 1024)} MB: at most 50 MB`);
+    const voxels = parsed.place && parsed.terrain && !parsed.terrain.empty ? `the place's Terrain has ${parsed.terrain.voxelBytes} bytes of voxels, which an import cannot carry` : undefined;
     const started = this.now();
-    const result = await this.request("edit", "importRbxm", { data: data.toString("base64"), parent: typeof args.parent === "string" && args.parent ? args.parent : undefined }, 120_000);
-    return { file, bytes: data.length, ...result, ms: this.now() - started };
+    if (!picks) {
+      const result = await this.request<Record<string, any>>("edit", "importRbxm", { data: payload.toString("base64"), parent: parent ?? "ServerStorage" }, 120_000);
+      return {
+        file, bytes: data.length, place: true, ...result, scriptList: scripts, scriptCount: found.count,
+        note: "the whole place: each service is a Folder of its name and Workspace a Model (with its Camera and an empty Terrain Folder). Move what is missing to where it belongs, or import again with paths to put each item back in its own parent",
+        ...(voxels ? { terrain: voxels } : {}), ms: this.now() - started,
+      };
+    }
+    const into = (p: Pick) => parent ?? (parsed.place ? p.names.slice(0, -1).join(".") : "Workspace");
+    const result = await this.request<Record<string, any>>("edit", "importPicks", {
+      data: payload.toString("base64"),
+      picks: picks.map((p) => ({ names: p.names, className: p.className, count: p.count, into: into(p) })),
+    }, 120_000);
+    // every instance that is or holds a kept one: one walk up from each kept instance
+    const holdsKept = new Set<FileInstance>();
+    for (const pick of picks) {
+      for (const k of pick.instances) {
+        for (let at: FileInstance | undefined = k; at && !holdsKept.has(at); at = at.parent) holdsKept.add(at);
+      }
+    }
+    const leftOut = topItems(parsed).filter((item) => !holdsKept.has(item)).map(pathOf);
+    return {
+      file, bytes: data.length, place: parsed.place,
+      kept: picks.map((p) => `${p.path} (${p.className}${p.count > 1 ? `, ${p.count} of that name` : ""}) into ${into(p)}`),
+      ...result,
+      leftOut: leftOut.slice(0, 100), leftOutCount: leftOut.length,
+      scriptList: scripts, scriptCount: found.count,
+      ...(voxels && picks.some((p) => p.names[0] === "Workspace") ? { terrain: voxels } : {}),
+      ms: this.now() - started,
+    };
   }
 
   /** The last screenshot's pixels, for a picture made of several (devices) */
@@ -1487,6 +1787,117 @@ export class StudioTools {
     const started = this.now();
     const result = await this.request(peer, "scene", { mode, topN }, StudioTools.timeout(args, mode === "all" ? 300_000 : 120_000));
     return { peer, ...result, ms: this.now() - started };
+  }
+
+  /** The place in Studio: ids, version, creator, the published name, edit mode or a play */
+  private async placeInfo(args: Record<string, any>) {
+    return this.request("edit", "placeInfo", {}, StudioTools.timeout(args, 15_000));
+  }
+
+  /** Studio's selection: read it, set it (or add, remove), or point the edit camera at it */
+  private async selection(args: Record<string, any>) {
+    const action = args.action ?? "get";
+    if (!["get", "set", "view"].includes(action)) throw new ToolError("action must be get, set or view");
+    const request: Record<string, unknown> = { action };
+    if (action === "set") {
+      if (!Array.isArray(args.paths) || args.paths.some((p: unknown) => typeof p !== "string" || !p.trim())) throw new ToolError("paths must be a list of instance paths (empty clears the selection)");
+      if (args.mode !== undefined && !["set", "add", "remove"].includes(args.mode)) throw new ToolError("mode must be set, add or remove");
+      Object.assign(request, { paths: args.paths.map((p: string) => p.trim()), mode: args.mode ?? "set" });
+    }
+    if (action === "view") {
+      if (typeof args.path === "string" && args.path.trim()) request.path = args.path.trim();
+      for (const [key, min, max] of [["from", -360, 360], ["angleY", -89, 89], ["padding", 0.1, 10]] as const) {
+        if (args[key] === undefined || args[key] === null) continue;
+        const n = Number(args[key]);
+        if (!Number.isFinite(n) || n < min || n > max) throw new ToolError(`${key} must be a number from ${min} to ${max}`);
+        request[key] = n;
+      }
+    }
+    return this.request("edit", "selection", request, 15_000);
+  }
+
+  /**
+   * A model from Roblox's generation (GenerationService:GenerateModelAsync) put in the place in
+   * edit mode: a prompt, an image asset id, or both. 118 s for a crate (09/11/26, PA), so the
+   * wait is 5 min by default.
+   */
+  private async generate(args: Record<string, any>) {
+    const prompt = typeof args.prompt === "string" && args.prompt.trim() ? args.prompt.trim() : undefined;
+    let imageAssetId: number | undefined;
+    if (args.imageAssetId !== undefined && args.imageAssetId !== null) {
+      imageAssetId = Number(args.imageAssetId);
+      if (!Number.isSafeInteger(imageAssetId) || imageAssetId <= 0) throw new ToolError("imageAssetId must be an image asset id");
+    }
+    if (!prompt && !imageAssetId) throw new ToolError("give a prompt, an image, or both");
+    const vector = (key: string): number[] | undefined => {
+      const v = args[key];
+      if (v === undefined || v === null) return undefined;
+      const list = Array.isArray(v) ? v.map(Number) : [Number(v?.x), Number(v?.y), Number(v?.z)];
+      if (list.length !== 3 || !list.every(Number.isFinite)) throw new ToolError(`${key} must be x, y and z (studs)`);
+      return list;
+    };
+    const size = vector("size");
+    if (size && size.some((n) => n <= 0)) throw new ToolError("size must be above 0 on each axis");
+    const position = vector("position");
+    if (args.maxTriangles !== undefined && (!Number.isInteger(args.maxTriangles) || args.maxTriangles < 1)) throw new ToolError("maxTriangles must be a whole number above 0");
+    if (args.schema !== undefined && !["Body1", "Car5"].includes(args.schema)) throw new ToolError("schema must be Body1 (one mesh) or Car5 (a car's five parts)");
+    if (args.groups !== undefined && (!Array.isArray(args.groups) || !args.groups.length || args.groups.some((g: unknown) => typeof g !== "string" || !g))) throw new ToolError("groups must be a list of part names");
+    const started = this.now();
+    const result = await this.request("edit", "generate", {
+      ...(prompt ? { prompt } : {}), ...(imageAssetId ? { imageAssetId } : {}), ...(size ? { size } : {}), ...(position ? { position } : {}),
+      ...(args.maxTriangles ? { maxTriangles: args.maxTriangles } : {}), ...(typeof args.textures === "boolean" ? { textures: args.textures } : {}),
+      ...(args.schema ? { schema: args.schema } : {}), ...(args.groups ? { groups: args.groups } : {}),
+      ...(typeof args.name === "string" && args.name.trim() ? { name: args.name.trim() } : {}),
+      ...(typeof args.parent === "string" && args.parent.trim() ? { parent: args.parent.trim() } : {}),
+    }, StudioTools.timeout(args, 300_000));
+    return { ...result, ms: this.now() - started };
+  }
+
+  static readonly MICRO_FOCUS = ["all", "script", "physics", "render", "network", "jobs"];
+
+  /**
+   * The MicroProfiler for durationMs through LibMP: frame times, the scopes that took them (self
+   * and inclusive ms a frame, the worst frame), groups and threads. Edit mode with no play, the
+   * play server during one, or the peer named; a solo play is one Studio process, so the peers
+   * read the same profiler. `out` (or save) keeps the capture, LZ4-compressed, for LibMP or the
+   * MicroProfiler's own viewer.
+   */
+  private async micro(args: Record<string, any>) {
+    if (args.peer !== undefined && args.peer !== null && !["edit", "server", "client"].includes(args.peer)) throw new ToolError("peer must be edit, server or client");
+    const peer: PeerRole = args.peer ?? (this.link.playPeers().server === "ready" ? "server" : "edit");
+    const whole = (key: string, fallback: number, min: number, max: number) => {
+      if (args[key] === undefined || args[key] === null) return fallback;
+      const n = Number(args[key]);
+      if (!Number.isInteger(n) || n < min || n > max) throw new ToolError(`${key} must be a whole number from ${min} to ${max}`);
+      return n;
+    };
+    const durationMs = whole("durationMs", 1000, 100, 5000);
+    // Left out: the frames that cover durationMs, back from the last one
+    const frames = args.frames === undefined || args.frames === null ? undefined : whole("frames", 256, 1, 256);
+    const maxTimers = whole("maxTimers", 20, 1, 100);
+    const focus = args.focus ?? "all";
+    if (!StudioTools.MICRO_FOCUS.includes(focus)) throw new ToolError(`focus must be one of ${StudioTools.MICRO_FOCUS.join(", ")}`);
+    if (args.sort !== undefined && args.sort !== "self" && args.sort !== "inclusive") throw new ToolError("sort must be self or inclusive");
+    if (typeof args.out === "string" && args.out && !path.isAbsolute(args.out)) throw new ToolError("out must be an absolute path");
+    const save = args.save === true || (typeof args.out === "string" && args.out !== "");
+    const started = this.now();
+    // The capture, then the first require of LibMP (3.3 MB of Luau) and the read of every frame
+    const result = await this.request<any>(peer, "micro", {
+      durationMs, ...(frames ? { frames } : {}), maxTimers, focus, sort: args.sort ?? "self", includeGpu: args.includeGpu === true, includeIdle: args.includeIdle === true,
+      ...(typeof args.filter === "string" && args.filter ? { filter: args.filter } : {}), save, keep: args.keep === true,
+    }, StudioTools.timeout(args, durationMs + 60_000));
+    const answer: Record<string, unknown> = { peer, ...result, ms: this.now() - started };
+    if (typeof result?.raw === "string") {
+      delete answer.raw;
+      const file = typeof args.out === "string" && args.out
+        ? args.out
+        : path.join(path.dirname(this.screenshotDir), "profiler", `micro-${peer}-${new Date(this.now()).toISOString().replace(/[:.]/g, "-")}.mpz`);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, Buffer.from(result.raw, "base64"));
+      answer.file = file;
+    }
+    if (peer !== "edit" && this.multiplayer === undefined) answer.note = "a solo play and edit mode are one Studio process: one MicroProfiler, whichever peer reads it";
+    return answer;
   }
 
   /** The image the last screenshot answered with, to read a mouse point given on it */

@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { Vault, type Dpapi } from "../cloud/vault.js";
 
 /**
  * Quack: the Roblox web tools that need no Studio, run in the command's own process: the engine
@@ -24,6 +25,13 @@ export interface RobloxEnv {
   env: Record<string, string | undefined>;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
+  /**
+   * The Open Cloud key: only the hub has one (its vault, decrypted in its own process). The CLI
+   * and the MCP never read the key: what needs it goes to the hub's /api/cloud.
+   */
+  apiKey?: () => Promise<string | undefined>;
+  /** DPAPI for the vault (cloud set encrypts; tests swap it) */
+  dpapi?: Dpapi;
 }
 
 export function robloxEnv(dataDir: string, overrides: Partial<RobloxEnv> = {}): RobloxEnv {
@@ -486,7 +494,18 @@ export function parseEnvFile(text: string): Record<string, string> {
   return out;
 }
 
-/** The key and the creator: the environment first, then open-cloud.env in the data folder */
+/** Where the key sits, for messages */
+const keyHome = (env: RobloxEnv) => `Quack's Settings, Open Cloud (kept encrypted in ${path.join(env.dataDir, "open-cloud.key")}; \`cloud set --key-stdin\` does the same)`;
+
+/** The key, in the hub only; every other process is told the key never leaves it */
+export async function resolveKey(env: RobloxEnv, permission: string): Promise<{ key: string; scrub: (text: string) => string }> {
+  if (!env.apiKey) throw new RobloxError("the Open Cloud key is used only inside the Quack hub: run this through the hub (the quack command does), never with the key itself");
+  const key = await env.apiKey();
+  if (!key) throw new RobloxError(`no Open Cloud key: the user saves one (with ${permission}) in ${keyHome(env)}. The key is the user's to give there, never in chat`);
+  return { key, scrub: (text) => text.split(key).join("***") };
+}
+
+/** The creator of uploads: the environment first, then open-cloud.env in the data folder (no secret there) */
 export function cloudCredentials(env: RobloxEnv, given: { userId?: string; groupId?: string } = {}) {
   const fileName = path.join(env.dataDir, "open-cloud.env");
   let file: Record<string, string> = {};
@@ -496,13 +515,12 @@ export function cloudCredentials(env: RobloxEnv, given: { userId?: string; group
     // no file: the environment only
   }
   const pick = (key: string) => (env.env[key]?.trim() || file[key]?.trim() || undefined);
-  const key = pick("ROBLOX_OPEN_CLOUD_API_KEY");
   const groupId = given.groupId ?? (given.userId ? undefined : pick("ROBLOX_CREATOR_GROUP_ID"));
   const userId = groupId ? undefined : (given.userId ?? pick("ROBLOX_CREATOR_USER_ID"));
   for (const [name, value] of [["user", userId], ["group", groupId]] as const) {
     if (value !== undefined && !/^\d+$/.test(value)) throw new RobloxError(`the creator ${name} id must be a number, not "${value}"`);
   }
-  return { key, userId, groupId, fileName };
+  return { userId, groupId, fileName };
 }
 
 const CLOUD_KEYS = ["ROBLOX_OPEN_CLOUD_API_KEY", "ROBLOX_CREATOR_USER_ID", "ROBLOX_CREATOR_GROUP_ID"] as const;
@@ -519,12 +537,16 @@ export function cloudSettings(env: RobloxEnv) {
   } catch {
     // no file yet
   }
-  const key = file.ROBLOX_OPEN_CLOUD_API_KEY?.trim() || undefined;
+  // The key itself is in the vault: its last 4 only, of a key long enough that they say nothing
+  const vault = new Vault(env.dataDir, env.dpapi).info();
+  const plain = file.ROBLOX_OPEN_CLOUD_API_KEY?.trim() || undefined;
   return {
     file: fileName,
-    hasKey: Boolean(key),
-    // The last 4 only of a key long enough that they say nothing of the rest
-    keyEnd: key && key.length > 12 ? key.slice(-4) : undefined,
+    vaultFile: path.join(env.dataDir, "open-cloud.key"),
+    hasKey: vault.hasKey || Boolean(plain),
+    keyEnd: vault.keyEnd ?? (plain && plain.length > 12 ? plain.slice(-4) : undefined),
+    /** A key still in plain text in open-cloud.env: the hub moves it into the vault on its first use */
+    plainKey: Boolean(plain),
     userId: file.ROBLOX_CREATOR_USER_ID?.trim() || undefined,
     groupId: file.ROBLOX_CREATOR_GROUP_ID?.trim() || undefined,
     fromEnvironment: CLOUD_KEYS.filter((k) => Boolean(env.env[k]?.trim())),
@@ -536,7 +558,7 @@ export function cloudSettings(env: RobloxEnv) {
  * names) as it was. key: a new key ("" removes it); undefined leaves it. A user id removes the
  * group id and the other way round: one creator at a time, as the upload takes it.
  */
-export function saveCloudSettings(env: RobloxEnv, change: { key?: string; userId?: string; groupId?: string }) {
+export async function saveCloudSettings(env: RobloxEnv, change: { key?: string; userId?: string; groupId?: string }) {
   for (const [name, value] of [["user", change.userId], ["group", change.groupId]] as const) {
     if (value !== undefined && value !== "" && !/^\d+$/.test(value)) throw new RobloxError(`the creator ${name} id must be a number, not "${value}"`);
   }
@@ -554,7 +576,11 @@ export function saveCloudSettings(env: RobloxEnv, change: { key?: string; userId
     lines = ["# Open Cloud for Quack's upload_asset (the app's Settings write this file)"];
   }
   const wanted = new Map<string, string | null>();
-  if (key !== undefined) wanted.set("ROBLOX_OPEN_CLOUD_API_KEY", key || null);
+  // The key goes to the vault, encrypted; a plain key line left from before is removed
+  if (key !== undefined) {
+    await new Vault(env.dataDir, env.dpapi).set(key);
+    wanted.set("ROBLOX_OPEN_CLOUD_API_KEY", null);
+  }
   if (change.userId !== undefined) {
     wanted.set("ROBLOX_CREATOR_USER_ID", change.userId || null);
     if (change.userId) wanted.set("ROBLOX_CREATOR_GROUP_ID", null);
@@ -665,10 +691,8 @@ export async function uploadAsset(env: RobloxEnv, args: { file: string; assetTyp
     throw new RobloxError(`cannot read ${args.file}: ${(error as Error).message}`);
   }
   const creds = cloudCredentials(env, { userId: args.userId, groupId: args.groupId });
-  if (!creds.key) throw new RobloxError(`no Open Cloud key: the user saves one (asset:read and asset:write) in Quack's Settings, Open Cloud; or ROBLOX_OPEN_CLOUD_API_KEY in the environment or in ${creds.fileName}`);
+  const { key: apiKey, scrub } = await resolveKey(env, "asset:read and asset:write");
   if (!creds.userId && !creds.groupId) throw new RobloxError(`no creator: give a user or group id, or the user sets the owner of uploads in Quack's Settings, Open Cloud (or ROBLOX_CREATOR_USER_ID / ROBLOX_CREATOR_GROUP_ID in the environment or ${creds.fileName})`);
-  const apiKey = creds.key;
-  const scrub = (text: string) => text.split(apiKey).join("***");
   const creator = creds.groupId ? `group ${creds.groupId}` : `user ${creds.userId}`;
   const sha256 = createHash("sha256").update(data).digest("hex");
   const key = `${sha256}|${args.assetType}|${args.displayName}|${creator}`;
@@ -785,3 +809,101 @@ local decal = model:FindFirstChildWhichIsA("Decal", true)
 local texture = if decal then decal.Texture else ""
 model:Destroy()
 return string.match(texture, "%d+") or "error: the asset holds no Decal"`;
+
+// ---------------------------------------------------------------------------------------
+// A place's saved versions (chrrxs's manage_instance list_place_versions) and one downloaded
+// as an .rbxl: the copy of instances the sync deleted when git has none (Memória Roblox,
+// 05/11/26, Seven Sins: the only copy of three ScreenGuis was the cloud's). The file opens in
+// a Studio of its own (`open --file`): no place id there, so the hub never sees it as a second
+// Studio of a registered place; export from it, import into the synced one.
+
+
+const wholeId = (raw: unknown, what: string): number => {
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || n <= 0) throw new RobloxError(`${what} must be a whole number above 0`);
+  return n;
+};
+
+async function cloudGet(env: RobloxEnv, url: string, what: string, permission: string): Promise<any> {
+  const { key, scrub } = await resolveKey(env, permission);
+  const response = await get(env, url, { "x-api-key": key, Accept: "application/json" });
+  const body = scrub(await response.text().catch(() => ""));
+  if (response.status === 401 || response.status === 403) {
+    throw new RobloxError(`${what}: Roblox refused the key (HTTP ${response.status}${body ? `: ${body.slice(0, 200)}` : ""}). It needs ${permission}, for the experience that holds this place`);
+  }
+  if (response.status === 404) throw new RobloxError(`${what}: not found (404)`);
+  if (!response.ok) throw new RobloxError(`${what}: HTTP ${response.status} ${body.slice(0, 300)}`);
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new RobloxError(`${what}: the answer is not JSON`);
+  }
+}
+
+export interface PlaceVersion {
+  version: number;
+  createdAt?: string;
+  moderation?: string;
+}
+
+/** A place's saved versions, newest first, a page at a time (Open Cloud assets/v1, asset:read) */
+export async function placeVersions(env: RobloxEnv, args: { placeId: unknown; limit?: number; pageToken?: string }) {
+  const placeId = wholeId(args.placeId, "the place id");
+  const limit = args.limit === undefined ? 10 : Math.trunc(args.limit);
+  if (!Number.isFinite(limit) || limit < 1 || limit > 50) throw new RobloxError("limit must be from 1 to 50");
+  const url = new URL(`${CLOUD}/assets/${placeId}/versions`);
+  url.searchParams.set("maxPageSize", String(limit));
+  if (args.pageToken) url.searchParams.set("pageToken", args.pageToken);
+  const body = await cloudGet(env, url.toString(), `the versions of place ${placeId}`, "asset:read");
+  const versions: PlaceVersion[] = (Array.isArray(body?.assetVersions) ? body.assetVersions : []).map((v: any) => ({
+    version: Number(/versions\/(\d+)$/.exec(String(v?.path ?? ""))?.[1] ?? 0),
+    ...(v?.createTime ? { createdAt: String(v.createTime) } : {}),
+    ...(v?.moderationResult?.moderationState ? { moderation: String(v.moderationResult.moderationState) } : {}),
+  }));
+  return { placeId, versions, ...(body?.nextPageToken ? { nextPageToken: String(body.nextPageToken) } : {}) };
+}
+
+export function versionsText(r: Awaited<ReturnType<typeof placeVersions>>): string {
+  if (!r.versions.length) return `Place ${r.placeId}: no saved version on this page.`;
+  const lines = [`Place ${r.placeId}, newest first:`];
+  for (const v of r.versions) lines.push(`  version ${v.version}${v.createdAt ? `  ${v.createdAt.replace("T", " ").replace(/\.\d+Z$/, "Z")}` : ""}${v.moderation && v.moderation !== "Approved" ? `  (${v.moderation})` : ""}`);
+  if (r.nextPageToken) lines.push(`More: --page ${r.nextPageToken}`);
+  return lines.join("\n");
+}
+
+const PLACES_KEPT = 10;
+
+/**
+ * One saved version of a place (the latest when none is named) downloaded as an .rbxl through
+ * the Asset Delivery API: its answer is a short-lived location, fetched without the key. Kept
+ * under the data folder's places/ (the last PLACES_KEPT), or at `out`.
+ */
+export async function downloadPlace(env: RobloxEnv, args: { placeId: unknown; version?: unknown; out?: string }) {
+  const placeId = wholeId(args.placeId, "the place id");
+  const version = args.version === undefined || args.version === null ? undefined : wholeId(args.version, "the version");
+  const what = `place ${placeId}${version ? ` version ${version}` : ""}`;
+  const meta = await cloudGet(env, `https://apis.roblox.com/asset-delivery-api/v1/assetId/${placeId}${version ? `/version/${version}` : ""}`, what, "legacy-asset:manage or asset:read");
+  const location = typeof meta?.location === "string" ? meta.location : "";
+  if (!/^https:\/\//.test(location)) throw new RobloxError(`${what}: the Asset Delivery answer has no location${meta?.errors ? ` (${JSON.stringify(meta.errors).slice(0, 200)})` : ""}`);
+  const response = await get(env, location, {}, 300_000);
+  if (!response.ok) throw new RobloxError(`${what}: the file's download answered HTTP ${response.status}`);
+  const data = Buffer.from(await response.arrayBuffer());
+  const head = data.subarray(0, 8).toString("latin1");
+  if (head !== "<roblox!" && !head.startsWith("<roblox")) throw new RobloxError(`${what}: the download is not a place file (${data.length} bytes starting ${JSON.stringify(head)})`);
+  let file = args.out;
+  if (file) {
+    if (!path.isAbsolute(file)) throw new RobloxError("out must be an absolute path");
+    if (!/\.rbxlx?$/i.test(file)) throw new RobloxError("out must be an .rbxl file");
+  } else {
+    const dir = path.join(env.dataDir, "places");
+    file = path.join(dir, `${placeId}-${version ? `v${version}` : "latest"}-${new Date(env.now()).toISOString().replace(/[:.]/g, "-")}.rbxl${head === "<roblox!" ? "" : "x"}`);
+    try {
+      const old = fs.readdirSync(dir).filter((f) => /\.rbxlx?$/.test(f)).sort((a, b) => fs.statSync(path.join(dir, a)).mtimeMs - fs.statSync(path.join(dir, b)).mtimeMs);
+      for (const f of old.slice(0, Math.max(0, old.length - PLACES_KEPT + 1))) fs.rmSync(path.join(dir, f), { force: true });
+    } catch {
+      // no folder yet
+    }
+  }
+  writeAtomic(file, data);
+  return { placeId, ...(version ? { version } : {}), file, bytes: data.length };
+}

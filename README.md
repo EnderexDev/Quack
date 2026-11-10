@@ -28,7 +28,7 @@ Rojo-compatible `sourcemap.json` for luau-lsp.
 
 ## Install (Windows)
 
-1. Install [Node.js](https://nodejs.org) 20.19 or newer. The hub runs on it.
+1. Install [Node.js](https://nodejs.org) 22.15 or newer. The hub runs on it.
 2. Download the installer from the
    [latest release](https://github.com/EnderexDev/quack-releases/releases/latest) and run it.
    The app installs the Studio plugin for you and updates itself.

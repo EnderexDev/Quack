@@ -214,6 +214,13 @@ html.dev .brand .mark { background-image: url(logo-dev.svg); }
 .option.take b { color: #ff8b84; }
 .option.take span { color: var(--ink-400); }
 .dialog .note { margin: 0; text-align: center; }
+/* A write to the live game waiting for an answer: over every other dialog */
+#approval { z-index: 30; }
+.dialog h2.approval-title { font-size: 20px; text-transform: none; overflow-wrap: anywhere; }
+.dialog .note.approval-ask { text-align: left; color: var(--ink-300); }
+.approval-text { width: 100%; min-height: 200px; max-height: 50vh; resize: vertical; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; color: var(--ink-200); background: var(--ink-900); border: 3px solid var(--line); border-radius: 10px; padding: 10px 12px; outline: none; }
+.approval-text:focus { border-color: var(--brand-400); }
+.note.bad { color: #ff8b84; }
 .setup-options { display: flex; flex-direction: column; gap: 8px; }
 .setup-option { display: flex; align-items: center; gap: 12px; text-align: left; background: var(--ink-900); border-radius: 12px; padding: 10px 12px; }
 .setup-option b { display: block; color: var(--ink-100); }

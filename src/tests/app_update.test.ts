@@ -87,7 +87,7 @@ test("Settings saves the Open Cloud key through `cloud`, and the rule notice sta
   assert.match(ui, /invoke\("cloud_settings"/);
 
   const i18n = read("ui/i18n.js");
-  for (const key of ["ruleLabel", "ruleFirst", "ruleChanged", "ruleDone", "cloudCard", "cloudNote", "cloudKeySaved", "cloudKeySavedShort", "cloudSave", "cloudRemove", "cloudFile"]) {
+  for (const key of ["ruleLabel", "ruleFirst", "ruleChanged", "ruleConnected", "ruleDone", "cloudCard", "cloudNote", "cloudKeySaved", "cloudKeySavedShort", "cloudSave", "cloudRemove", "cloudFile"]) {
     assert.equal([...i18n.matchAll(new RegExp(`\\n\\s+${key}: "`, "g"))].length, 2, key);
   }
 });

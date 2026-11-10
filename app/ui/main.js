@@ -297,11 +297,15 @@ function renderUpdate() {
   // A hub from before build ids reports none: that one is outdated too. Not shown while a new
   // version waits: installing it restarts the hub anyway
   const outdated = Boolean(!ui.update && ui.app.build && ui.hub.online && state()?.build !== ui.app.build);
-  const key = JSON.stringify([outdated, restartArmed, restarting, getLanguage()]);
+  // The hub does not take this app's approval token (another Quack started it, or the token
+  // file was lost): writes cannot be accepted until a restart gives it this app's token. Never
+  // restarted by itself: on Official that drops the live game's sync for a few seconds
+  const noToken = Boolean(ui.hub.online && ui.hub.approvalsAnswerable === false);
+  const key = JSON.stringify([outdated, noToken, restartArmed, restarting, getLanguage()]);
   if (key === updateKey) return;
   updateKey = key;
-  bar.classList.toggle("hidden", !outdated);
-  if (!outdated) return;
+  bar.classList.toggle("hidden", !outdated && !noToken);
+  if (!outdated && !noToken) return;
   const restart = h("button", { class: "btn yellow chunk-bright press" }, restartArmed ? t("restartConfirm") : t("restartHub"));
   // Every redraw while a restart runs keeps the button off: a second one would race the first
   restart.disabled = restarting;
@@ -329,7 +333,7 @@ function renderUpdate() {
     restartArmed = false;
     renderUpdate();
   });
-  bar.replaceChildren(h("span", { class: "pill brand" }, t("updateLabel")), h("span", { class: "grow" }, t("hubOutdated")), restart);
+  bar.replaceChildren(h("span", { class: "pill brand" }, t("updateLabel")), h("span", { class: "grow" }, outdated ? t("hubOutdated") : t("approvalNeedsRestart")), restart);
 }
 
 /**
@@ -833,17 +837,21 @@ function mcpCard() {
   const list = h("div", {});
   const button = h("button", { class: "btn yellow chunk-bright press" }, t("mcpFind"));
   let found = null;
+  // One click puts all of it in place: the MCP server, Quack's rule in the AI's instructions and,
+  // in Claude Code, Quack's guard. A client missing any of them (an older rule, a folder
+  // connected before the guard existed) is connected again
+  const needs = (c) => c.installed && (!c.connected || c.guarded === false || c.rule === "outdated" || c.rule === "missing");
   const show = (clients) => {
     found = clients;
     list.replaceChildren(...clients.map((c) => h("div", { class: "field" },
       h("span", { class: "grow" }, c.label),
-      h("span", { class: c.connected ? "pill brand" : "pill", title: c.problem ?? "" }, c.problem ? c.problem : t(!c.installed ? "mcpMissing" : c.connected ? "mcpHas" : "mcpNo")))));
-    const toConnect = clients.filter((c) => c.installed && !c.connected).length;
+      h("span", { class: c.connected ? "pill brand" : "pill", title: c.problem ?? "" }, c.problem ? c.problem : t(!c.installed ? "mcpMissing" : !c.connected ? "mcpNo" : needs(c) ? "mcpUpdate" : "mcpHas")))));
+    const toConnect = clients.filter(needs).length;
     if (!clients.some((c) => c.installed)) list.append(h("p", { class: "note" }, t("mcpNone")));
     button.textContent = toConnect ? `${t("mcpConnect")} (${toConnect})` : t("mcpFind");
   };
   button.addEventListener("click", async () => {
-    const connect = !!found?.some((c) => c.installed && !c.connected);
+    const connect = !!found?.some(needs);
     button.disabled = true;
     button.textContent = t(connect ? "mcpConnecting" : "mcpFinding");
     try {
@@ -859,6 +867,8 @@ function mcpCard() {
     }
   });
   card.append(list, h("div", { class: "row", style: "margin-top:8px" }, h("span", { class: "grow" }), button));
+  // What each AI has, as soon as the card opens: an update shows without a first click
+  invoke("ai_clients", { connect: false }).then((result) => { if (!found && Array.isArray(result?.clients)) show(result.clients); }).catch(() => {});
   card.append(h("p", { class: "note", style: "margin-top:12px" }, t("ruleNote")), h("div", { class: "row", style: "margin-top:8px" }, h("span", { class: "grow" }), ruleButton()));
   return card;
 }
@@ -948,7 +958,7 @@ function cloudCard() {
   return card;
 }
 
-// ---------- The rule for AI: a notice until the user says they gave it to their AI ----------
+// ---------- The rule for AI: a notice until Connect to AI put it in place (or the user dismisses it) ----------
 
 let ruleKey = "";
 function renderRuleNotice() {
@@ -962,18 +972,29 @@ function renderRuleNotice() {
   ruleKey = key;
   bar.classList.toggle("hidden", !visible);
   if (!visible) return;
-  const copy = h("button", { class: "btn yellow chunk-bright press" }, t("ruleCopy"));
-  copy.addEventListener("click", async () => {
+  // The same as Settings' Connect to AI: the rule written into each AI's instructions, with its
+  // tools and guard
+  const connect = h("button", { class: "btn yellow chunk-bright press" }, t("mcpFind"));
+  connect.addEventListener("click", async () => {
+    connect.disabled = true;
+    connect.textContent = t("mcpConnecting");
     try {
-      await copyText(ui.rule.text);
-      toast(t("ruleCopied", { version }));
+      const result = await invoke("ai_clients", { connect: true });
+      if (result.error) throw new Error(result.error);
+      const done = (result.clients ?? []).filter((c) => c.connected);
+      if (!done.length) throw new Error(t("mcpNone"));
+      toast(t("ruleConnected", { version, clients: done.map((c) => c.label).join(", ") }));
+      await invoke("set_settings", { ruleSeen: version });
     } catch (error) {
       fail(error);
+    } finally {
+      connect.disabled = false;
+      connect.textContent = t("mcpFind");
     }
   });
   const done = h("button", { class: "btn press" }, t("ruleDone"));
   done.addEventListener("click", () => invoke("set_settings", { ruleSeen: version }).catch(fail));
-  bar.replaceChildren(h("span", { class: "pill brand" }, t("ruleLabel")), h("span", { class: "grow" }, t(seen ? "ruleChanged" : "ruleFirst", { version })), copy, done);
+  bar.replaceChildren(h("span", { class: "pill brand" }, t("ruleLabel")), h("span", { class: "grow" }, t(seen ? "ruleChanged" : "ruleFirst", { version })), connect, done);
 }
 
 async function copyText(text) {
@@ -1369,6 +1390,89 @@ function renderChoice() {
   keep.focus();
 }
 
+// ---------- A write to the live game waiting for the user's answer ----------
+
+/**
+ * The oldest write the hub holds for the user (Open Cloud: a save, a publish, a badge...), over
+ * everything, the choice dialog too. Its title and its whole text, read only and scrolling, as
+ * the hub's `describe` wrote it (hidden characters already shown as \u{...}). Refuse is the
+ * default: it has the focus, so Enter refuses, and Esc refuses too. The answer goes through the
+ * app's Rust side, which adds the token only it holds; the window never sees the token.
+ */
+let approvalShown = null;
+let approvalTimer;
+let approvalEscape = null;
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && approvalEscape) {
+    event.preventDefault();
+    approvalEscape();
+  }
+});
+
+/** m:ss left */
+const countdown = (ms) => {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+};
+
+function renderApproval() {
+  const approval = ui.hub.online ? ui.hub.approvals?.[0] : undefined;
+  const answerable = ui.hub.approvalsAnswerable === true;
+  const key = approval ? JSON.stringify([approval.id, answerable, getLanguage()]) : null;
+  if (key === approvalShown) return;
+  approvalShown = key;
+  clearInterval(approvalTimer);
+  approvalEscape = null;
+  document.getElementById("approval")?.remove();
+  if (!approval) return;
+
+  let dialog;
+  let sending = false;
+  const answer = (approve) => async () => {
+    if (sending || !answerable) return;
+    sending = true;
+    refuse.disabled = accept.disabled = true;
+    try {
+      await invoke("approval_answer", { id: approval.id, approve });
+    } catch (error) {
+      // Still up, to try again (or to refuse); the hub's own timeout is a No anyway
+      sending = false;
+      refuse.disabled = accept.disabled = false;
+      fail(error);
+      return;
+    }
+    clearInterval(approvalTimer);
+    approvalEscape = null;
+    dialog.remove();
+    toast(t("approvalSent"));
+  };
+  const refuse = h("button", { class: "btn yellow chunk-bright press", onclick: answer(false) }, t("approvalRefuse"));
+  const accept = h("button", { class: "btn dark chunk press danger", onclick: answer(true) }, t("approvalAccept"));
+  refuse.disabled = accept.disabled = !answerable;
+  approvalEscape = answer(false);
+
+  const text = h("textarea", { class: "approval-text mono", readonly: true, spellcheck: "false", "aria-label": approval.title });
+  text.value = approval.text;
+  const expires = h("p", { class: "note" });
+  const tick = () => {
+    expires.textContent = t("approvalExpires", { time: countdown(approval.expiresAt - Date.now()) });
+  };
+  tick();
+  approvalTimer = setInterval(tick, 1000);
+
+  dialog = h("div", { id: "approval", class: "overlay" },
+    h("div", { class: "card chunk dialog", role: "alertdialog", "aria-modal": "true", "aria-labelledby": "approvalTitle" },
+      h("span", { class: "label" }, t("approvalLabel")),
+      h("h2", { class: "display approval-title", id: "approvalTitle" }, approval.title),
+      h("p", { class: "note approval-ask" }, t("approvalAsk")),
+      text,
+      answerable ? null : h("p", { class: "note bad" }, t("approvalCannotAnswer")),
+      h("div", { class: "actions" }, h("span", { class: "grow" }), accept, refuse),
+      expires));
+  document.body.append(dialog);
+  refuse.focus();
+}
+
 ui.app = await invoke("app_info").catch(() => ui.app);
 // Listening first: a download finishing between the two would otherwise never show
 await listen("update-ready", (event) => {
@@ -1388,6 +1492,8 @@ await start({
     // An open dialog is redrawn in the new language
     choiceShown = null;
     renderChoice();
+    approvalShown = null;
+    renderApproval();
   },
   onState: (payload) => {
     const wasOnline = ui.hub.online;
@@ -1403,6 +1509,7 @@ await start({
     if (wasOnline !== payload.online) contentKey = "";
     renderMain();
     renderChoice();
+    renderApproval();
   },
 });
 await listen("navigate", (event) => {

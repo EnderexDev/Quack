@@ -14,6 +14,10 @@ import type { DaemonStatus } from "../hubLink.js";
 import { clearHubLock, folderOwner, isAlive, readHubLock, stopOwner, writeHubLock, type FolderOwner, type HubLock } from "./owners.js";
 import { loadRegistry, saveRegistry, type Registry } from "./registry.js";
 import { HubQueues, QueueError } from "../queue/hubQueues.js";
+import { APP_HEADER, APPROVAL_TOKEN_HEADER, AppApprovals, type Approver } from "../cloud/approve.js";
+import { runCloudOp, type CloudContext } from "../cloud/ops.js";
+import { Vault, type Dpapi } from "../cloud/vault.js";
+import { RobloxError, robloxEnv, type RobloxEnv } from "../control/roblox.js";
 import type { StudioPort, Timings } from "../queue/queue.js";
 
 /**
@@ -58,6 +62,12 @@ export interface HubOptions {
   daemonStartTimeoutMs?: number;
   /** The Studio queue's own timings and clock (tests) */
   queue?: { timings?: Partial<Timings>; tickMs?: number; settingsFile?: string; alive?: (pid: number) => boolean };
+  /**
+   * Open Cloud. appExe: Quack's app, started with --hidden when a write waits and no app polls
+   * this hub (main.ts finds it next to the bundled hub). Tests: the vault's DPAPI, the approver
+   * itself, how the app is launched, the approval's timeout, Roblox's web.
+   */
+  cloud?: { dpapi?: Dpapi; approve?: Approver; appExe?: string; launchApp?: (exe: string) => void; approvalTimeoutMs?: number; env?: Partial<RobloxEnv> };
 }
 
 /** A daemon the last hub left running that this one replaces instead of adopting */
@@ -297,6 +307,35 @@ export class QuackHub {
       ...(options.queue?.settingsFile ? { settingsFile: options.queue.settingsFile } : {}),
       ...(options.queue?.alive ? { alive: options.queue.alive } : {}),
     });
+    this.approvals = new AppApprovals({
+      appExe: options.cloud?.appExe,
+      launch: options.cloud?.launchApp,
+      timeoutMs: options.cloud?.approvalTimeoutMs,
+      log: (line) => this.log(line),
+    });
+    // Open Cloud: the key is decrypted here and nowhere else (src/cloud/vault.ts)
+    const dataDir = path.dirname(options.registryFile);
+    const vault = new Vault(dataDir, options.cloud?.dpapi);
+    const variables = options.cloud?.env?.env ?? process.env;
+    this.cloud = {
+      env: robloxEnv(dataDir, {
+        ...options.cloud?.env,
+        // The vault first; a key in the hub's own environment (CI, a machine with no DPAPI) after
+        apiKey: async () => (await vault.get()) ?? (variables.ROBLOX_OPEN_CLOUD_API_KEY?.trim() || undefined),
+        dpapi: options.cloud?.dpapi,
+      }),
+      approve: options.cloud?.approve ?? this.approvals.approver(),
+      log: (line) => this.log(line),
+    };
+  }
+
+  private readonly cloud: CloudContext;
+  /** The writes waiting for the user's answer in the app, and the token only the app holds */
+  private readonly approvals: AppApprovals;
+
+  /** The app's approval token, read from this hub's stdin (main.ts --token-stdin) */
+  setApprovalToken(token: string): boolean {
+    return this.approvals.setToken(token);
   }
 
   /**
@@ -439,6 +478,7 @@ export class QuackHub {
   async stop(options: { handoff?: boolean; replaceDaemons?: boolean } = {}): Promise<void> {
     this.stopping = true;
     this.queues.stop();
+    this.approvals.close();
     // A start or replacement already under way finishes first, so its daemon is in the list below
     await Promise.allSettled([...this.replacing.values()]);
     await Promise.allSettled([...this.starting.values()]);
@@ -678,7 +718,7 @@ export class QuackHub {
     return {
       build: BUNDLED_BUILD ?? "dist",
       // What this hub can do beyond syncing: clients look here before using an API
-      capabilities: ["queue"],
+      capabilities: ["queue", "approvals"],
       queues: this.queues.summary(),
       startedAt: this.startedAt,
       paused: this.paused,
@@ -688,6 +728,8 @@ export class QuackHub {
       // A place registered after its refusal is no longer refused
       refused: [...this.refusals.values()].filter((r) => !registry.places[r.placeId]).sort((a, b) => b.at - a.at),
       ai: this.aiSummaryFresh(now),
+      // Writes waiting for the user's answer in the app (GET /api/approvals has them)
+      approvals: this.approvals.list().length,
     };
   }
 
@@ -782,7 +824,13 @@ export class QuackHub {
           case "/api/sessions":
             return send(200, { sessions: this.listSessions() });
           case "/api/state":
+            // The app's own poll: an app is there to ask the user, no need to start one
+            if (req.headers[APP_HEADER] === "1") this.approvals.sawApp();
             return send(200, this.state());
+          case "/api/approvals":
+            // Open: a question holds only what its asker sent. `answerable`: the token sent
+            // with this call is this hub's (the app learns whether its answers will count)
+            return send(200, { approvals: this.approvals.list(), tokenSet: this.approvals.hasToken(), answerable: this.approvals.tokenMatches(req.headers[APPROVAL_TOKEN_HEADER]) });
           case "/api/log": {
             const from = q.get("from");
             const offset = from === null ? undefined : Number(from);
@@ -835,7 +883,8 @@ export class QuackHub {
       let size = 0;
       const chunks: Buffer[] = [];
       // A Studio tool call carries Luau code
-      const maxBody = url.pathname === "/api/studio" || url.pathname === "/api/queue/submit" ? STUDIO_BODY_BYTES : MAX_BODY_BYTES;
+      // A cloud call can carry a player's whole save
+      const maxBody = url.pathname === "/api/studio" || url.pathname === "/api/queue/submit" || url.pathname === "/api/cloud" ? STUDIO_BODY_BYTES : MAX_BODY_BYTES;
       req.on("data", (chunk: Buffer) => {
         size += chunk.length;
         if (size > maxBody) {
@@ -856,6 +905,16 @@ export class QuackHub {
             throw new ApiError(400, "body is not JSON");
           }
           if (!body || typeof body !== "object") throw new ApiError(400, "body must be an object");
+          if (url.pathname === "/api/approvals/answer") {
+            // Only the app answers: any local program can call this API, so the answer carries
+            // the token the app gave this hub on its stdin
+            if (!this.approvals.tokenMatches(req.headers[APPROVAL_TOKEN_HEADER])) throw new ApiError(403, "only Quack's app answers a write");
+            if (typeof body.id !== "string") throw new ApiError(400, "id is required");
+            if (typeof body.approve !== "boolean") throw new ApiError(400, "approve must be true or false");
+            if (!this.approvals.answer(body.id, body.approve)) throw new ApiError(404, "that write is no longer waiting");
+            this.log(`Approval ${body.id}: ${body.approve ? "accepted" : "refused"} in the app`);
+            return send(200, { ok: true });
+          }
           if (url.pathname === "/api/shutdown" && this.options.onShutdownRequest) {
             const handoff = body.handoff === true;
             const replaceDaemons = handoff && body.replaceDaemons === true;
@@ -876,6 +935,20 @@ export class QuackHub {
           }
           if (url.pathname.startsWith("/api/queue")) {
             return send(200, this.queues.handlePost(url.pathname, body));
+          }
+          if (url.pathname === "/api/cloud") {
+            // One named Open Cloud operation, run with the key only this process holds; a
+            // Roblox refusal or a pending upload is an answer, not a hub failure
+            if (typeof body.op !== "string") throw new ApiError(400, "op is required");
+            const args = body.args && typeof body.args === "object" && !Array.isArray(body.args) ? body.args : {};
+            runCloudOp(this.cloud, body.op, args).then(
+              (result) => send(200, { result }),
+              (error) => {
+                if (error instanceof RobloxError) send(200, { error: error.message, ...(error.pending ? { pending: true } : {}) });
+                else fail(error);
+              },
+            );
+            return;
           }
           if (url.pathname === "/api/unsynced") {
             const session = this.playSession(typeof body.placeId === "string" ? body.placeId : null);

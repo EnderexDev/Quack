@@ -98,6 +98,33 @@ export class FileWriter {
     this.liveDir = fn;
   }
 
+  // Quack: told of every script file this writer really writes or removes (not one it left as it
+  // was), with the text written (null for a removal) and what the file held just before
+  private writeRecorder: ((filePath: string, written: string | null, before: string | undefined) => void) | null = null;
+
+  /** The daemon notes each write as Studio's, for `changes` */
+  public setWriteRecorder(fn: (filePath: string, written: string | null, before: string | undefined) => void): void {
+    this.writeRecorder = fn;
+  }
+
+  private noteWrite(filePath: string, written: string | null, before: string | undefined): void {
+    try {
+      this.writeRecorder?.(filePath, written, before);
+    } catch (error) {
+      log.warn(`Could not note the write of ${this.getRelativePath(filePath)}:`, error);
+    }
+  }
+
+  /** A file's text before this writer removes it, read only when someone notes writes */
+  private textBeforeRemoval(filePath: string): string | undefined {
+    if (!this.writeRecorder) return undefined;
+    try {
+      return fs.readFileSync(filePath, "utf-8");
+    } catch {
+      return undefined;
+    }
+  }
+
   // Quack: files and folders this writer removed, by path, with when. The watcher's suppression
   // lasts 1 s, but the OS can drop the event and a rescan delivers it later: in the Anime Astral
   // copy (06/11/26) a renamed script's old file came back 1.8 s after its removal, was read as
@@ -195,8 +222,10 @@ export class FileWriter {
         // Quack: skip files already identical, as writeScript does. A reconnect to a big game
         // rewrote all 1380 scripts (1.6 s) and woke every editor and luau-lsp watching them.
         let onDisk: string | undefined;
+        let raw: string | undefined;
         try {
-          onDisk = diskText(fs.readFileSync(filePath, "utf-8"));
+          raw = fs.readFileSync(filePath, "utf-8");
+          onDisk = diskText(raw);
         } catch (error) {
           onDisk = undefined;
           // Missing is fine to write; unreadable is not, when the disk may hold a newer edit
@@ -217,6 +246,7 @@ export class FileWriter {
         } else if (changed) {
           writeFileAtomic(filePath, node.source!);
           log.script(this.getRelativePath(filePath), "updated");
+          this.noteWrite(filePath, node.source!, raw);
         }
 
         this.fileMappings.set(node.guid, {
@@ -260,13 +290,15 @@ export class FileWriter {
       // Quack: the same text with CRLF (git wrote it) counts as unchanged; rewriting it as LF
       // left git showing the file modified with no content change, which blocked the next merge
       const existed = fs.existsSync(filePath);
+      const before = existed ? fs.readFileSync(filePath, "utf-8") : undefined;
       const unchanged =
         !pathChanged &&
-        existed &&
-        diskText(fs.readFileSync(filePath, "utf-8")) === diskText(node.source ?? "");
+        before !== undefined &&
+        diskText(before) === diskText(node.source ?? "");
       if (!unchanged) {
         writeFileAtomic(filePath, node.source);
         log.script(this.getRelativePath(filePath), existed ? "updated" : "created");
+        this.noteWrite(filePath, node.source, before);
       }
 
       // If the target path changed for this guid, remove the old file to avoid stale copies
@@ -275,7 +307,9 @@ export class FileWriter {
         // for a user-initiated removal (which would delete the instance in Studio).
         this.suppressEvent(previousPath, "unlink");
         this.noteRemoved(previousPath);
+        const oldText = this.textBeforeRemoval(previousPath);
         fs.unlinkSync(previousPath);
+        this.noteWrite(previousPath, null, oldText);
         this.pathToGuid.delete(path.resolve(previousPath));
         this.cleanupParentsIfEmpty(path.dirname(previousPath));
       }
@@ -545,8 +579,10 @@ export class FileWriter {
       try {
         this.suppressEvent(normalized, "unlink");
         this.noteRemoved(normalized);
+        const oldText = this.textBeforeRemoval(normalized);
         fs.unlinkSync(normalized);
         log.script(this.getRelativePath(normalized), "deleted");
+        this.noteWrite(normalized, null, oldText);
       } catch (error) {
         log.warn(`Failed to delete file ${filePath}:`, error);
         deleted = false;

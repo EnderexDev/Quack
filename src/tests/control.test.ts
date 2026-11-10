@@ -5,16 +5,27 @@ import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { PassThrough } from "node:stream";
 import { runControl, type ControlContext } from "../control/commands.js";
 import { serveMcp } from "../control/mcp.js";
 import { instructions, rule } from "../control/rule.js";
+import { checkTool, guardAnswer } from "../control/guard.js";
+import { installGuard, installRule } from "../control/connect.js";
 import { flavorInfo, HubClient, type Flavor } from "../control/hubClient.js";
 import { QuackHub } from "../hub/hub.js";
 import { removeDir } from "./removeDir.js";
 import { saveRegistry } from "../hub/registry.js";
+import { Vault, type Dpapi } from "../cloud/vault.js";
+
+/** DPAPI stand-in: reversible, never the key's own bytes on disk */
+const fakeDpapi: Dpapi = {
+  protect: async (b) => Buffer.from([...b].reverse().map((x) => x ^ 0x5a)),
+  unprotect: async (b) => Buffer.from([...b].map((x) => x ^ 0x5a).reverse()),
+};
+import { buildRoblox, samplePlace } from "./rbxlFixture.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const daemonCli = path.join(here, "..", "cli.js");
@@ -430,7 +441,7 @@ function mcpSession(port: number, cwd = os.tmpdir()) {
 }
 
 /** The eight Studio calls an AI makes most (a month of chrrxs use, 08/11/26), by the same names, then a click by path, a wait and a recording */
-const STUDIO_TOOLS = ["eval_server_runtime", "eval_client_runtime", "execute_luau", "solo_playtest", "capture_screenshot", "get_runtime_logs", "simulate_keyboard_input", "set_device_simulator", "click_gui", "wait_for", "record", "inspect_gui", "verify_sync", "perf_sample", "set_logpoint", "export_rbxm", "import_rbxm", "find_instances", "inspect_instance", "set_properties", "simulate_conditions", "script_tabs", "capture_devices", "test_profile", "simulate_mouse_input", "get_roblox_docs", "search_assets", "get_asset_details", "get_asset_thumbnail", "preview_asset", "insert_asset", "upload_asset", "get_memory_breakdown", "capture_script_profiler", "get_scene_analysis"];
+const STUDIO_TOOLS = ["eval_server_runtime", "eval_client_runtime", "execute_luau", "solo_playtest", "capture_screenshot", "get_runtime_logs", "simulate_keyboard_input", "set_device_simulator", "click_gui", "wait_for", "record", "inspect_gui", "verify_sync", "studio_changes", "perf_sample", "set_logpoint", "export_rbxm", "import_rbxm", "find_instances", "inspect_instance", "set_properties", "simulate_conditions", "script_tabs", "capture_devices", "test_profile", "simulate_mouse_input", "get_roblox_docs", "search_assets", "get_asset_details", "get_asset_thumbnail", "preview_asset", "insert_asset", "upload_asset", "get_memory_breakdown", "capture_script_profiler", "get_scene_analysis", "capture_micro_profiler", "get_request_status", "get_place_info", "list_place_versions", "download_place", "open_place", "selection", "generate_model", "badges", "developer_products", "game_passes", "localization", "analytics_query", "move_player", "get_universe", "update_universe", "restart_servers", "publish_message", "memory_store_sorted_map", "memory_store_queue", "flush_memory_store", "ordered_data_store", "user_restriction", "datastore", "experience_config", "cloud_permissions", "luau_run"];
 
 test("mcp: initialize carries the instructions, and the tools are the reading ones, wait, play and the Studio tools", { timeout: 15000 }, async () => {
   const mcp = mcpSession(await freePort());
@@ -460,14 +471,16 @@ test("rule: one text for the CLI, the app and the MCP, between markers carrying 
   assert.equal(plain.code, 0);
   const dev = rule(flavorInfo("dev"));
   assert.equal(plain.out, dev.text, "no hub needed");
-  assert.match(dev.text, new RegExp(`^<!-- quack-rule ${dev.version} -->\\n[\\s\\S]+\\n<!-- /quack-rule -->$`));
+  // Each flavor has its own markers, so Dev's rule sits next to the Official's
+  assert.match(dev.text, new RegExp(`^<!-- quackdev-rule ${dev.version} -->\\n[\\s\\S]+\\n<!-- /quackdev-rule -->$`));
   assert.match(dev.version, /^[0-9a-f]{8}$/);
   // An AI that swaps the block cuts at the first end marker: the body must not hold either marker
-  assert.equal(dev.text.split("<!-- /quack-rule -->").length, 2, "one end marker, the last line");
-  assert.equal(dev.text.split("<!-- quack-rule").length, 2, "one start marker, the first line");
+  assert.equal(dev.text.split("<!-- /quackdev-rule -->").length, 2, "one end marker, the last line");
+  assert.equal(dev.text.split("<!-- quackdev-rule").length, 2, "one start marker, the first line");
   assert.equal(rule({ ...flavorInfo("dev"), port: 1 }).version, dev.version, "the port is not part of the rule");
   const official = rule(flavorInfo("official"));
   assert.notEqual(official.version, dev.version);
+  assert.match(official.text, new RegExp(`^<!-- quack-rule ${official.version} -->\\n[\\s\\S]+\\n<!-- /quack-rule -->$`));
   assert.match(official.text, /`quack --help`/);
   assert.ok(!/quackdev/.test(official.text), "Official names only its own command");
   for (const tool of ["status", "wait", "verify_sync", "conflicts", "solo_playtest", "eval_server_runtime", "execute_luau", "click_gui", "wait_for", "set_logpoint", "perf_sample", "play", "test_profile", "get_roblox_docs", "search_assets", "preview_asset", "insert_asset", "upload_asset", "capture_script_profiler", "get_memory_breakdown", "get_scene_analysis"]) {
@@ -546,6 +559,220 @@ test("mcp: no hub running is a tool error that says so, and the real command spe
   const messages = stdout.split("\n").filter(Boolean).map((line) => JSON.parse(line));
   assert.deepEqual(messages.map((m) => m.id).sort(), [1, 2]);
   assert.equal(messages.find((m) => m.id === 2).result.tools.length, 7 + STUDIO_TOOLS.length);
+});
+
+test("Quack's guard refuses the vault, the approval token, DPAPI, the vault's code and automating the app, and nothing else", () => {
+  const blocked: [string, Record<string, unknown>][] = [
+    ["Bash", { command: "cat %APPDATA%/quack/open-cloud.key" }],
+    ["PowerShell", { command: "Get-Content $env:APPDATA\\quack\\open-cloud.key" }],
+    ["Bash", { command: "K=$(node -e \"require('fs').readFileSync(process.env.APPDATA+'/quack/open-cloud.key')\")" }],
+    ["Bash", { command: "ALLOW_SECRET=1 type open-cloud.key" }],
+    ["Bash", { command: "grep KEY ~/AppData/Roaming/quack/open-cloud.env" }],
+    ["PowerShell", { command: "[Security.Cryptography.ProtectedData]::Unprotect($b,$e,'CurrentUser')" }],
+    ["Bash", { command: "node --input-type=module -e 'import { Vault } from \"./dist/cloud/vault.js\"; console.log(await new Vault(d).get())'" }],
+    ["Bash", { command: "node <<'EOF'\nconst { Vault } = await import('./dist/cloud/vault.js');\nconsole.log(await new Vault(dir).get());\nEOF" }],
+    ["Read", { file_path: "C:\\Users\\A\\AppData\\Roaming\\quack\\open-cloud.key" }],
+    ["mcp__ide__Read", { file_path: "C:/Users/A/AppData/Roaming/quack/open-cloud.key" }],
+    ["Grep", { pattern: "x", path: "C:/Users/A/AppData/Roaming/quack/open-cloud.key" }],
+    ["Glob", { pattern: "**/approval-token.dpapi" }],
+    ["PowerShell", { command: "$w=New-Object -ComObject WScript.Shell; $w.AppActivate('Quack Dev'); $w.SendKeys('{ENTER}')" }],
+    ["PowerShell", { command: "[System.Windows.Forms.SendKeys]::SendWait('{LEFT}{ENTER}') # the Quack popup" }],
+    ["Bash", { command: "cat $APPDATA/dev.enderex.quack.dev/approval-token.dpapi" }],
+    ["Read", { file_path: "C:\\Users\\A\\AppData\\Roaming\\dev.enderex.quack\\approval-token.dpapi" }],
+    // Wildcards in the name or in the folder
+    ["Bash", { command: "cat ~/AppData/Roaming/quack/open-cloud.*" }],
+    ["Bash", { command: "cat ~/AppData/Roaming/dev.enderex.quack.dev/approval-token*" }],
+    ["Bash", { command: "cat ~/AppData/Roaming/quack/open-c*" }],
+    ["PowerShell", { command: "cd $env:APPDATA\\quack; Get-Content *" }],
+    // A recursive search of the folder, or a Grep from it or above it
+    ["Bash", { command: "grep -r KEY ~/AppData/Roaming/quack" }],
+    ["Bash", { command: "rg . \"$APPDATA/quack/\"" }],
+    ["Grep", { pattern: ".", path: "C:\\Users\\A\\AppData\\Roaming\\quack" }],
+    ["Grep", { pattern: "KEY", path: "C:/Users/A/AppData/Roaming" }],
+    ["Grep", { pattern: "KEY", path: "C:/Users/A" }],
+    ["Grep", { pattern: "KEY", path: "C:\\" }],
+    // PowerShell's encoded command is decoded and checked
+    ["PowerShell", { command: "powershell -EncodedCommand WwBTAGUAYwB1AHIAaQB0AHkALgBDAHIAeQBwAHQAbwBnAHIAYQBwAGgAeQAuAFAAcgBvAHQAZQBjAHQAZQBkAEQAYQB0AGEAXQA6ADoAVQBuAHAAcgBvAHQAZQBjAHQAKAAkAGIALAAkAGUALAAnAEMAdQByAHIAZQBuAHQAVQBzAGUAcgAnACkA" }],
+    ["Bash", { command: "powershell.exe -NoProfile -enc WwBTAGUAYwB1AHIAaQB0AHkALgBDAHIAeQBwAHQAbwBnAHIAYQBwAGgAeQAuAFAAcgBvAHQAZQBjAHQAZQBkAEQAYQB0AGEAXQA6ADoAVQBuAHAAcgBvAHQAZQBjAHQAKAAkAGIALAAkAGUALAAnAEMAdQByAHIAZQBuAHQAVQBzAGUAcgAnACkA" }],
+    // Round 2: a recursive search from above the folders, a path spelled with "." or "..",
+    // a wildcard on the folder's own name, an encoded command inside an encoded command
+    ["Bash", { command: "rg --hidden --no-ignore . C:/Users/ana/AppData/Roaming" }],
+    ["PowerShell", { command: "Get-ChildItem $env:APPDATA -Recurse | Select-String KEY" }],
+    ["Bash", { command: "grep -rn KEY ~" }],
+    ["Bash", { command: "cat C:/Users/ana/AppData/Roaming/quack*/*" }],
+    ["Bash", { command: "cat ~/AppData/Roam*/q*/open*" }],
+    ["Grep", { pattern: ".", path: "C:/Users/ana/AppData/Roaming/." }],
+    ["Grep", { pattern: ".", path: "C:/Users/ana/Documents/../AppData/Roaming" }],
+    // Round 3: every occurrence of a stem, .. inside a shell path, PowerShell's -r, a Windows
+    // path to the search tool, a wildcard spelling AppData itself
+    ["Read", { file_path: "C:/Users/open-cloud/AppData/Roaming/quack/open-cloud.env" }],
+    ["Bash", { command: "rg --hidden . C:/Users/ana/AppData/Roaming/x/.." }],
+    ["PowerShell", { command: "gci $env:APPDATA -r -file | gc" }],
+    ["PowerShell", { command: "Get-ChildItem $env:APPDATA -rec | Get-Content" }],
+    ["PowerShell", { command: "C:\\tools\\rg.exe --hidden --no-ignore . C:\\Users\\ana\\AppData\\Roaming" }],
+    ["Bash", { command: "cat C:/Users/ana/AppDat?/Roaming/quack/*" }],
+    ["Bash", { command: "cat ~/App*/Roaming/x" }],
+    ["PowerShell", { command: "powershell -enc cABvAHcAZQByAHMAaABlAGwAbAAgAC0AZQBuAGMAIABXAHcAQgBUAEEARwBVAEEAWQB3AEIAMQBBAEgASQBBAGEAUQBCADAAQQBIAGsAQQBMAGcAQgBEAEEASABJAEEAZQBRAEIAdwBBAEgAUQBBAGIAdwBCAG4AQQBIAEkAQQBZAFEAQgB3AEEARwBnAEEAZQBRAEEAdQBBAEYAQQBBAGMAZwBCAHYAQQBIAFEAQQBaAFEAQgBqAEEASABRAEEAWgBRAEIAawBBAEUAUQBBAFkAUQBCADAAQQBHAEUAQQBYAFEAQQA2AEEARABvAEEAVgBRAEIAdQBBAEgAQQBBAGMAZwBCAHYAQQBIAFEAQQBaAFEAQgBqAEEASABRAEEASwBBAEEAawBBAEcASQBBAEwAQQBBAGsAQQBHAFUAQQBMAEEAQQBuAEEARQBNAEEAZABRAEIAeQBBAEgASQBBAFoAUQBCAHUAQQBIAFEAQQBWAFEAQgB6AEEARwBVAEEAYwBnAEEAbgBBAEMAawBBAA==" }],
+  ];
+  const allowed: [string, Record<string, unknown>][] = [
+    ["PowerShell", { command: "$w=New-Object -ComObject WScript.Shell; $w.AppActivate('Roblox Studio'); $w.SendKeys('%p')" }],
+    ["Bash", { command: "quackdev cloud check" }],
+    ["Bash", { command: "quackdev datastore get PlayerData 123 PA" }],
+    ["Bash", { command: "npm test" }],
+    ["Bash", { command: "git add src/cloud/vault.ts src/cloud/ops.ts" }],
+    ["Bash", { command: "npx tsc -p . && node --test dist/tests/roblox.test.js" }],
+    // Quack's own source names these files: editing it stays possible
+    ["Write", { file_path: "src/cloud/vault.ts", content: "export const VAULT_FILE = \"open-cloud.key\";" }],
+    ["Edit", { file_path: "src/control/guard.ts", old_string: "approval-token.dpapi", new_string: "x" }],
+    ["Read", { file_path: "src/cloud/vault.ts" }],
+    ["Agent", { prompt: "cat open-cloud.key" }],
+    ["Bash", { command: "cat ~/AppData/Roaming/quack/hub.json" }],
+    ["Bash", { command: "ls ~/AppData/Roaming/quack" }],
+    ["Bash", { command: "grep -rn open-cloud src/cloud" }],
+    ["Grep", { pattern: "Vault", path: "E:/Documents/Dev/Quack" }],
+    ["Grep", { pattern: "Vault" }],
+    ["Grep", { pattern: "Vault", path: "src" }],
+    ["Bash", { command: "rg Vault src/cloud" }],
+    ["Bash", { command: "grep -rn KEY ./src" }],
+    ["Bash", { command: "ls ~/AppData/Local/Roblox/logs" }],
+    // A search pattern is not a path, and /s is an option, not a drive
+    ["Bash", { command: "rg 'AppData.*' src" }],
+    ["Bash", { command: "findstr /s /i Vault src\\*.ts" }],
+    ["Bash", { command: "cmd /c dir /s src" }],
+    ["PowerShell", { command: "Remove-Item dist -Force -ErrorAction SilentlyContinue" }],
+    ["Bash", { command: "ls ~/AppData/Local/Roblox/logs/*.log" }],
+    ["PowerShell", { command: "powershell -EncodedCommand RwBlAHQALQBQAHIAbwBjAGUAcwBzACAAcQB1AGEAYwBrAC0AYQBwAHAA" }],
+  ];
+  for (const [tool, input] of blocked) assert.ok(checkTool(tool, input), `${tool} ${JSON.stringify(input)} should be blocked`);
+  for (const [tool, input] of allowed) assert.equal(checkTool(tool, input), undefined, `${tool} ${JSON.stringify(input)} should pass`);
+
+  // The hook's answer, as Claude Code reads it
+  const deny = JSON.parse(guardAnswer(JSON.stringify({ tool_name: "Read", tool_input: { file_path: "x/open-cloud.key" } })));
+  assert.equal(deny.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(deny.hookSpecificOutput.permissionDecisionReason, /quack-vault-file/);
+  assert.equal(guardAnswer(JSON.stringify({ tool_name: "Bash", tool_input: { command: "ls" } })), "{}");
+  assert.equal(guardAnswer("not json"), "{}");
+  assert.equal(guardAnswer("null"), "{}", "JSON that is not an object answers, never throws");
+  // A long command of near misses answers, and in time linear in its length: the time for 4x the
+  // words stays far from the 16x a pattern that backtracks would take. A ratio, not a budget in
+  // ms, so a slow machine (the release's runner took 625 ms for all of these) cannot fail it
+  const near = [
+    (n: number) => "node Vault ".repeat(n),
+    (n: number) => "Quack ".repeat(n),
+    (n: number) => "open-cloud".repeat(n),
+    (n: number) => "approval-token".repeat(n),
+    (n: number) => `rg x ${"/.".repeat(n)}x`,
+    (n: number) => "-r ".repeat(n) + "x",
+  ];
+  const timeOf = (command: string) => {
+    let best = Infinity;
+    for (let i = 0; i < 3; i++) {
+      const at = performance.now();
+      checkTool("Bash", { command });
+      best = Math.min(best, performance.now() - at);
+    }
+    return best;
+  };
+  for (const make of near) {
+    const small = Math.max(timeOf(make(5000)), 2);
+    const large = timeOf(make(20000));
+    assert.ok(large / small < 9, `${make(2).slice(0, 20)}: ${large.toFixed(1)} ms for 4x the words of ${small.toFixed(1)} ms`);
+  }
+  assert.equal(checkTool("Bash", { command: "node Vault ".repeat(20000) }), undefined);
+  assert.equal(checkTool("Bash", { command: "Quack ".repeat(20000) }), undefined);
+  assert.equal(checkTool("Bash", { command: "open-cloud".repeat(20000) }), undefined);
+  assert.equal(checkTool("Bash", { command: "approval-token".repeat(20000) }), undefined);
+  assert.equal(checkTool("Bash", { command: `rg x ${"/.".repeat(20000)}x` }), undefined);
+  // A session's folder counts as where a Grep without a path starts
+  assert.ok(checkTool("Grep", { pattern: "." }, "C:/Users/ana/AppData/Roaming/quack"));
+  // A shell command runs in the session's folder, or where a cd took it
+  assert.ok(checkTool("Bash", { command: "rg --hidden --no-ignore ." }, "C:/Users/ana/AppData/Roaming"));
+  assert.ok(checkTool("Bash", { command: "cat quack*/*" }, "C:/Users/ana/AppData/Roaming"));
+  assert.ok(checkTool("Bash", { command: "cd C:/Users/ana/AppData/Roaming && cat quack*/*" }));
+  assert.equal(checkTool("Bash", { command: "rg --hidden ." }, "E:/projects/game"), undefined);
+  assert.equal(checkTool("Bash", { command: "-r ".repeat(20000) + "x" }), undefined);
+
+  // The built file a tool call starts, end to end
+  const main = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "control", "guardMain.js");
+  const out = execFileSync(process.execPath, [main], { input: JSON.stringify({ tool_name: "Bash", tool_input: { command: "type open-cloud.key" } }), encoding: "utf8" });
+  assert.equal(JSON.parse(out).hookSpecificOutput.permissionDecision, "deny");
+});
+
+test("installGuard keeps every other hook and key, replaces its own entry, and never writes over a broken file", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-guard-"));
+  try {
+    const file = path.join(dir, "settings.json");
+    const other = { matcher: "Bash", hooks: [{ type: "command", command: "node mine.cjs" }] };
+    fs.writeFileSync(file, JSON.stringify({ model: "x", hooks: { PreToolUse: [other], Stop: [{ hooks: [] }] } }));
+    const guard = { command: "C:\\Program Files\\nodejs\\node.exe", args: ["C:\\Quack Dev\\guard.mjs"] };
+    installGuard(file, "quack-dev", guard);
+    installGuard(file, "quack-dev", guard);
+    installGuard(file, "quack", guard);
+    const written = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(written.model, "x");
+    assert.deepEqual(written.hooks.Stop, [{ hooks: [] }]);
+    assert.deepEqual(written.hooks.PreToolUse[0], other);
+    assert.equal(written.hooks.PreToolUse.length, 3, "one entry per flavor, a second connect replaces it");
+    assert.equal(written.hooks.PreToolUse[1].hooks[0].command, '"C:/Program Files/nodejs/node.exe" "C:/Quack Dev/guard.mjs" --quack-guard quack-dev');
+    fs.writeFileSync(file, "{ broken");
+    assert.throws(() => installGuard(file, "quack-dev", guard), /JSON/);
+    assert.equal(fs.readFileSync(file, "utf8"), "{ broken");
+    const fresh = path.join(dir, "new", "settings.json");
+    installGuard(fresh, "quack", guard);
+    assert.equal(JSON.parse(fs.readFileSync(fresh, "utf8")).hooks.PreToolUse.length, 1);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("installRule puts the rule in CLAUDE.md or AGENTS.md, replaces an older copy where the user keeps it, and touches nothing else", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-rule-"));
+  try {
+    const official = flavorInfo("official");
+    const dev = flavorInfo("dev");
+    const current = rule(official);
+    // A new folder: the file is made with the rule alone
+    installRule(path.join(dir, "fresh"), "claude", official);
+    assert.equal(fs.readFileSync(path.join(dir, "fresh", "CLAUDE.md"), "utf8"), `${current.text}\n`);
+
+    // An instructions file with the user's own text: the rule goes at the end, the text stays
+    const claude = path.join(dir, "claude");
+    fs.mkdirSync(claude);
+    fs.writeFileSync(path.join(claude, "CLAUDE.md"), "# Mine\r\n\r\nKeep this.\r\n");
+    installRule(claude, "claude", official);
+    installRule(claude, "claude", official);
+    const written = fs.readFileSync(path.join(claude, "CLAUDE.md"), "utf8");
+    assert.ok(written.startsWith("# Mine\r\n\r\nKeep this.\r\n\r\n<!-- quack-rule "), "appended after a blank line, the user's text first");
+    assert.equal(written.split("<!-- quack-rule ").length, 2, "a second connect replaces, never adds");
+    assert.ok(!/[^\r]\n/.test(written), "the file's CRLF is kept");
+
+    // Dev's rule sits next to the Official's
+    installRule(claude, "claude", dev);
+    const both = fs.readFileSync(path.join(claude, "CLAUDE.md"), "utf8");
+    assert.equal(both.split("<!-- quack-rule ").length, 2);
+    assert.equal(both.split("<!-- quackdev-rule ").length, 2);
+
+    // An older copy the user keeps in a rule file of their own is replaced there, and only there
+    const packs = path.join(dir, "packs");
+    fs.mkdirSync(path.join(packs, "rules-packs"), { recursive: true });
+    fs.mkdirSync(path.join(packs, "projects", "x"), { recursive: true });
+    fs.writeFileSync(path.join(packs, "CLAUDE.md"), "# Global\n");
+    const old = "---\nfrom: Quack\n---\n<!-- quack-rule 00000000 -->\nold text\n<!-- /quack-rule -->\nafter\n";
+    fs.writeFileSync(path.join(packs, "rules-packs", "quack.md"), old);
+    fs.writeFileSync(path.join(packs, "projects", "x", "log.md"), "<!-- quack-rule 11111111 -->\nnot a rule file\n<!-- /quack-rule -->\n");
+    installRule(packs, "claude", official);
+    assert.equal(fs.readFileSync(path.join(packs, "CLAUDE.md"), "utf8"), "# Global\n", "no second copy in CLAUDE.md");
+    assert.equal(fs.readFileSync(path.join(packs, "rules-packs", "quack.md"), "utf8"), `---\nfrom: Quack\n---\n${current.text}\nafter\n`);
+    assert.match(fs.readFileSync(path.join(packs, "projects", "x", "log.md"), "utf8"), /11111111/, "a client's own data is never searched");
+
+    // Codex: AGENTS.md; Cursor has no rules file
+    installRule(path.join(dir, "codex"), "codex", official);
+    assert.ok(fs.readFileSync(path.join(dir, "codex", "AGENTS.md"), "utf8").includes(current.text));
+    installRule(path.join(dir, "cursor"), "cursor", official);
+    assert.equal(fs.existsSync(path.join(dir, "cursor")), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("connect-ai: Cursor's file keeps every other server and key, a broken one is never overwritten, a missing CLI is not installed", { timeout: 30000 }, async () => {
@@ -636,7 +863,7 @@ test("connect-ai reaches every config folder: the default, ~/.claude-*, ~/.codex
     // This process runs inside one of them, as a T3 session does: the default must still be the default
     process.env.CLAUDE_CONFIG_DIR = proxy;
     const clients = { home, claudeBin: path.join(bin, "claude.cmd"), codexBin: path.join(bin, "codex.cmd"), env: {}, t3Settings };
-    const server = { command: process.execPath, args: ["cli.mjs", "--flavor", "official", "mcp"] };
+    const server = { command: process.execPath, args: ["cli.mjs", "--flavor", "official", "mcp"], guard: { command: process.execPath, args: ["C:\\Quack\\guard.mjs"] } };
     const run = async (...argv: string[]) => {
       const out: string[] = [];
       const code = await runControl([...argv, "--json"], {
@@ -664,6 +891,23 @@ test("connect-ai reaches every config folder: the default, ~/.claude-*, ~/.codex
     assert.ok(stored(proxy).quack);
     assert.ok(stored(work).quack);
     assert.ok(stored(`${process.env.QUACK_FAKE_DEFAULT}-codex`).quack);
+    // Quack's guard goes in each Claude Code folder's settings.json, next to what was there
+    const settings = (dir: string) => JSON.parse(fs.readFileSync(path.join(dir, "settings.json"), "utf8"));
+    assert.equal(settings(proxy).env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8317", "the folder's own settings stay");
+    for (const dir of [proxy, t3Claude, path.join(home, ".claude")]) {
+      const entries = settings(dir).hooks.PreToolUse;
+      assert.equal(entries.length, 1, dir);
+      assert.match(entries[0].hooks[0].command, /"C:\/Quack\/guard\.mjs" --quack-guard quack$/);
+      assert.match(entries[0].matcher, /Bash/);
+    }
+    assert.equal(fs.existsSync(path.join(work, "settings.json")), false, "Codex gets no Claude Code hook");
+    assert.ok(all.clients.filter((c) => c.client === "claude").every((c) => c.guarded), "ai-clients reads the guard back");
+    // and the rule in each Claude Code folder's CLAUDE.md and each Codex folder's AGENTS.md
+    const officialRule = rule(flavorInfo("official")).text;
+    for (const file of [path.join(proxy, "CLAUDE.md"), path.join(t3Claude, "CLAUDE.md"), path.join(home, ".claude", "CLAUDE.md"), path.join(work, "AGENTS.md"), path.join(home, ".codex", "AGENTS.md")]) {
+      assert.ok(fs.readFileSync(file, "utf8").includes(officialRule), file);
+    }
+    assert.ok(all.clients.filter((c) => c.client !== "cursor").every((c) => c.rule === "current"), "ai-clients reads the rule back");
   } finally {
     if (savedDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
     else process.env.CLAUDE_CONFIG_DIR = savedDir;
@@ -838,6 +1082,200 @@ test("Studio tools on assets, memory, the profiler and scene analysis: the termi
   });
 });
 
+test("import: the terminal and the MCP read a place file with no Studio call, then send only the paths asked for, and say what came and what stayed out", { timeout: 60000 }, async () => {
+  await withHub(async ({ port, folders }) => {
+    const seen: { role: string; tool: string; args: any }[] = [];
+    const fake = toolStudio(port, 111, (role, tool, args) => {
+      seen.push({ role, tool, args });
+      if (tool === "importPicks") return { placed: args.picks.map((p: any) => `${p.into}.${p.names.at(-1)} (${p.className})`), scripts: 1, alreadyThere: [] };
+      throw new Error(`${tool} is not faked`);
+    });
+    const run = control(port, { cwd: path.join(folders["111"], "sync") });
+    await waitFor(async () => (await run("status", "--json")).json().sessions[0]?.instances === 3);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-import-"));
+    const file = path.join(dir, "v84.rbxl");
+    fs.writeFileSync(file, buildRoblox(samplePlace()));
+
+    const listed = await run("import", file, "--list");
+    assert.equal(listed.code, 0, listed.err);
+    assert.match(listed.out, /^A place of 20 instances\.\nTop-level items \(each service's children\): 7\n {2}Workspace\.MapA \(Model\): 2 below, 1 script\(s\)/);
+    assert.match(listed.out, /Scripts: 3\n {2}Workspace\.MapA\.Door \(Script\)/);
+    assert.equal(seen.length, 0, "list calls no Studio");
+
+    const refused = await run("import", file, "--paths", "Workspace.MapA,StarterGui.Shop");
+    assert.equal(refused.code, 1);
+    assert.match(refused.err, /what you picked holds 1 script\(s\).*Workspace\.MapA\.Door \(Script\)/);
+    const done = await run("import", file, "--paths", "Workspace.MapA,StarterGui.Shop", "--scripts");
+    assert.equal(done.code, 0, done.err);
+    assert.deepEqual(seen.at(-1)!.args.picks.map((p: any) => p.into), ["Workspace", "StarterGui"]);
+    assert.match(done.out, /^Put Workspace\.MapA \(Model\), StarterGui\.Shop \(ScreenGui\) in the place; its 1 script\(s\) sync to disk/);
+    assert.match(done.out, /\nLeft out of the file: Workspace\.My\.Map, Workspace\.Baseplate, ReplicatedStorage\.Config, StarterPlayer\.StarterPlayerScripts, Lighting\.Sky\nScripts that came: Workspace\.MapA\.Door \(Script\)/);
+
+    const mcp = mcpSession(port, path.join(folders["111"], "sync"));
+    const viaMcp = await mcp.tool("import_rbxm", { file, paths: ["Workspace.My.Map"] });
+    assert.equal(viaMcp.isError, undefined, viaMcp.content[0].text);
+    assert.deepEqual(seen.at(-1)!.args.picks, [{ names: ["Workspace", "My.Map"], className: "Model", count: 1, into: "Workspace" }]);
+    assert.match((await mcp.tool("import_rbxm", { file, list: true })).content[0].text, /^A place of 20 instances/);
+    assert.match((await mcp.tool("import_rbxm", { file, paths: ["A,B"] })).content[0].text, /paths must be a list of paths in the file, none with a comma/);
+    await mcp.close();
+    fake.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+// What only chrrxs had (09/11/26): the MicroProfiler, a timed-out call's answer, the place, the
+// selection, model generation, opening a place file
+test("Studio tools chrrxs alone had: micro, result, place info, selection and generate reach the right peer; a refusal comes before Studio", { timeout: 60000 }, async () => {
+  await withHub(async ({ port, folders }) => {
+    const seen: { role: string; tool: string; args: any }[] = [];
+    let slowExec: Promise<void> | undefined;
+    const fake = toolStudio(port, 111, async (role, tool, args) => {
+      seen.push({ role, tool, args });
+      if (tool === "playState") return { editModeActive: true };
+      if (tool === "exec") {
+        if (slowExec) await slowExec;
+        return { ok: true, values: ["7"], output: ["late print"] };
+      }
+      if (tool === "micro") {
+        return {
+          durationMs: args.durationMs, bytes: 1000, sort: args.sort,
+          frames: { count: 60, firstId: 1, lastId: 60, msAvg: 16.7, msP50: 16.6, msP90: 17, msP99: 33, msMax: 40, over50ms: 0, slowest: [{ id: 12, absoluteId: 9012, ms: 40 }] },
+          timers: [{ rank: 1, name: "Physics", group: "Physics", selfMsPerFrame: 2.5, inclusiveMsPerFrame: 4, maxFrameMs: 9, calls: 60 }],
+          groups: [{ name: "Physics", selfMsPerFrame: 2.5, pct: 40 }], threads: [{ name: "Main", busyMsPerFrame: 10 }], steps: 1000,
+        };
+      }
+      if (tool === "placeInfo") return { placeId: 111, gameId: 9, creatorId: 5, creatorType: "User", placeVersion: 85, dataModelName: "Alpha", name: "Alpha Game", editMode: true, streamingEnabled: false, gravity: 196.2 };
+      if (tool === "selection") {
+        if (args.action === "view") return { action: "view", framed: 1, center: [0, 5, 0], size: [4, 4, 4], camera: [10, 10, 10], distance: 12 };
+        return { action: args.action, selected: (args.paths ?? ["Workspace.Part"]).map((p: string) => ({ path: p, className: "Part" })), count: (args.paths ?? ["x"]).length };
+      }
+      if (tool === "generate") return { path: `Workspace.${args.name ?? "GeneratedModel"}`, seconds: 118, parts: [{ name: "body_geom", size: [4, 4, 4], meshId: "rbxassetid://1" }], size: [4, 4, 4] };
+      throw new Error(`${tool} is not faked`);
+    });
+    const run = control(port, { cwd: path.join(folders["111"], "sync") });
+    await waitFor(async () => (await run("status", "--json")).json().sessions[0]?.instances === 3);
+
+    // micro: edit mode with no play; the focus goes as --mode
+    const profiled = await run("micro", "--ms", "300", "--mode", "physics");
+    assert.equal(profiled.code, 0, profiled.err);
+    assert.deepEqual([seen.at(-1)!.role, seen.at(-1)!.tool, seen.at(-1)!.args.durationMs, seen.at(-1)!.args.focus], ["edit", "micro", 300, "physics"]);
+    // No frames asked: the plugin reads the ones that cover durationMs, not the whole buffer (in PA
+    // a default of 256 took in an earlier capture's frames)
+    assert.equal(seen.at(-1)!.args.frames, undefined);
+    assert.ok((await run("micro", "--frames", "40")).code === 0 && seen.at(-1)!.args.frames === 40);
+    assert.match(profiled.out, /^MicroProfiler in the edit plugin for 300 ms: 60 frames .* p99 33, max 40; 0 over 50 ms\nSlowest frames: 40 ms \(id 12, absolute 9012\)/);
+    assert.match(profiled.out, /  1\.      2\.5 \/        4 \/       9 \/     60  Physics \[Physics\]/);
+    assert.match((await run("micro", "--out", "x.json")).err, /--out must be a \.mpz file/);
+    assert.match((await run("micro", "--ms", "9000")).err, /durationMs must be a whole number from 100 to 5000/);
+
+    // place info and the selection
+    const info = await run("place", "info");
+    assert.equal(info.code, 0, info.err);
+    assert.match(info.out, /^Alpha Game \(place 111, experience 9\), version 85, owned by user 5\nStudio is in edit mode/);
+    const set = await run("selection", "set", "Workspace.A,Workspace.B", "--mode", "add");
+    assert.equal(set.code, 0, set.err);
+    assert.deepEqual(seen.at(-1)!.args, { action: "set", paths: ["Workspace.A", "Workspace.B"], mode: "add" });
+    assert.match(set.out, /^2 selected:\n  Workspace\.A \(Part\)/);
+    const view = await run("selection", "view", "Workspace.Map", "--from=-90", "--angle", "20");
+    assert.equal(view.code, 0, view.err);
+    assert.deepEqual([seen.at(-1)!.args.path, seen.at(-1)!.args.from, seen.at(-1)!.args.angleY], ["Workspace.Map", -90, 20]);
+    assert.match((await run("selection", "view", "--angle", "120")).err, /angleY must be a number from -89 to 89/);
+
+    // generate: the prompt, the size and where it goes
+    const made = await run("generate", "a wooden crate", "--size", "4,4,4", "--name", "Crate");
+    assert.equal(made.code, 0, made.err);
+    assert.deepEqual([seen.at(-1)!.args.prompt, seen.at(-1)!.args.size, seen.at(-1)!.args.name], ["a wooden crate", [4, 4, 4], "Crate"]);
+    assert.match(made.out, /^Generated Workspace\.Crate in 118 s: 1 mesh part\(s\), 4 x 4 x 4 studs; anchored, one undo step, selected\./);
+    assert.match((await run("generate")).err, /usage: generate <prompt>/);
+    assert.match((await run("generate", "x", "--size", "1,2")).err, /--size must be <x>,<y>,<z>/);
+
+    // result: a timed-out exec's answer, read after it came
+    let release!: () => void;
+    slowExec = new Promise<void>((r) => (release = r));
+    const timedOut = await run("exec", "--code=return 7", "--timeout", "0.5");
+    assert.equal(timedOut.code, 1);
+    const id = /Request ([0-9a-f]{12})/.exec(timedOut.err)?.[1];
+    assert.ok(id, timedOut.err);
+    assert.match((await run("result", id!)).out, new RegExp(`^Request ${id} \\(exec to the edit plugin\\): no answer yet`));
+    release();
+    slowExec = undefined;
+    await waitFor(async () => (await run("result", id!, "--json")).json().state === "answered");
+    assert.match((await run("result", id!)).out, new RegExp(`^Request ${id} \\(exec to the edit plugin\\): answered, \\d+ s after its timeout\\.\\nlate print\\n=> 7$`));
+    assert.match((await run("result", "0123456789ab")).out, /^Request 0123456789ab: unknown/);
+
+    // The MCP: the same tools by chrrxs's names
+    const mcp = mcpSession(port, path.join(folders["111"], "sync"));
+    const micro = await mcp.tool("capture_micro_profiler", { focus: "render", sort: "inclusive", durationMs: 200 });
+    assert.equal(micro.isError, undefined, micro.content[0].text);
+    assert.deepEqual([seen.at(-1)!.args.focus, seen.at(-1)!.args.sort, seen.at(-1)!.args.durationMs], ["render", "inclusive", 200]);
+    assert.match((await mcp.tool("capture_micro_profiler", { focus: "gpu" })).content[0].text, /focus must be all, script/);
+    assert.match((await mcp.tool("get_request_status", { id })).content[0].text, /answered/);
+    assert.match((await mcp.tool("get_place_info", {})).content[0].text, /^Alpha Game \(place 111/);
+    const cleared = await mcp.tool("selection", { action: "set", paths: [] });
+    assert.equal(cleared.isError, undefined, cleared.content[0].text);
+    assert.deepEqual(seen.at(-1)!.args.paths, []);
+    assert.match((await mcp.tool("selection", { action: "view", path: "Map" })).content[0].text, /path must be an instance path/);
+    const generated = await mcp.tool("generate_model", { prompt: "-- a crate starting with dashes", position: [1, 2, 3] });
+    assert.equal(generated.isError, undefined, generated.content[0].text);
+    assert.deepEqual([seen.at(-1)!.args.prompt, seen.at(-1)!.args.position], ["-- a crate starting with dashes", [1, 2, 3]]);
+    assert.match((await mcp.tool("generate_model", {})).content[0].text, /give a prompt, an image, or both/);
+    assert.match((await mcp.tool("open_place", { file: "C:\\x.txt" })).content[0].text, /file must be an \.rbxl/);
+    await mcp.close();
+    fake.close();
+  });
+});
+
+test("move and a live find: the terminal and the MCP reach the play through the hub, a position that starts with - goes as --at=, and a refusal comes before Studio", { timeout: 60000 }, async () => {
+  await withHub(async ({ port, folders }) => {
+    const seen: { role: string; tool: string; args: any }[] = [];
+    const fake = toolStudio(port, 111, async (role, tool, args) => {
+      seen.push({ role, tool, args });
+      if (tool === "playState") return { editModeActive: false };
+      if (tool === "move") return { how: args.mode, player: "Ender", owner: "server", target: args.path, goal: args.position ?? [0, 5, 0], from: [9, 3, 9], at: args.position ?? [0, 5, 0], distanceLeft: 0.4, heightLeft: 0, stopped: args.mode === "teleport" ? "teleported" : "arrived", arrived: true, seconds: 1.5, walkSpeed: 16, timeoutSeconds: args.seconds, ...(args.mode === "path" ? { waypoints: 7 } : {}) };
+      if (tool === "find") return { found: [{ path: "Workspace.Enemies.Boss", className: "Model", attributes: 2 }], total: 1, scanned: 900, classMatch: args.classes ? "IsA" : undefined, seconds: 0.01 };
+      throw new Error(`${tool} is not faked`);
+    });
+    const run = control(port, { cwd: path.join(folders["111"], "sync") });
+    await waitFor(async () => (await run("status", "--json")).json().sessions[0]?.instances === 3);
+    assert.match((await run("move", "--at=1,2,3")).err, /no play is running/);
+    await fake.play("server");
+    await fake.play("client");
+
+    const teleported = await run("move", "--at=-5,0,2.5");
+    assert.equal(teleported.code, 0, teleported.err);
+    assert.deepEqual([seen.at(-1)!.role, seen.at(-1)!.tool, seen.at(-1)!.args], ["server", "move", { mode: "teleport", position: [-5, 0, 2.5], seconds: 15 }]);
+    assert.match(teleported.out, /^Teleported Ender to -5, 0, 2\.5 from 9, 3, 9, on the play server: feet at -5, 0, 2\.5, 0\.4 studs from the goal \(\d+ ms\)\.$/);
+    const walked = await run("move", "Workspace.Shop", "--mode", "path", "--timeout", "8", "--radius", "3");
+    assert.equal(walked.code, 0, walked.err);
+    assert.deepEqual(seen.at(-1)!.args, { mode: "path", path: "Workspace.Shop", seconds: 8, radius: 3 });
+    assert.match(walked.out, /^Ender walked along a path of 7 waypoints from 9, 3, 9 toward Workspace\.Shop \(its top at 0, 5, 0\), on the play server: arrived\. Feet at 0, 5, 0, 0\.4 studs left; 1\.5 s at WalkSpeed 16 \(\d+ ms in all\)\.$/);
+    assert.match((await run("move")).err, /usage: move <path>/);
+    assert.match((await run("move", "Workspace.Shop", "--mode", "fly")).err, /--mode must be teleport, walk or path/);
+    assert.match((await run("move", "--at=1,2")).err, /--at must be <x>,<y>,<z>/);
+
+    const found = await run("find", "--peer", "server", "--class", "BasePart", "--attr=Level=3", "--tag", "Enemy");
+    assert.equal(found.code, 0, found.err);
+    assert.deepEqual([seen.at(-1)!.role, seen.at(-1)!.tool, seen.at(-1)!.args], ["server", "find", { classes: ["BasePart"], attribute: "Level", attributeValue: "3", tag: "Enemy", limit: 50 }]);
+    assert.match(found.out, /^Workspace\.Enemies\.Boss \[Model\]  2 attributes\n1 found among 900 instances of the play server; classes by IsA \(subclasses too\) \(\d+ ms\)\.$/);
+    assert.match((await run("find", "--peer", "studio", "--name", "x")).err, /--peer must be server or client/);
+
+    const mcp = mcpSession(port, path.join(folders["111"], "sync"));
+    const moved = await mcp.tool("move_player", { position: [-1, 2, -3], mode: "walk", timeoutSeconds: 5 });
+    assert.equal(moved.isError, undefined, moved.content[0].text);
+    assert.deepEqual(seen.at(-1)!.args, { mode: "walk", position: [-1, 2, -3], seconds: 5 });
+    assert.match(moved.content[0].text, /^Ender walked in a straight line \(Humanoid:MoveTo\) from 9, 3, 9 toward -1, 2, -3/);
+    assert.match((await mcp.tool("move_player", { path: "Workspace.Shop", position: [1, 2, 3] })).content[0].text, /give path or position, one of them/);
+    assert.match((await mcp.tool("move_player", { path: "-Workspace" })).content[0].text, /path cannot start with "-"/);
+    const live = await mcp.tool("find_instances", { peer: "client", name: "*Button", attribute: "Price", attributeValue: -5, exact: true });
+    assert.equal(live.isError, undefined, live.content[0].text);
+    assert.deepEqual([seen.at(-1)!.role, seen.at(-1)!.args], ["client", { name: "*Button", attribute: "Price", attributeValue: "-5", exact: true, limit: 50 }]);
+    assert.match((await mcp.tool("find_instances", { tag: "Enemy", peer: "nope" })).content[0].text, /peer must be server, client or edit/);
+    assert.match((await mcp.tool("find_instances", { attribute: "a b" })).content[0].text, /attribute must be an attribute's name/);
+    await mcp.close();
+    fake.close();
+  });
+});
+
 test("queue: who holds Studio and who waits, the settings, a forced release, a submit that waits for its verdict", { timeout: 60000 }, async () => {
   await withHub(async ({ port, folders }) => {
     const run = control(port, { cwd: folders["111"] });
@@ -881,7 +1319,7 @@ test("cloud: the key and creator saved in open-cloud.env, the key never printed,
       const code = await runControl(argv, {
         info: flavorInfo("dev"), client: new HubClient(1), out: (l) => out.push(l), err: (l) => err.push(l),
         confirm: async () => false, interactive: false, color: false, cwd: dataDir, openUri: async () => {},
-        roblox: { dataDir, env: {} }, readStdin: async () => stdin,
+        roblox: { dataDir, env: {}, dpapi: fakeDpapi }, readStdin: async () => stdin,
       });
       return { code, out: out.join("\n"), err: err.join("\n") };
     };
@@ -896,7 +1334,10 @@ test("cloud: the key and creator saved in open-cloud.env, the key never printed,
     assert.equal(json.groupId, undefined, "a user id replaces the group id");
     const text = fs.readFileSync(file, "utf8");
     assert.match(text, /^# mine\nOTHER=1\n/, "other lines stay, in their place");
-    assert.ok(text.includes(`ROBLOX_OPEN_CLOUD_API_KEY=${key}\n`), "the key is written without the line break");
+    // The key is in the vault, encrypted (09/11/26): no file holds it, the hub's decrypt gives it back
+    assert.ok(!text.includes(key) && !text.includes("ROBLOX_OPEN_CLOUD_API_KEY"), "the key is not in open-cloud.env");
+    assert.ok(!fs.readFileSync(path.join(dataDir, "open-cloud.key"), "utf8").includes(key), "nor in plain text in the vault");
+    assert.equal(await new Vault(dataDir, fakeDpapi).get(), key, "without the line break");
     assert.ok(!text.includes("ROBLOX_CREATOR_GROUP_ID"));
 
     const shown = await run(["cloud"]);
@@ -914,8 +1355,45 @@ test("cloud: the key and creator saved in open-cloud.env, the key never printed,
     const cleared = JSON.parse((await run(["cloud", "clear", "--json"])).out);
     assert.equal(cleared.hasKey, false);
     assert.equal(cleared.groupId, "456", "clear removes only the key");
-    assert.ok(!fs.readFileSync(file, "utf8").includes("ROBLOX_OPEN_CLOUD_API_KEY"));
+    assert.ok(!fs.existsSync(path.join(dataDir, "open-cloud.key")), "clear removes the vault");
   } finally {
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
+});
+
+test("changes: the terminal and the MCP say which uncommitted files Studio wrote, through the hub, with no Studio call", { timeout: 60000 }, async () => {
+  await withHub(async ({ port, folders }) => {
+    const folder = folders["111"];
+    const gitIn = (...args: string[]) => execFileSync("git", ["-C", folder, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    fs.writeFileSync(path.join(folder, ".gitignore"), ".quack/\nsourcemap.json\n");
+    gitIn("init", "-q");
+    gitIn("config", "user.email", "test@example.com");
+    gitIn("config", "user.name", "Test");
+    gitIn("add", "-A");
+    gitIn("commit", "-q", "-m", "start");
+
+    // The snapshot writes the place's one script: Studio's
+    fakeStudio(port, 111, "AlphaScript");
+    const run = control(port, { cwd: path.join(folder, "sync") });
+    await waitFor(async () => (await run("status", "--json")).json().sessions[0]?.instances === 3);
+    await waitFor(() => fs.existsSync(path.join(folder, "sync", "ServerStorage", "AlphaScript.luau")));
+    // An agent's new file
+    fs.writeFileSync(path.join(folder, "sync", "ServerStorage", "Note.luau"), "return 'note'\n");
+
+    const listed = await run("changes");
+    assert.equal(listed.code, 0, listed.err);
+    const [head, studioLine, otherLine, total] = listed.out.split("\n");
+    assert.equal(head, `2 files changed in sync since the last commit (repo ${gitIn("rev-parse", "--show-toplevel").trim()}):`);
+    assert.match(studioLine, /^ {2}studio \?\? {2}sync\/ServerStorage\/AlphaScript\.luau {2}made by Studio \[Studio wrote it \d{4}-\d\d-\d\d \d\d:\d\d\]$/);
+    assert.match(otherLine, /^ {2}other {2}\?\? {2}sync\/ServerStorage\/Note\.luau {9}not from Studio$/);
+    assert.match(total, /^1 from Studio, 0 mixed, 1 not from Studio \(\d+ ms\)\. Paths are from the repo's root, for git add\.$/);
+    const json = (await run("changes", "--numbers-only", "--json")).json();
+    assert.deepEqual(json.files.map((f: any) => [f.path, f.origin, f.numbersOnly]), [["sync/ServerStorage/AlphaScript.luau", "studio", false], ["sync/ServerStorage/Note.luau", "other", undefined]]);
+
+    const mcp = mcpSession(port, path.join(folder, "sync"));
+    const answer = await mcp.tool("studio_changes", { numbersOnly: true });
+    assert.equal(answer.isError, undefined, answer.content[0].text);
+    assert.match(answer.content[0].text, /studio \?\? {2}sync\/ServerStorage\/AlphaScript\.luau {2}made by Studio \[Studio wrote it [^\]]+\]; not only numbers: a new file/);
+    await mcp.close();
+  });
 });

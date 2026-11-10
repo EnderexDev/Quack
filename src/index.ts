@@ -34,6 +34,8 @@ import { BUNDLED, BUNDLED_BUILD } from "./bundled.js";
 import { HubLink, readHubLink } from "./hubLink.js";
 import { StudioTools } from "./studioTools.js";
 import { clearHubLock } from "./hub/owners.js";
+import { StudioWrites } from "./fs/studioWrites.js";
+import { studioChanges } from "./changes.js";
 
 /** Quack: a `quackdev play`, from the swap request to the play session's check */
 export interface PlayState {
@@ -157,6 +159,8 @@ export class SyncDaemon {
   private tree: TreeManager;
   private fileWriter: FileWriter;
   private fileWatcher: FileWatcher;
+  /** Quack: what Studio last wrote to each script file, for `changes` (kept in .quack/) */
+  private studioWrites: StudioWrites;
   // Quack: merges in flight, one per script. `dirty` = a newer side arrived; merge again.
   private merges: Map<string, { studio: string; dirty: boolean }> = new Map();
   // Quack: the connected Studio has the wrong place; its changes are ignored
@@ -225,6 +229,14 @@ export class SyncDaemon {
     this.fileWriter.setEventSuppressor((filePath, event) => {
       this.fileWatcher.suppressNextEvent(filePath, event);
     });
+    // Every script file the daemon writes or removes is Studio's change reaching the disk (a merge
+    // is marked as one after); a successor on standby, or a daemon that handed its place over,
+    // writes nothing of its own
+    this.studioWrites = new StudioWrites(path.join(path.dirname(path.resolve(config.sourcemapPath)), ".quack", "studio-writes.json"));
+    this.fileWriter.setWriteRecorder((filePath, written, before) => {
+      if (this.standby || this.handedOff) return;
+      this.studioWrites.record(this.syncRelative(filePath), written, before);
+    });
     this.fileWriter.setLiveDirCheck((dirPath) => {
       const segments = this.getRelativeSegments(dirPath);
       return segments.length > 0 && this.nodesAtDiskPath(segments).some((n) => !this.isScriptClass(n.className));
@@ -289,6 +301,12 @@ export class SyncDaemon {
         const mapping = this.fileWriter.getMapping(guid);
         return mapping ? relative(mapping.filePath) : undefined;
       },
+      // Not from a daemon on standby or one that handed over: its copy of the record is stale, and
+      // pruning it would save that stale copy over the live daemon's when it stops
+      changes: async (options) => {
+        if (this.standby || this.handedOff) throw new Error("this daemon is handing its place to another; ask again in a moment");
+        return studioChanges(this.fileWriter.getBaseDir(), this.studioWrites, options);
+      },
     });
 
     this.setupHandlers();
@@ -319,6 +337,8 @@ export class SyncDaemon {
     // A refused place has no session to resume
     const session = this.snapshotRefused ? undefined : this.lastSync?.session;
     const file = path.join(process.cwd(), ".quack", `handoff-${process.pid}-${phase}.json`);
+    // Studio's writes so far are on disk for the successor, which reads them as it takes over
+    this.studioWrites.flush();
 
     if (phase === "prepare") {
       this.tree.startJournal();
@@ -357,6 +377,8 @@ export class SyncDaemon {
     if (this.afterTakeoverTimer) clearTimeout(this.afterTakeoverTimer);
     const stoppedAt = Date.now();
     if (phase !== "final") await this.fileWatcher.stop();
+    // The pending deletes just applied may have removed files: saved before the successor reads
+    this.studioWrites.flush();
 
     if (phase === "final") {
       const journal = this.tree.takeJournal();
@@ -457,6 +479,8 @@ export class SyncDaemon {
    */
   private takeOver(request: { file?: string }): { applied: number } {
     if (!this.standby) throw new Error("not on standby");
+    // What Studio wrote through the previous daemon during the standby (it saved them as it let go)
+    this.studioWrites.load();
     // Each part of the switch the Studio waits for, in the log
     const began = performance.now();
     const timing: string[] = [];
@@ -1005,7 +1029,10 @@ export class SyncDaemon {
       const node = this.tree.getNode(guid)!;
       this.tree.updateScriptSource(guid, result.text);
       this.fileWatcher.suppressNextChange(filePath, result.text);
+      const noted = this.studioWrites.get(relative);
       this.fileWriter.writeScript(node);
+      // Both sides are in it: never Studio's change alone
+      if (this.studioWrites.get(relative) !== noted) this.studioWrites.markMerged(relative, result.text);
       this.ipc.patchScript(guid, result.text);
 
       if (result.method === "fallback") {
@@ -2306,6 +2333,7 @@ export class SyncDaemon {
         this.cleanupDirectories();
       }
       this.guidToInode.clear();
+      this.studioWrites.flush();
       await this.fileWatcher.stop();
       this.ipc.send({ type: "daemonDisconnect" });
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -2323,6 +2351,11 @@ export class SyncDaemon {
     })();
 
     return this.stopPromise;
+  }
+
+  /** A path from the sync folder, with / (how `changes` and the store name files) */
+  private syncRelative(filePath: string): string {
+    return path.relative(path.resolve(this.fileWriter.getBaseDir()), path.resolve(filePath)).split(path.sep).join("/");
   }
 
   private isScriptClass(className: string): boolean {
@@ -2365,7 +2398,15 @@ export class SyncDaemon {
               continue;
             }
             try {
+              let before: string | undefined;
+              try {
+                before = fs.readFileSync(fullPath, "utf-8");
+              } catch {
+                before = undefined;
+              }
               fs.unlinkSync(fullPath);
+              // Studio's place has no such script: the removal is Studio's side reaching the disk
+              this.studioWrites.record(this.syncRelative(fullPath), null, before);
               removedFiles.push(entry.name);
             } catch (error) {
               log.warn("Failed to delete orphan file:", fullPath, error);

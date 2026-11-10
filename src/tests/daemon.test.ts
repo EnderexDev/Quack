@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 import { SyncDaemon } from "../index.js";
+import { STREAK_LIMIT, StudioWrites } from "../fs/studioWrites.js";
 import { config } from "../config.js";
 import { isVersionCompatible } from "../util/versionUtils.js";
 
@@ -2557,5 +2559,291 @@ test("a script's text changing does not rebuild the sourcemap; a rename does", a
     config.sourcemapPath = prevSourcemapPath;
     config.port = prevPort;
     fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+function gitIn(cwd: string, ...args: string[]): string {
+  return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+}
+
+/** A project in a git repo: sync/ holds the scripts, .quack/ and the sourcemap sit beside it */
+function changesProject(files: Record<string, string>): { root: string; sync: string } {
+  const root = makeTempDir("quack-changes-");
+  const sync = path.join(root, "sync");
+  for (const [rel, text] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(sync, rel)), { recursive: true });
+    fs.writeFileSync(path.join(sync, rel), text);
+  }
+  fs.writeFileSync(path.join(root, ".gitignore"), ".quack/\nsourcemap.json\n");
+  gitIn(root, "init", "-q");
+  gitIn(root, "config", "user.email", "test@example.com");
+  gitIn(root, "config", "user.name", "Test");
+  gitIn(root, "config", "core.autocrlf", "false");
+  gitIn(root, "add", "-A");
+  gitIn(root, "commit", "-q", "-m", "start");
+  return { root, sync };
+}
+
+async function withChangesDaemon(root: string, sync: string, fn: (daemon: SyncDaemon) => Promise<void>): Promise<void> {
+  const prev = { syncDir: config.syncDir, sourcemapPath: config.sourcemapPath, port: config.port, orphans: config.deleteOrphansOnConnect };
+  config.syncDir = sync;
+  config.sourcemapPath = path.join(root, "sourcemap.json");
+  config.port = 0;
+  config.deleteOrphansOnConnect = false;
+  const daemon = new SyncDaemon();
+  try {
+    await fn(daemon);
+  } finally {
+    await daemon.stop();
+    config.syncDir = prev.syncDir;
+    config.sourcemapPath = prev.sourcemapPath;
+    config.port = prev.port;
+    config.deleteOrphansOnConnect = prev.orphans;
+  }
+}
+
+const changesOf = async (daemon: SyncDaemon, args: Record<string, unknown> = {}): Promise<any> => (daemon as any).studioTools.call("changes", args);
+const byPath = (result: any) => Object.fromEntries(result.files.map((f: any) => [f.path, f]));
+
+test("changes: Studio's writes are told from disk edits, kept across a daemon restart, and forgotten once committed", { timeout: 60000 }, async () => {
+  const { root, sync } = changesProject({
+    "ReplicatedStorage/Config.luau": "return { Speed = 10, Name = \"Bolt\" }\n",
+    "ReplicatedStorage/Shop.luau": "return 1\n",
+    "ReplicatedStorage/Draft.luau": "return 'a'\n",
+    "ReplicatedStorage/Echo.luau": "return 'e'\n",
+    "ReplicatedStorage/Layered.luau": "return 5\n",
+    "ReplicatedStorage/Gone.luau": "return 0\n",
+  });
+  const file = (rel: string) => path.join(sync, ...rel.split("/"));
+  const script = (guid: string, name: string, source: string) => ({ guid, className: "ModuleScript", name, parentGuid: "rs", path: ["ReplicatedStorage", name], source });
+  const studioEdit = (daemon: SyncDaemon, guid: string, name: string, source: string) =>
+    (daemon as any).handleStudioMessage({ type: "scriptChanged", data: { guid, source, path: ["ReplicatedStorage", name], className: "ModuleScript" } });
+  try {
+    await withChangesDaemon(root, sync, async (daemon) => {
+      (daemon as any).handleStudioMessage({
+        type: "fullSnapshot",
+        data: [
+          { guid: "rs", className: "ReplicatedStorage", name: "ReplicatedStorage", parentGuid: "root", path: ["ReplicatedStorage"] },
+          script("c", "Config", "return { Speed = 10, Name = \"Bolt\" }\n"),
+          script("s", "Shop", "return 1\n"),
+          script("d", "Draft", "return 'a'\n"),
+          script("e", "Echo", "return 'e'\n"),
+          script("l", "Layered", "return 5\n"),
+          script("g", "Gone", "return 0\n"),
+        ],
+      });
+      // The snapshot matched the disk: nothing written, nothing changed
+      assert.deepEqual((await changesOf(daemon)).files, []);
+
+      studioEdit(daemon, "c", "Config", "return { Speed = 12, Name = \"Bolt\" }\n");
+      studioEdit(daemon, "s", "Shop", "return 2\n");
+      fs.writeFileSync(file("ReplicatedStorage/Shop.luau"), "return 3\n"); // edited on disk after Studio
+      fs.writeFileSync(file("ReplicatedStorage/Draft.luau"), "return 'b'\n"); // an agent's edit only
+      // A disk edit sent to Studio and echoed back with the same text: no write, so not Studio's
+      fs.writeFileSync(file("ReplicatedStorage/Echo.luau"), "return 'f'\n");
+      studioEdit(daemon, "e", "Echo", "return 'f'\n");
+      // An agent's uncommitted edit, then the designer tunes the same script in Studio
+      fs.writeFileSync(file("ReplicatedStorage/Layered.luau"), "return 5 + bonus\n");
+      studioEdit(daemon, "l", "Layered", "return 6 + bonus\n");
+      // A script made in Studio, and one removed there
+      (daemon as any).handleStudioMessage({ type: "scriptChanged", data: { guid: "n", source: "return {}\n", path: ["ReplicatedStorage", "Made"], className: "ModuleScript" } });
+      (daemon as any).handleStudioMessage({ type: "deleted", data: { guid: "g" } });
+
+      const result = await changesOf(daemon, { numbersOnly: true });
+      assert.equal(result.git, true);
+      assert.equal(result.syncDir, "sync");
+      const files = byPath(result);
+      assert.deepEqual(Object.keys(files).sort(), [
+        "sync/ReplicatedStorage/Config.luau", "sync/ReplicatedStorage/Draft.luau", "sync/ReplicatedStorage/Echo.luau",
+        "sync/ReplicatedStorage/Gone.luau", "sync/ReplicatedStorage/Layered.luau", "sync/ReplicatedStorage/Made.luau", "sync/ReplicatedStorage/Shop.luau",
+      ]);
+      const tuned = files["sync/ReplicatedStorage/Config.luau"];
+      assert.deepEqual([tuned.origin, tuned.status, tuned.numbersOnly], ["studio", " M", true]);
+      assert.equal(typeof tuned.writtenAt, "number");
+      assert.deepEqual([files["sync/ReplicatedStorage/Shop.luau"].origin, files["sync/ReplicatedStorage/Shop.luau"].note], ["mixed", "changed on disk after Studio wrote it"]);
+      assert.equal(files["sync/ReplicatedStorage/Draft.luau"].origin, "other");
+      assert.equal(files["sync/ReplicatedStorage/Echo.luau"].origin, "other");
+      assert.deepEqual([files["sync/ReplicatedStorage/Layered.luau"].origin, files["sync/ReplicatedStorage/Layered.luau"].note], ["mixed", "it already held another uncommitted edit when Studio began writing it"]);
+      assert.deepEqual([files["sync/ReplicatedStorage/Made.luau"].origin, files["sync/ReplicatedStorage/Made.luau"].status, files["sync/ReplicatedStorage/Made.luau"].numbersOnly], ["studio", "??", false]);
+      assert.deepEqual([files["sync/ReplicatedStorage/Gone.luau"].origin, files["sync/ReplicatedStorage/Gone.luau"].status, files["sync/ReplicatedStorage/Gone.luau"].note], ["studio", " D", "removed by Studio"]);
+      assert.deepEqual([result.studio, result.mixed, result.other], [3, 2, 2]);
+
+      // A Studio edit that is more than numbers
+      studioEdit(daemon, "c", "Config", "return { Speed = 12, Name = \"Bolt\", Fly = true }\n");
+      const code = byPath(await changesOf(daemon, { numbersOnly: true }))["sync/ReplicatedStorage/Config.luau"];
+      assert.deepEqual([code.origin, code.numbersOnly, code.numbersNote], ["studio", false, "code changed"]);
+      studioEdit(daemon, "c", "Config", "return { Speed = 12, Name = \"Bolt\" }\n");
+    });
+
+    // A new daemon on the same folder (a restart, a new hub) knows what Studio wrote, with no Studio
+    await withChangesDaemon(root, sync, async (daemon) => {
+      const files = byPath(await changesOf(daemon));
+      assert.equal(files["sync/ReplicatedStorage/Config.luau"].origin, "studio");
+      assert.equal(files["sync/ReplicatedStorage/Shop.luau"].origin, "mixed");
+      assert.equal(files["sync/ReplicatedStorage/Made.luau"].origin, "studio");
+
+      // Committed: forgotten
+      gitIn(root, "add", "sync/ReplicatedStorage/Config.luau");
+      gitIn(root, "commit", "-q", "-m", "balance");
+      const after = await changesOf(daemon);
+      assert.equal(byPath(after)["sync/ReplicatedStorage/Config.luau"], undefined);
+    });
+    const saved = JSON.parse(fs.readFileSync(path.join(root, ".quack", "studio-writes.json"), "utf8"));
+    assert.equal(saved.files["ReplicatedStorage/Config.luau"], undefined, "a committed file is dropped from the record");
+    assert.ok(saved.files["ReplicatedStorage/Made.luau"]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("changes: a designer tuning on after part of his work was committed stays Studio's; a sync folder out of git says so", { timeout: 60000 }, async () => {
+  const { root, sync } = changesProject({ "ServerStorage/Waves.luau": "return { Hp = 100 }\n" });
+  const edit = (daemon: SyncDaemon, source: string) =>
+    (daemon as any).handleStudioMessage({ type: "scriptChanged", data: { guid: "w", source, path: ["ServerStorage", "Waves"], className: "ModuleScript" } });
+  try {
+    await withChangesDaemon(root, sync, async (daemon) => {
+      (daemon as any).handleStudioMessage({
+        type: "fullSnapshot",
+        data: [
+          { guid: "ss", className: "ServerStorage", name: "ServerStorage", parentGuid: "root", path: ["ServerStorage"] },
+          { guid: "w", className: "ModuleScript", name: "Waves", parentGuid: "ss", path: ["ServerStorage", "Waves"], source: "return { Hp = 100 }\n" },
+        ],
+      });
+      edit(daemon, "return { Hp = 120 }\n");
+      // Committed by a session that never asked `changes`: the record still holds the streak
+      gitIn(root, "commit", "-q", "-am", "balance");
+      edit(daemon, "return { Hp = 150 }\n");
+      const waves = (await changesOf(daemon)).files[0];
+      assert.deepEqual([waves.path, waves.origin], ["sync/ServerStorage/Waves.luau", "studio"]);
+
+      // An agent's edit staged, then the disk put back to Studio's text: the index is not Studio's
+      const wavesFile = path.join(sync, "ServerStorage", "Waves.luau");
+      fs.writeFileSync(wavesFile, "return { Hp = 150, Boss = true }\n");
+      gitIn(root, "add", "sync/ServerStorage/Waves.luau");
+      fs.writeFileSync(wavesFile, "return { Hp = 150 }\n");
+      const staged = (await changesOf(daemon)).files[0];
+      assert.deepEqual([staged.status, staged.origin, staged.note], ["MM", "mixed", "a version staged in git differs from the one on disk"]);
+      gitIn(root, "reset", "-q", "--", "sync/ServerStorage/Waves.luau");
+
+      // The commit holds CRLF and Studio writes LF: still only numbers
+      (daemon as any).handleStudioMessage({ type: "scriptChanged", data: { guid: "t", source: "x\n", path: ["ServerStorage", "Text"], className: "ModuleScript" } });
+      fs.writeFileSync(path.join(sync, "ServerStorage", "Text.luau"), "local s = [[a\r\nb]]\r\nreturn 1\r\n");
+      gitIn(root, "add", "sync/ServerStorage/Text.luau");
+      gitIn(root, "commit", "-q", "-m", "crlf");
+      (daemon as any).handleStudioMessage({ type: "scriptChanged", data: { guid: "t", source: "local s = [[a\nb]]\nreturn 2\n", path: ["ServerStorage", "Text"], className: "ModuleScript" } });
+      const text = byPath(await changesOf(daemon, { numbersOnly: true }))["sync/ServerStorage/Text.luau"];
+      assert.deepEqual([text.origin, text.numbersOnly], ["studio", true]);
+    });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+
+  const loose = makeTempDir("quack-nogit-");
+  try {
+    fs.mkdirSync(path.join(loose, "sync"));
+    await withChangesDaemon(loose, path.join(loose, "sync"), async (daemon) => {
+      const result = await changesOf(daemon);
+      assert.equal(result.git, false);
+      assert.match(result.note, /not in a git repository/);
+    });
+  } finally {
+    fs.rmSync(loose, { recursive: true, force: true });
+  }
+});
+
+test("changes: a merge is mixed until committed; a Studio write during the git call is not forgotten; a failed save is tried again", { timeout: 60000 }, async () => {
+  const { root, sync } = changesProject({ "ServerStorage/Loot.luau": "return { Gold = 1 }\n" });
+  const edit = (daemon: SyncDaemon, source: string) =>
+    (daemon as any).handleStudioMessage({ type: "scriptChanged", data: { guid: "l", source, path: ["ServerStorage", "Loot"], className: "ModuleScript" } });
+  try {
+    await withChangesDaemon(root, sync, async (daemon) => {
+      (daemon as any).handleStudioMessage({
+        type: "fullSnapshot",
+        data: [
+          { guid: "ss", className: "ServerStorage", name: "ServerStorage", parentGuid: "root", path: ["ServerStorage"] },
+          { guid: "l", className: "ModuleScript", name: "Loot", parentGuid: "ss", path: ["ServerStorage", "Loot"], source: "return { Gold = 1 }\n" },
+        ],
+      });
+      const writes: StudioWrites = (daemon as any).studioWrites;
+      // What the daemon does after a merge lands: the written text is marked as both sides'
+      edit(daemon, "return { Gold = 2 }\n");
+      writes.markMerged("ServerStorage/Loot.luau", "return { Gold = 2 }\n");
+      edit(daemon, "return { Gold = 3 }\n");
+      assert.equal((await changesOf(daemon)).files[0].origin, "mixed");
+      // The merge committed (by a session that never asked changes since): Studio's next tuning is Studio's
+      gitIn(root, "commit", "-q", "-am", "merged");
+      edit(daemon, "return { Gold = 4 }\n");
+      assert.equal((await changesOf(daemon)).files[0].origin, "studio");
+
+      // A commit in the middle of a long tuning session nobody asked `changes` about: the rest is
+      // still Studio's (16 texts a streak lost the committed one)
+      edit(daemon, "return { Gold = 5 }\n");
+      gitIn(root, "commit", "-q", "-am", "mid-session");
+      for (let n = 6; n < 40; n++) edit(daemon, `return { Gold = ${n} }\n`);
+      assert.equal((await changesOf(daemon)).files[0].origin, "studio");
+      gitIn(root, "commit", "-q", "-am", "session");
+
+      // A merge, then more tuning than the streak keeps texts of: committed, the rest is Studio's
+      STREAK_LIMIT.texts = 16;
+      try {
+        writes.markMerged("ServerStorage/Loot.luau", "return { Gold = 39 }\n");
+        for (let n = 40; n < 65; n++) edit(daemon, `return { Gold = ${n} }\n`);
+        assert.equal((await changesOf(daemon)).files[0].origin, "mixed");
+        gitIn(root, "commit", "-q", "-am", "tuned");
+        edit(daemon, "return { Gold = 65 }\n");
+        assert.equal((await changesOf(daemon)).files[0].origin, "studio");
+        gitIn(root, "commit", "-q", "-am", "tuned again");
+      } finally {
+        STREAK_LIMIT.texts = 1000;
+      }
+
+      // A file bigger than a pipe's chunk, read from git as it streams
+      const big = (n: number) => `return {\n${Array.from({ length: 20000 }, (_, i) => `  Item${i} = ${i === 7 ? n : i},`).join("\n")}\n}\n`;
+      edit(daemon, big(1));
+      gitIn(root, "commit", "-q", "-am", "big");
+      edit(daemon, big(2));
+      const tuned = (await changesOf(daemon, { numbersOnly: true })).files[0];
+      assert.deepEqual([tuned.origin, tuned.numbersOnly], ["studio", true]);
+
+      // A link put where Studio's new file was, with the same text: not Studio's
+      (daemon as any).handleStudioMessage({ type: "scriptChanged", data: { guid: "k", source: "return 'k'\n", path: ["ServerStorage", "Linked"], className: "ModuleScript" } });
+      const linked = path.join(sync, "ServerStorage", "Linked.luau");
+      fs.writeFileSync(path.join(root, "target.luau"), "return 'k'\n");
+      fs.rmSync(linked);
+      let linkMade = true;
+      try {
+        fs.symlinkSync(path.join(root, "target.luau"), linked);
+      } catch {
+        linkMade = false; // Windows without the right to make links: nothing to check
+      }
+      if (linkMade) {
+        const link = byPath(await changesOf(daemon))["sync/ServerStorage/Linked.luau"];
+        assert.deepEqual([link.origin, link.note], ["mixed", "a link now stands where Studio wrote a file"]);
+      }
+
+      // An entry written after the call took its look is kept, though git did not list it
+      const seen = writes.snapshot();
+      writes.record("ServerStorage/Late.luau", "return 1\n", undefined);
+      assert.equal(writes.keepOnly(new Set(), seen), seen.size, "only the entries it saw go");
+      assert.ok(writes.get("ServerStorage/Late.luau"));
+    });
+
+    // The save fails (its folder is a file), then works again: the entries are not lost
+    const blocked = path.join(root, "blocked");
+    fs.writeFileSync(blocked, "");
+    const store = new StudioWrites(path.join(blocked, "studio-writes.json"));
+    store.record("A.luau", "return 1\n", undefined);
+    store.flush();
+    fs.rmSync(blocked);
+    store.flush();
+    assert.ok(JSON.parse(fs.readFileSync(path.join(blocked, "studio-writes.json"), "utf8")).files["A.luau"]);
+
+    // A record of the first build, whole sha256 texts, reads in the short form compared now
+    const whole = "a".repeat(64);
+    fs.writeFileSync(path.join(blocked, "old.json"), JSON.stringify({ version: 1, files: { "B.luau": { hash: "h", at: 1, streak: ["absent", whole], merged: whole } } }));
+    const old = new StudioWrites(path.join(blocked, "old.json")).get("B.luau")!;
+    assert.deepEqual([old.streak, old.merged], [["absent", "a".repeat(16)], "a".repeat(16)]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });

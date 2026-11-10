@@ -9,18 +9,19 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node --test dist/tests/daemon.test.js dist/tests/snapshot.test.js dist/tests/rojo.test.js dist/tests/property_loader.test.js dist/tests/pack.test.js dist/tests/push.test.js dist/tests/normalize_property.test.js dist/tests/rojo_refs.test.js dist/tests/studio_output.test.js dist/tests/studio_tools.test.js dist/tests/watcher.test.js dist/tests/merge.test.js dist/tests/hub.test.js dist/tests/handoff.test.js dist/tests/bundle.test.js dist/tests/control.test.js dist/tests/roblox.test.js dist/tests/plugin_build.test.js dist/tests/app_colors.test.js dist/tests/app_update.test.js dist/tests/dev_version.test.js dist/tests/play.test.js dist/tests/rewrite.test.js dist/tests/container.test.js dist/tests/queue.test.js dist/tests/app_queue.test.js dist/tests/app_editor.test.js",
+    "test": "npm run build && node --test dist/tests/daemon.test.js dist/tests/snapshot.test.js dist/tests/rojo.test.js dist/tests/property_loader.test.js dist/tests/pack.test.js dist/tests/push.test.js dist/tests/normalize_property.test.js dist/tests/rojo_refs.test.js dist/tests/studio_output.test.js dist/tests/studio_tools.test.js dist/tests/rbxl.test.js dist/tests/watcher.test.js dist/tests/merge.test.js dist/tests/hub.test.js dist/tests/handoff.test.js dist/tests/bundle.test.js dist/tests/control.test.js dist/tests/roblox.test.js dist/tests/plugin_build.test.js dist/tests/app_colors.test.js dist/tests/app_update.test.js dist/tests/dev_version.test.js dist/tests/play.test.js dist/tests/rewrite.test.js dist/tests/container.test.js dist/tests/queue.test.js dist/tests/app_queue.test.js dist/tests/app_editor.test.js dist/tests/cloud_live.test.js dist/tests/approval.test.js dist/tests/app_approval.test.js",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "clean": "rimraf dist",
     "prepack": "npm run build",
     "prepublishOnly": "npm run build",
     "vendor:rbx-dom-lua": "node plugin/scripts/vendor-rbx-dom-lua.mjs && node plugin/scripts/push-rbx-dom-lua.mjs",
+    "vendor:libmp": "node plugin/scripts/vendor-libmp.mjs",
     "plugin:build": "node plugin/scripts/build-plugin.mjs",
     "bundle:hub": "npm run build && node scripts/bundle-hub.mjs"
   },
   "engines": {
-    "node": ">=20.19.0"
+    "node": ">=22.15.0"
   },
   "keywords": [
     "roblox",

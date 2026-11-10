@@ -4,6 +4,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { QuackHub } from "../hub/hub.js";
@@ -834,6 +835,64 @@ test("a script deleted on disk during the switch makes the Studio send a snapsho
     studio.stop();
     if (second) await second.stop();
     // A failure before the handoff leaves the first hub running: stopped here (a no-op after it)
+    await first.stop().catch(() => {});
+    await wait(300);
+    removeQuietly(tmp);
+  }
+});
+
+test("changes: a Studio edit written by the old daemon during a handoff is still Studio's to its successor", { timeout: 90000 }, async () => {
+  const { tmp, folder, registryFile } = setup();
+  const gitIn = (...args: string[]) => execFileSync("git", ["-C", folder, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  fs.mkdirSync(path.join(folder, "sync", "ServerStorage"), { recursive: true });
+  fs.writeFileSync(path.join(folder, "sync", "ServerStorage", "Kept.luau"), "return 1\n");
+  fs.writeFileSync(path.join(folder, ".gitignore"), ".quack/\nsourcemap.json\n");
+  gitIn("init", "-q");
+  gitIn("config", "user.email", "test@example.com");
+  gitIn("config", "user.name", "Test");
+  gitIn("config", "core.autocrlf", "false");
+  gitIn("add", "-A");
+  gitIn("commit", "-q", "-m", "start");
+
+  const port = await freePort();
+  const first = new QuackHub({ port, registryFile, daemonCli, log: () => {} });
+  await first.start();
+  let second: QuackHub | undefined;
+  const studio = resumingStudio(port, 321, "P1");
+  try {
+    const script = path.join(folder, "sync", "ServerStorage", "Kept.luau");
+    await waitFor(() => sessionOf(first)?.studioConnected === true && fs.existsSync(path.join(folder, "sourcemap.json")));
+    await first.stop({ handoff: true });
+    const lock = readHubLock(folder)!;
+    const old = `http://127.0.0.1:${lock.daemonPort}`;
+    const post = (url: string, token: string, body: unknown) => fetch(url, { method: "POST", headers: { "content-type": "application/json", "x-quack-token": token }, body: JSON.stringify(body) });
+
+    const prepared = (await (await post(`${old}/export`, lock.token!, { phase: "prepare" })).json()) as any;
+    second = new QuackHub({ port: await freePort(), registryFile, daemonCli, log: () => {} });
+    await second.start();
+    const successor = await (second as any).sessionFor("321", folder, "Game", prepared.file, true);
+    await successor.ready;
+
+    // The designer tunes a value while the successor stands by: the old daemon writes it
+    studio.state.daemon!.send(JSON.stringify({
+      type: "scriptChanged",
+      data: { guid: "s1", path: ["ServerStorage", "Kept"], className: "ModuleScript", source: "return 7\n", base: "return 1\n" },
+    }));
+    await waitFor(() => fs.readFileSync(script, "utf8") === "return 7\n");
+
+    const successorUrl = `ws://127.0.0.1:${successor.childPort}/?token=${successor.token}`;
+    const final = (await (await post(`${old}/export`, lock.token!, { phase: "final", successorUrl })).json()) as any;
+    const took = await post(`http://127.0.0.1:${successor.childPort}/takeover`, successor.token, { file: final.file });
+    assert.equal(took.status, 200);
+
+    const asked = await post(`http://127.0.0.1:${successor.childPort}/studio`, successor.token, { tool: "changes", args: { numbersOnly: true } });
+    assert.equal(asked.status, 200);
+    const { result } = (await asked.json()) as any;
+    assert.equal(result.files.length, 1, JSON.stringify(result));
+    assert.deepEqual([result.files[0].path, result.files[0].origin, result.files[0].numbersOnly], ["sync/ServerStorage/Kept.luau", "studio", true]);
+  } finally {
+    studio.stop();
+    if (second) await second.stop();
     await first.stop().catch(() => {});
     await wait(300);
     removeQuietly(tmp);

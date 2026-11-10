@@ -44,7 +44,7 @@ test("the bundled hub the app ships syncs a Studio with one daemon, away from di
   // The bundle stands alone: nothing from dist/ or node_modules next to it
   // (watcher.node, the backstop watcher, only where the app ships: Windows x64)
   const shipsWatcher = process.platform === "win32" && process.arch === "x64";
-  assert.deepEqual(fs.readdirSync(bundleDir).sort(), ["BUILD", "DAEMON_BUILD", "VERSION", "cli.mjs", "daemon.mjs", "hub.mjs", ...(shipsWatcher ? ["watcher.node"] : [])]);
+  assert.deepEqual(fs.readdirSync(bundleDir).sort(), ["BUILD", "DAEMON_BUILD", "VERSION", "cli.mjs", "daemon.mjs", "guard.mjs", "hub.mjs", ...(shipsWatcher ? ["watcher.node"] : [])]);
   const buildId = fs.readFileSync(path.join(bundleDir, "BUILD"), "utf8").trim();
   assert.match(buildId, /^[0-9a-f]{12}$/);
   assert.match(fs.readFileSync(path.join(bundleDir, "DAEMON_BUILD"), "utf8").trim(), /^[0-9a-f]{12}$/);
