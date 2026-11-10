@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -51,6 +52,8 @@ export interface ControlContext {
   readStdin?: () => Promise<string>;
   /** The Roblox web tools' fetch, data folder and environment; tests replace them */
   roblox?: Partial<RobloxEnv>;
+  /** queue publish: runs the publish command (tests replace it); resolves to its exit code */
+  runCommand?: (argv: string[], env: Record<string, string>) => { exit: Promise<number>; kill: () => void };
 }
 
 class UsageError extends Error {}
@@ -235,9 +238,22 @@ interface Options {
   ascending: boolean;
   upsert: boolean;
   keepAlts: boolean;
+  /** queue publish: the commit that must go live, the line's level and task, and who asks */
+  commit?: string;
+  level?: string;
+  task?: string;
+  rush: boolean;
+  client?: string;
+  /** What follows `--`: the command queue publish runs when Studio is its turn */
+  command: string[];
 }
 
-function parse(argv: string[]): { command?: string; args: string[]; options: Options } {
+function parse(full: string[]): { command?: string; args: string[]; options: Options } {
+  // In queue publish, everything after `--` is a command of its own, never this one's options.
+  // Anywhere else `--` keeps its usual meaning: what follows is positional even when it starts with -
+  const dash = full[0] === "queue" && full[1] === "publish" ? full.indexOf("--") : -1;
+  const argv = dash >= 0 ? full.slice(0, dash) : full;
+  const trailing = dash >= 0 ? full.slice(dash + 1) : [];
   const { values, positionals } = parseArgs({
     args: argv,
     strict: true,
@@ -393,6 +409,11 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       ascending: { type: "boolean" },
       upsert: { type: "boolean" },
       "keep-alts": { type: "boolean" },
+      commit: { type: "string" },
+      level: { type: "string" },
+      task: { type: "string" },
+      rush: { type: "boolean" },
+      client: { type: "string" },
     },
   });
   const number = (name: "idle" | "timeout"): number | undefined => {
@@ -556,6 +577,12 @@ function parse(argv: string[]): { command?: string; args: string[]; options: Opt
       ascending: values["ascending"] === true,
       upsert: values["upsert"] === true,
       keepAlts: values["keep-alts"] === true,
+      commit: values.commit,
+      level: values.level,
+      task: values.task,
+      rush: values.rush === true,
+      client: values.client,
+      command: trailing,
     },
   };
 }
@@ -829,6 +856,16 @@ Studio queue (one per place: test jobs, the Studio lock and who waits for it)
                             A test job (setup, client, check, cleanup with ctx), run in the
                             place's play or a worktree's branch (-w; default: the folder you are
                             in); waits for its verdict. Exit 0 pass, 1 fail, ${EXIT.timeout} infra or no verdict
+  queue publish [place] [--commit <sha>] [--level <l>] [--task <text>] [--rush] [--client <id>]
+                [--timeout <min>] -- <command...>
+                            Publish the place through the queue: waits for Studio (the queue's
+                            play stops first), then runs <command> to publish. One publish answers
+                            every client waiting to publish that it covers (their --commit is in
+                            what it shipped, or they asked before it took Studio): those exit 0
+                            without running theirs. The command gets QUACK_PUBLISH_HEAD (the synced
+                            checkout's commit) and QUACK_PUBLISH_RESULT, a file it may write
+                            {"version": N, "commit": "<sha>"} to; exit 0 means published.
+                            --level: critical|blocking|update|normal|low (default blocking)
   queue release [place]     Free the Studio lock, whoever holds it
   queue settings            The queue's timings (the app's Settings change them)
 
@@ -3381,9 +3418,18 @@ export function queueText(q: any): string {
     lines.push(`  waiting for Studio (${q.waiters.length}), next first:`);
     q.waiters.forEach((w: any, i: number) =>
       lines.push(
-        `    ${i + 1}. ${w.rush ? "RUSH " : ""}${w.effectiveLevel}${w.effectiveLevel !== w.level ? ` (was ${w.level})` : ""}, ~${w.holdMin} min, waiting ${minutes(w.waitedMs)}${w.exclusive ? ", live" : ""}: ${clientLabel(w.client)}${w.task ? `: ${w.task}` : ""}`,
+        `    ${i + 1}. ${w.rush ? "RUSH " : ""}${w.effectiveLevel}${w.effectiveLevel !== w.level ? ` (was ${w.level})` : ""}, ~${w.holdMin} min, waiting ${minutes(w.waitedMs)}${w.publish ? `, publish${w.publish.commit ? ` ${w.publish.commit.slice(0, 8)}` : ""}` : w.exclusive ? ", live" : ""}: ${clientLabel(w.client)}${w.task ? `: ${w.task}` : ""}`,
       ),
     );
+  }
+  const pub = q.publish;
+  if (pub?.current) {
+    const riders = pub.current.riders?.length ?? 0;
+    lines.push(`  publishing: ${clientLabel(pub.current.client)} for ${minutes(pub.current.ms)}${pub.current.head ? `, synced checkout at ${pub.current.head.slice(0, 8)}` : ""}${riders ? `, ${riders} more ride on it` : ""}`);
+  }
+  if (pub?.last) {
+    const covered = pub.last.covered?.length ?? 0;
+    lines.push(`  last publish: ${pub.last.version !== undefined ? `version ${pub.last.version}` : "a new version"} by ${clientLabel(pub.last.client)}, ${minutes(Date.now() - pub.last.at)} ago${pub.last.head ? ` (${pub.last.head.slice(0, 8)})` : ""}${covered ? `, answered ${covered} more` : ""}`);
   }
   if (q.running) lines.push(`  running: ${q.running.name} (${clientLabel(q.running.client)}), ${minutes(q.running.ms)}`);
   const queued = (q.jobs ?? []).filter((j: any) => j.state === "pending");
@@ -3469,6 +3515,7 @@ async function queue(ctx: ControlContext, options: Options, args: string[]): Pro
     );
     return EXIT.ok;
   }
+  if (sub === "publish") return queuePublish(ctx, options, rest);
   if (sub !== "submit") return showStatus(sub);
   const file = need(rest[0], "queue submit <job.luau> [place] [-w <folder>]");
   let source: string;
@@ -3478,13 +3525,7 @@ async function queue(ctx: ControlContext, options: Options, args: string[]): Pro
     throw new UsageError(`cannot read ${file}: ${(error as Error).message}`);
   }
   const root = path.resolve(ctx.cwd, options.worktrees[0] ?? ".");
-  let place: Place;
-  if (rest[1]) place = await resolvePlace(ctx, rest[1]);
-  else {
-    const state = await ctx.client.get("/api/state");
-    const inside = (state.places as Place[]).find((p) => sameOrInside(p.folder, root));
-    place = inside ?? (await placeOfWorktree(ctx, root));
-  }
+  const place = await placeOfFolder(ctx, rest[1], root);
   // A job runs the folder it names: the place's own, or a worktree's top folder (its branch)
   const folder = sameOrInside(place.folder, root) ? place.folder : worktreeTop(root);
   // No pid: the job is not this process's, so it stays queued when the command gives up waiting
@@ -3505,6 +3546,160 @@ async function queue(ctx: ControlContext, options: Options, args: string[]): Pro
       return EXIT.timeout;
     }
     await new Promise((r) => setTimeout(r, ctx.pollMs ?? 500));
+  }
+}
+
+/** The place named, or the one whose folder (or a worktree of it) holds `root` */
+async function placeOfFolder(ctx: ControlContext, query: string | undefined, root: string): Promise<Place> {
+  if (query) return resolvePlace(ctx, query);
+  const state = await ctx.client.get("/api/state");
+  const inside = (state.places as Place[]).find((p) => sameOrInside(p.folder, root));
+  return inside ?? (await placeOfWorktree(ctx, root));
+}
+
+/** The publish command, as a child with the terminal: a .cmd or .bat needs cmd.exe on Windows */
+function spawnCommand(argv: string[], env: Record<string, string>): { exit: Promise<number>; kill: () => void } {
+  const viaCmd = process.platform === "win32" && /\.(cmd|bat)$/i.test(argv[0]);
+  const child = spawn(viaCmd ? "cmd.exe" : argv[0], viaCmd ? ["/d", "/c", ...argv] : argv.slice(1), { stdio: "inherit", env: { ...process.env, ...env } });
+  const exit = new Promise<number>((resolve) => {
+    child.once("error", (error) => {
+      process.stderr.write(`could not start ${argv[0]}: ${error.message}\n`);
+      resolve(127);
+    });
+    child.once("exit", (code, signal) => resolve(code ?? (signal ? 1 : 0)));
+  });
+  return { exit, kill: () => void child.kill() };
+}
+
+const short = (sha: string | null | undefined) => (sha ? sha.slice(0, 8) : "?");
+
+function publishedText(p: any, mine: boolean): string {
+  if (!p) return "Published.";
+  const what = `${p.version !== undefined ? `version ${p.version}` : "a new version"}${p.head ? ` (synced checkout at ${short(p.head)})` : ""}`;
+  return mine ? `Published ${what}.` : `Published by ${clientLabel(p.client)}: ${what}, ${minutes(Date.now() - p.at)} ago. Nothing to run.`;
+}
+
+/**
+ * queue publish: a ticket in the place's Studio line. When Studio is its turn, the command runs and
+ * its exit code says whether it published; when another client's publish covers it first, it ends
+ * with that one's answer and runs nothing.
+ */
+async function queuePublish(ctx: ControlContext, options: Options, rest: string[]): Promise<number> {
+  const usage = "queue publish [place] [--commit <sha>] [--level <l>] [--task <text>] [--rush] [--client <id>] [--timeout <min>] -- <command...>";
+  if (!options.command.length) throw new UsageError(`${usage}\n(the command that publishes goes after --)`);
+  if (options.level !== undefined && !["critical", "blocking", "update", "normal", "low"].includes(options.level)) throw new UsageError("--level must be critical, blocking, update, normal or low");
+  const place = await placeOfFolder(ctx, rest[0], ctx.cwd);
+  // This process is the client's life: it ending frees its place in line and its hold
+  const client = { id: options.client ?? `publish-${process.pid}`, name: options.name ?? "quack queue publish", pid: process.pid };
+  const call = (op: string, body: Record<string, unknown> = {}) => ctx.client.post("/api/queue/publish", { placeId: place.placeId, op, ...body });
+  const joined = await call("join", {
+    client,
+    ...(options.commit ? { commit: options.commit } : {}),
+    ...(options.task ? { task: options.task } : {}),
+    ...(options.level ? { level: options.level } : {}),
+    ...(options.rush ? { rush: true } : {}),
+  });
+  if (joined.state === "published") {
+    ctx.out(options.json ? JSON.stringify(joined, null, 2) : `Already live: ${short(options.commit)} went out in an earlier publish. ${publishedText(joined.publish, false)}`);
+    return EXIT.ok;
+  }
+  const ticket: string = joined.ticket;
+  const deadline = Date.now() + (options.timeout ?? 30) * 60_000;
+  let said = "";
+  const say = (line: string) => {
+    if (line === said || options.json) return;
+    said = line;
+    ctx.out(line);
+  };
+  let child: { exit: Promise<number>; kill: () => void } | null = null;
+  let finished = false;
+  const giveUp = () => {
+    if (finished) return;
+    finished = true;
+    child?.kill();
+    // Best effort: the hub also frees the place once this process is gone
+    void call("leave", { ticket }).catch(() => {});
+  };
+  process.once("SIGINT", giveUp);
+  process.once("SIGTERM", giveUp);
+  try {
+    for (;;) {
+      let answer: any;
+      try {
+        answer = await call("claim", { ticket });
+      } catch (error) {
+        // A hub restarting: the ticket is saved with the queue, so it is asked again
+        if (!(error instanceof HubOffline) || Date.now() > deadline) throw error;
+        say("The hub does not answer (restarting?): asking again.");
+        await new Promise((r) => setTimeout(r, ctx.pollMs ?? 1000));
+        continue;
+      }
+      if (answer.state === "covered" || answer.state === "published") {
+        finished = true;
+        ctx.out(options.json ? JSON.stringify(answer, null, 2) : publishedText(answer.publish, answer.state === "published"));
+        return EXIT.ok;
+      }
+      if (answer.state === "failed" || answer.state === "dropped" || answer.state === "left") {
+        finished = true;
+        ctx.err(`Not published: ${answer.reason ?? answer.state}`);
+        return EXIT.error;
+      }
+      if (answer.state === "yours") {
+        const riders = answer.riders?.length ? `; ${answer.riders.length} more client(s) waiting to publish ride on it` : "";
+        if (!options.json) ctx.out(`Studio is this ticket's: publishing${answer.head ? ` the synced checkout at ${short(answer.head)}` : ""}${riders}.`);
+        const resultFile = path.join(os.tmpdir(), `quack-publish-${ticket}.json`);
+        fs.rmSync(resultFile, { force: true });
+        child = (ctx.runCommand ?? spawnCommand)(options.command, {
+          QUACK_PUBLISH_TICKET: ticket,
+          QUACK_PUBLISH_HEAD: answer.head ?? "",
+          QUACK_PUBLISH_RESULT: resultFile,
+          QUACK_PUBLISH_RIDERS: String(answer.riders?.length ?? 0),
+        });
+        // Its Studio hold must not idle out while the command runs
+        const keep = setInterval(() => void call("touch", { ticket }).catch(() => {}), 20_000);
+        let code: number;
+        try {
+          code = await child.exit;
+        } finally {
+          clearInterval(keep);
+        }
+        let result: any = {};
+        try {
+          result = JSON.parse(fs.readFileSync(resultFile, "utf8"));
+        } catch {
+          // the command wrote nothing: its exit code says it all
+        }
+        fs.rmSync(resultFile, { force: true });
+        const done = await call("done", {
+          ticket,
+          ok: code === 0,
+          ...(result && (typeof result.version === "number" || typeof result.version === "string") ? { version: result.version } : {}),
+          ...(result && typeof result.commit === "string" ? { commit: result.commit } : {}),
+          ...(code === 0 ? {} : { reason: `the publish command exited ${code}` }),
+        });
+        finished = true;
+        if (options.json) ctx.out(JSON.stringify(done, null, 2));
+        else if (done.state === "published") {
+          const covered = done.publish?.covered ?? [];
+          ctx.out(`${publishedText(done.publish, true)}${covered.length ? ` It answered ${covered.length} more: ${covered.map((c: any) => clientLabel(c.client)).join(", ")}.` : ""}`);
+        } else ctx.err(`Not published: ${done.reason ?? done.state}. The next client waiting to publish takes Studio.`);
+        return done.state === "published" ? EXIT.ok : code || EXIT.error;
+      }
+      if (Date.now() > deadline) {
+        ctx.err(`Studio did not come to this ticket in ${options.timeout ?? 30} min; it leaves the line.`);
+        return EXIT.timeout;
+      }
+      const pub = answer.publishing;
+      if (pub) say(`${clientLabel(pub.client)} is publishing now${pub.rides ? ": what it ships covers this ticket" : ""}. Waiting for its answer.`);
+      else if (answer.capped) say("Capped: Studio comes back after the queue's next batch.");
+      else if (answer.holder) say(`Waiting for Studio (place ${answer.position || "?"} in line), held by ${answer.holder.runner ? "the queue (its play stops first)" : clientLabel(answer.holder.client)}.`);
+      else say(`Waiting for Studio (place ${answer.position || "?"} in line).`);
+      await new Promise((r) => setTimeout(r, ctx.pollMs ?? 1000));
+    }
+  } finally {
+    process.removeListener("SIGINT", giveUp);
+    process.removeListener("SIGTERM", giveUp);
+    if (!finished) giveUp();
   }
 }
 

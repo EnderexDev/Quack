@@ -1,9 +1,10 @@
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { changedScripts, fnv1a, foreignIn, hashAll, loadSourcemap, planGroups, recentFiles, samePath, type Sourcemap } from "./disk.js";
+import { changedScripts, fnv1a, foreignIn, hashAll, loadSourcemap, planGroups, publishGit, recentFiles, samePath, type Sourcemap } from "./disk.js";
 import { isLevel, RUNNER, StudioLock, type Client, type Level } from "./lock.js";
 import { luaString, phaseCode } from "./prelude.js";
+import { PublishLine, type PublishGit } from "./publish.js";
 import { effectiveSettings, readGameConfig, type QueueSettings } from "./settings.js";
 
 /**
@@ -134,6 +135,8 @@ export interface QueueOptions {
   alive?: (pid: number) => boolean;
   log?: (line: string) => void;
   timings?: Partial<Timings>;
+  /** The git a publish asks of the synced checkout (tests replace it) */
+  git?: PublishGit;
 }
 
 const LAZY_SAVE_MS = 5000;
@@ -176,6 +179,8 @@ export class PlaceQueue {
   readonly folder: string;
   name?: string;
   readonly lock: StudioLock;
+  /** Clients waiting to publish the place: one publish answers all it covers */
+  readonly publishes: PublishLine;
   private jobs = new Map<string, Job>();
   private readonly port: StudioPort;
   private readonly now: () => number;
@@ -236,6 +241,16 @@ export class PlaceQueue {
       onGrantEnd: (record) => this.history({ ...record }),
       onChange: (clockOnly) => this.scheduleSave(clockOnly),
     });
+    this.publishes = new PublishLine({
+      folder: this.folder,
+      lock: this.lock,
+      git: options.git ?? publishGit,
+      now: this.now,
+      onChange: () => this.scheduleSave(),
+      history: (entry) => this.history(entry),
+      log: this.log,
+      kick: () => this.kick(),
+    });
     this.load();
   }
 
@@ -264,6 +279,7 @@ export class PlaceQueue {
       this.jobs.set(job.id, { ...job, state: "pending" });
     }
     this.lock.restore(saved?.lock);
+    this.publishes.restore(saved?.publish);
     if (saved?.play && typeof saved.play.token === "string" && Array.isArray(saved.play.roots)) {
       this.adoptable = { token: saved.play.token, roots: saved.play.roots.map(String) };
     }
@@ -300,6 +316,7 @@ export class PlaceQueue {
       savedAt: this.now(),
       jobs: [...this.jobs.values()],
       lock: this.lock.serialize(),
+      publish: this.publishes.serialize(),
       play: this.playing && this.playToken ? { token: this.playToken, roots: this.playRoots } : (this.adoptable ?? null),
     };
     try {
@@ -433,6 +450,7 @@ export class PlaceQueue {
   tick(): void {
     const ended = this.lock.tick();
     if (ended) this.log(`queue: the Studio lock ended (${ended})`);
+    this.publishes.tick();
     for (const job of [...this.jobs.values()]) {
       if (job.state !== "pending" || !job.client.pid || this.alive(job.client.pid)) continue;
       this.jobs.delete(job.id);
@@ -477,6 +495,7 @@ export class PlaceQueue {
       play: this.playing
         ? { roots: this.playRoots, since: this.playStartedAt, jobs: this.jobsInPlay, held: this.holdActive() ? { client: this.hold!.client, leftMs: this.hold!.until - now } : null }
         : null,
+      publish: this.publishes.status(),
       today: this.stats(now),
     };
   }

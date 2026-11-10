@@ -568,6 +568,13 @@ async function renderQueue(target) {
           holder && h("span", { class: "hint" }, [holder.requestedMin ? t("queueAsked", { n: holder.requestedMin }) : null, t("queueLastCall", { d: span(holder.idleMs), tool: holder.tool })].filter(Boolean).join(" · "))),
         holder ? release : h("span", { class: "pill live" }, t("queueFree"))),
       q.cap?.active ? h("p", { class: "note" }, t("queueCapped", { who: q.cap.clientId })) : null,
+      q.publish?.current ? h("div", { class: "field" },
+        h("span", { class: "grow" }, t("queuePublishing", { who: who(q.publish.current.client), d: span(q.publish.current.ms) }),
+          q.publish.current.head ? h("span", { class: "hint mono" }, q.publish.current.head.slice(0, 8)) : null),
+        q.publish.current.riders?.length ? h("span", { class: "pill sky" }, t("queueRiders", { n: q.publish.current.riders.length })) : null) : null,
+      q.publish?.last ? h("p", { class: "note" }, [
+        t("queueLastPublish", { what: q.publish.last.version !== undefined ? `v${q.publish.last.version}` : (q.publish.last.head ?? "").slice(0, 8), who: who(q.publish.last.client), d: span(Date.now() - q.publish.last.at) }),
+        q.publish.last.covered?.length ? t("queueLastCovered", { n: q.publish.last.covered.length }) : null].filter(Boolean).join(" · ")) : null,
       h("div", { class: "field" }, h("span", { class: "grow" }, t("queuePhase")), h("span", { class: "mono muted" }, q.phase)));
 
     const waiting = h("div", { class: "card chunk" }, h("span", { class: "label" }, t("queueWaiting")));
@@ -576,7 +583,8 @@ async function renderQueue(target) {
       h("span", { class: "mono muted" }, `${i + 1}.`),
       h("span", { class: "grow" }, who(w.client), w.task ? h("span", { class: "hint" }, w.task) : null),
       w.rush ? h("span", { class: "pill bad" }, t("queueRush")) : null,
-      w.exclusive ? h("span", { class: "pill sky" }, t("queueLive")) : null,
+      w.publish ? h("span", { class: "pill warn", title: w.publish.commit ?? "" }, w.publish.commit ? `${t("queuePublishPill")} ${w.publish.commit.slice(0, 8)}` : t("queuePublishPill"))
+        : w.exclusive ? h("span", { class: "pill sky" }, t("queueLive")) : null,
       h("span", { class: "pill brand", title: w.effectiveLevel !== w.level ? t("queueWasLevel", { level: w.level }) : "" }, w.effectiveLevel),
       h("span", { class: "pill mono" }, `~${w.holdMin} min`),
       h("span", { class: "mono muted" }, span(w.waitedMs)))));

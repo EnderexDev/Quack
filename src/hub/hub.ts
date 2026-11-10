@@ -718,7 +718,7 @@ export class QuackHub {
     return {
       build: BUNDLED_BUILD ?? "dist",
       // What this hub can do beyond syncing: clients look here before using an API
-      capabilities: ["queue", "approvals"],
+      capabilities: ["queue", "approvals", "publish"],
       queues: this.queues.summary(),
       startedAt: this.startedAt,
       paused: this.paused,
@@ -934,7 +934,9 @@ export class QuackHub {
             return;
           }
           if (url.pathname.startsWith("/api/queue")) {
-            return send(200, this.queues.handlePost(url.pathname, body));
+            const answer = this.queues.handlePost(url.pathname, body);
+            if (answer instanceof Promise) return void answer.then((value) => send(200, value), fail);
+            return send(200, answer);
           }
           if (url.pathname === "/api/cloud") {
             // One named Open Cloud operation, run with the key only this process holds; a

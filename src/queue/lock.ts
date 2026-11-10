@@ -35,6 +35,14 @@ export interface Holder {
   level?: Level;
   task?: string;
   runner?: boolean;
+  /** Holds Studio to publish the place (publish.ts) */
+  publish?: PublishWant;
+}
+
+/** A place in line that wants the place published, not Studio for itself (publish.ts) */
+export interface PublishWant {
+  ticket: string;
+  commit?: string;
 }
 
 export interface Waiter {
@@ -46,6 +54,8 @@ export interface Waiter {
   since: number;
   /** Wants Studio live: the runner finishes its batch and hands Studio over */
   exclusive: boolean;
+  /** Wants the place published: one publish answers every such entry it covers */
+  publish?: PublishWant;
 }
 
 export interface Cap {
@@ -186,6 +196,7 @@ export class StudioLock {
       lastUsed: now,
       requestedMin: mine ? mine.holdMin : null,
       ...(mine ? { level: mine.level, task: mine.task } : {}),
+      ...(mine?.publish ? { publish: mine.publish } : {}),
       ...(runner ? { runner: true } : {}),
     };
     // Served: its place in line is done (the waiting process leaving later changes nothing)
@@ -241,6 +252,13 @@ export class StudioLock {
   leave(clientId: string, pid?: number): void {
     const before = this.state.waiters.length;
     this.state.waiters = this.state.waiters.filter((w) => !(w.client.id === clientId && (pid === undefined || w.client.pid === pid)));
+    if (before !== this.state.waiters.length) this.changed();
+  }
+
+  /** Only the place in line of that publish ticket: a newer entry of the same client stays */
+  leaveTicket(ticket: string): void {
+    const before = this.state.waiters.length;
+    this.state.waiters = this.state.waiters.filter((w) => w.publish?.ticket !== ticket);
     if (before !== this.state.waiters.length) this.changed();
   }
 

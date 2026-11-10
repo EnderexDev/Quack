@@ -6,6 +6,12 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.25] - 2026-11-10
+
+### Added
+- Publishing goes through the Studio queue: `quack queue publish [place] [--commit <sha>] -- <command>` waits for Studio like any client, stops the queue's play first (Studio publishes nothing during a play), then runs the command that publishes. Studio publishes everything it holds, so one publish answers every client waiting to publish that it covers: a `--commit` already in the synced checkout it shipped, or a client that asked before it took Studio. Those exit 0 with that publish's version and run nothing. A failed publish covers nobody, and the next client in line publishes. A commit that is not in the synced checkout yet is refused, and one an earlier publish already shipped is answered at once.
+- `quack queue` and the app's Queue tab show who is publishing, how many ride on that publish, and the last publish.
+
 ## [1.0.24] - 2026-11-10
 
 ### Added
@@ -316,7 +322,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.24...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.25...HEAD
+[1.0.25]: https://github.com/EnderexDev/Quack/compare/v1.0.24...v1.0.25
 [1.0.24]: https://github.com/EnderexDev/Quack/compare/v1.0.23...v1.0.24
 [1.0.23]: https://github.com/EnderexDev/Quack/compare/v1.0.22...v1.0.23
 [1.0.22]: https://github.com/EnderexDev/Quack/compare/v1.0.21...v1.0.22

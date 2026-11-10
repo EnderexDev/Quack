@@ -4,6 +4,7 @@ import { isLevel, RUNNER, type Client } from "./lock.js";
 import { PlaceQueue, queueDir, readClient, type StudioPort, type Timings } from "./queue.js";
 import { loadSettings, saveSettings, SettingsError, settingsFileFor, type QueueSettings } from "./settings.js";
 import { parseJob, samePath, untrackable } from "./disk.js";
+import { PublishError, type PublishGit } from "./publish.js";
 
 /**
  * The hub's side of the Studio queue: one PlaceQueue per registered place, the clock that ticks
@@ -17,6 +18,12 @@ import { parseJob, samePath, untrackable } from "./disk.js";
  * POST /api/queue/lock    { placeId, op, client, ... } op: claim | touch | release | join | leave
  * POST /api/queue/release-all { client: { id }, placeId? }   the client is done: every lock and place in line it has
  * POST /api/queue/force-release { placeId }   the app's one button: frees the lock whoever holds it
+ * POST /api/queue/publish { placeId, op, ... }  publishing the place (publish.ts):
+ *      join { client, commit?, task?, level?, rush? }  a ticket, or the publish that already shipped the commit
+ *      claim { ticket }   the ticket's turn ("yours": publish now), "waiting", or the publish that covered it
+ *      touch { ticket }   the publish command still runs: the hold does not idle out
+ *      done { ticket, ok, version?, commit?, reason? }   what the command did; a publish answers the tickets it covers
+ *      leave { ticket }   the client gave up
  */
 
 export class QueueError extends Error {
@@ -41,6 +48,7 @@ export interface QueuesOptions {
   now?: () => number;
   alive?: (pid: number) => boolean;
   tickMs?: number;
+  git?: PublishGit;
 }
 
 const MAX_SOURCE = 512 * 1024;
@@ -127,6 +135,7 @@ export class HubQueues {
         ...(this.options.timings ? { timings: this.options.timings } : {}),
         ...(this.options.now ? { now: this.options.now } : {}),
         ...(this.options.alive ? { alive: this.options.alive } : {}),
+        ...(this.options.git ? { git: this.options.git } : {}),
       });
       this.queues.set(placeId, queue);
     }
@@ -165,12 +174,18 @@ export class HubQueues {
     throw new QueueError(404, "not found");
   }
 
+  /** An answer, or a promise of one (a publish asks git); either way a refusal is a QueueError */
   handlePost(pathname: string, body: Record<string, any>): unknown {
-    try {
-      return this.post(pathname, body);
-    } catch (error) {
+    const asQueueError = (error: unknown): never => {
       if (error instanceof QueueError) throw error;
+      if (error instanceof PublishError) throw new QueueError(error.status, error.message);
       throw new QueueError(400, (error as Error).message);
+    };
+    try {
+      const answer = this.post(pathname, body);
+      return answer instanceof Promise ? answer.catch(asQueueError) : answer;
+    } catch (error) {
+      return asQueueError(error);
     }
   }
 
@@ -213,6 +228,8 @@ export class HubQueues {
       }
       case "/api/queue/lock":
         return this.lockOp(body);
+      case "/api/queue/publish":
+        return this.publishOp(body);
       case "/api/queue/release-all": {
         const id = typeof body.client?.id === "string" ? body.client.id : null;
         if (!id) throw new QueueError(400, "client.id is required");
@@ -232,6 +249,42 @@ export class HubQueues {
       }
     }
     throw new QueueError(404, "not found");
+  }
+
+  private publishOp(body: Record<string, any>): Promise<unknown> {
+    const queue = this.queueOf(body.placeId);
+    const line = queue.publishes;
+    const ticket = typeof body.ticket === "string" ? body.ticket : "";
+    switch (body.op) {
+      case "join": {
+        const commit = typeof body.commit === "string" && body.commit.trim() ? body.commit.trim().slice(0, 200) : undefined;
+        return line.join({
+          client: readClient(body.client),
+          ...(commit ? { commit } : {}),
+          ...(typeof body.task === "string" && body.task ? { task: body.task.slice(0, 300) } : {}),
+          level: isLevel(body.level) ? body.level : "blocking",
+          rush: body.rush === true,
+        });
+      }
+      case "claim":
+        return line.claim(ticket);
+      case "touch":
+        return Promise.resolve(line.touch(ticket));
+      case "done": {
+        const version = typeof body.version === "number" || (typeof body.version === "string" && body.version) ? body.version : undefined;
+        return line.done(ticket, {
+          ok: body.ok === true,
+          ...(version !== undefined ? { version } : {}),
+          ...(typeof body.commit === "string" && body.commit ? { commit: body.commit } : {}),
+          ...(typeof body.reason === "string" && body.reason ? { reason: body.reason.slice(0, 500) } : {}),
+        });
+      }
+      case "leave":
+        return line.leave(ticket);
+      case "status":
+        return Promise.resolve(line.status());
+    }
+    throw new QueueError(400, "op must be join, claim, touch, done, leave or status");
   }
 
   private lockOp(body: Record<string, any>): unknown {

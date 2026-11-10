@@ -807,7 +807,7 @@ test("hub API: capability, settings, the lock and its line, a job kept over a hu
   await hub.start();
   try {
     const state = (await api(port, "GET", "/api/state")).body;
-    assert.deepEqual(state.capabilities, ["queue", "approvals"]);
+    assert.deepEqual(state.capabilities, ["queue", "approvals", "publish"]);
 
     assert.equal((await api(port, "POST", "/api/queue/settings", { settings: { capMin: -3 } })).status, 400);
     const set = await api(port, "POST", "/api/queue/settings", { settings: { capMin: 4 } });
@@ -1080,6 +1080,353 @@ test("queue: the day's numbers are read again only when the history grew", { tim
     assert.equal(queue.stats(), first, "the same numbers while nothing was written");
     await verdictOf(queue, queue.submit(me, job("two", folder)).id);
     assert.equal(queue.stats().jobs, 2);
+  } finally {
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+// ---------------------------------------------------------------------------------------
+// Publishing through the queue (publish.ts): one publish answers every ticket it covers
+
+const pub = (id: string, extra: { commit?: string; pid?: number; level?: Waiter["level"] } = {}) => ({
+  client: { id, name: id.toUpperCase(), pid: extra.pid ?? process.pid },
+  ...(extra.commit ? { commit: extra.commit } : {}),
+  level: extra.level ?? ("blocking" as const),
+  rush: false,
+});
+
+test("publish: one publish answers the tickets it covers; a commit not landed is refused; one already shipped is answered at once", { timeout: 30_000 }, async () => {
+  const { tmp, folder, wt } = makeGame(true);
+  const { port } = fakeStudio(folder);
+  const { queue } = makeQueue(folder, port);
+  try {
+    const h1 = git(folder, "rev-parse", "HEAD").trim();
+    queue.lock.claim({ id: "holder", pid: process.pid }, "solo_playtest");
+    const a: any = await queue.publishes.join(pub("a"));
+    const b: any = await queue.publishes.join(pub("b", { commit: h1.slice(0, 10) }));
+    assert.equal(a.state, "waiting");
+    // A commit that lives only in a worktree's branch: Studio holds the synced folder, never that
+    git(wt.wtA, "commit", "-qam", "branch only");
+    const onBranch = git(wt.wtA, "rev-parse", "HEAD").trim();
+    await assert.rejects(queue.publishes.join(pub("c", { commit: onBranch })), /not in the synced checkout's HEAD/);
+    await assert.rejects(queue.publishes.join(pub("c", { commit: "nope1234" })), /is not in the synced checkout/);
+    await assert.rejects(queue.publishes.join(pub("c", { commit: "--all" })), /is not in the synced checkout/);
+    assert.equal(((await queue.publishes.claim(a.ticket)) as any).state, "waiting", "held by someone else");
+
+    queue.lock.release("holder");
+    const mine: any = await queue.publishes.claim(a.ticket);
+    assert.equal(mine.state, "yours");
+    assert.equal(mine.head, h1);
+    assert.deepEqual(mine.riders.map((r: any) => r.client.id), ["b"]);
+    const riding: any = await queue.publishes.claim(b.ticket);
+    assert.equal(riding.state, "waiting");
+    assert.equal(riding.publishing.client.id, "a");
+    assert.equal(riding.publishing.rides, true);
+    // Asked after a took Studio, with no commit: what it wants may not be in this publish
+    const late: any = await queue.publishes.join(pub("late", { level: "normal" }));
+    assert.equal(queue.status().publish.current!.riders.length, 1);
+
+    const done: any = await queue.publishes.done(a.ticket, { ok: true, version: 81 });
+    assert.equal(done.state, "published");
+    assert.deepEqual(done.publish.covered.map((c: any) => c.client.id), ["b"]);
+    const answered: any = await queue.publishes.claim(b.ticket);
+    assert.equal(answered.state, "covered");
+    assert.equal(answered.publish.version, 81);
+    assert.equal(answered.publish.client.id, "a");
+    assert.equal(queue.lock.state.waiters.some((w) => w.client.id === "b"), false, "b left the line without taking Studio");
+    assert.equal(queue.lock.state.holder, null, "a's publish gave Studio back");
+
+    assert.equal(((await queue.publishes.claim(late.ticket)) as any).state, "yours", "the late one publishes on its own");
+    await queue.publishes.done(late.ticket, { ok: true, version: 82 });
+    const again: any = await queue.publishes.join(pub("d", { commit: h1 }));
+    assert.equal(again.state, "published");
+    assert.equal(again.publish.version, 82);
+    assert.equal(queue.lock.state.waiters.length, 0, "an answered join never enters the line");
+  } finally {
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+test("publish: a failed publish covers nobody, and a publisher whose process ends loses Studio: the next ticket publishes", { timeout: 30_000 }, async () => {
+  const { tmp, folder } = makeGame(true);
+  const { port } = fakeStudio(folder);
+  const alive = new Set([1, 2, 3]);
+  const { queue } = makeQueue(folder, port, {}, { alive: (pid) => alive.has(pid) });
+  try {
+    const a: any = await queue.publishes.join(pub("a", { pid: 1 }));
+    const b: any = await queue.publishes.join(pub("b", { pid: 2 }));
+    const c: any = await queue.publishes.join(pub("c", { pid: 3 }));
+    assert.equal(((await queue.publishes.claim(a.ticket)) as any).state, "yours");
+    const failed: any = await queue.publishes.done(a.ticket, { ok: false, reason: "Studio did not come to the front" });
+    assert.equal(failed.state, "failed");
+    assert.equal(((await queue.publishes.claim(b.ticket)) as any).state, "yours", "b was not covered by a failure");
+    alive.delete(2);
+    queue.tick();
+    const lost: any = await queue.publishes.claim(b.ticket);
+    assert.equal(lost.state, "failed");
+    assert.match(lost.reason, /hold ended before it said it published/);
+    assert.equal(((await queue.publishes.claim(c.ticket)) as any).state, "yours");
+    alive.delete(3);
+    queue.tick();
+    assert.equal(queue.status().publish.current, null);
+  } finally {
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+test("publish: the runner stops its lingering play and hands Studio to a ticket", { timeout: 30_000 }, async () => {
+  const { tmp, folder } = makeGame();
+  const { s, port } = fakeStudio(folder);
+  const { queue } = makeQueue(folder, port, { lingerSec: 30 });
+  try {
+    await verdictOf(queue, queue.submit(me, job("warm", folder)).id);
+    assert.equal(s.playing, true, "the play lingers");
+    const t: any = await queue.publishes.join(pub("publisher"));
+    const end = Date.now() + 5000;
+    let answer: any;
+    do {
+      await wait(10);
+      answer = await queue.publishes.claim(t.ticket);
+    } while (answer.state !== "yours" && Date.now() < end);
+    assert.equal(answer.state, "yours");
+    assert.equal(s.playing, false, "Studio publishes nothing during a play: it was stopped first");
+    await queue.publishes.done(t.ticket, { ok: true });
+  } finally {
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+test("publish: the tickets and the publish running survive a hub restart", { timeout: 30_000 }, async () => {
+  const { tmp, folder } = makeGame(true);
+  const { port } = fakeStudio(folder);
+  const first = makeQueue(folder, port);
+  const later: ReturnType<typeof makeQueue>[] = [];
+  try {
+    const h1 = git(folder, "rev-parse", "HEAD").trim();
+    const a: any = await first.queue.publishes.join(pub("a"));
+    const b: any = await first.queue.publishes.join(pub("b", { commit: h1 }));
+    assert.equal(((await first.queue.publishes.claim(a.ticket)) as any).state, "yours");
+    first.queue.stop();
+    const second = makeQueue(folder, port);
+    later.push(second);
+    const resumed: any = await second.queue.publishes.claim(a.ticket);
+    assert.equal(resumed.state, "yours", "still a's turn");
+    assert.equal(resumed.head, h1);
+    const done: any = await second.queue.publishes.done(a.ticket, { ok: true, version: 7 });
+    assert.deepEqual(done.publish.covered.map((c: any) => c.ticket), [b.ticket]);
+    second.queue.stop();
+    const third = makeQueue(folder, port);
+    later.push(third);
+    assert.equal(((await third.queue.publishes.claim(b.ticket)) as any).state, "covered", "the answer is kept too");
+  } finally {
+    first.queue.stop();
+    for (const q of later) q.queue.stop();
+    removeDir(tmp);
+  }
+});
+
+test("publish: a publish that went out after its hold was freed by hand still counts and answers its riders", { timeout: 30_000 }, async () => {
+  const { tmp, folder } = makeGame(true);
+  const { port } = fakeStudio(folder);
+  const { queue } = makeQueue(folder, port);
+  try {
+    const h1 = git(folder, "rev-parse", "HEAD").trim();
+    const a: any = await queue.publishes.join(pub("a"));
+    const b: any = await queue.publishes.join(pub("b", { commit: h1 }));
+    assert.equal(((await queue.publishes.claim(a.ticket)) as any).state, "yours");
+    // The app's one button while a's command still runs
+    queue.lock.release(null, true);
+    queue.tick();
+    assert.equal(((await queue.publishes.claim(a.ticket)) as any).state, "failed");
+    const done: any = await queue.publishes.done(a.ticket, { ok: true, version: 90 });
+    assert.equal(done.state, "published", "the command published: that is the truth, not the lock");
+    assert.equal(done.reason, undefined);
+    assert.deepEqual(done.publish.covered.map((c: any) => c.client.id), ["b"]);
+    assert.equal(((await queue.publishes.claim(b.ticket)) as any).state, "covered");
+    // A failure after a lost hold stays a failure
+    const c: any = await queue.publishes.join(pub("c"));
+    assert.equal(((await queue.publishes.claim(c.ticket)) as any).state, "yours");
+    queue.lock.release(null, true);
+    queue.tick();
+    assert.equal(((await queue.publishes.done(c.ticket, { ok: false })) as any).state, "failed");
+  } finally {
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+/** A git whose answers wait on a gate the test opens: the races between a publish and git */
+function gatedGit() {
+  const g = {
+    headSha: "h1" as string | null,
+    /** "a>b": a is an ancestor of b */
+    ancestors: new Set<string>(["c1>h1", "c1>h2", "h1>h2"]),
+    gate: null as Promise<void> | null,
+    open: () => {},
+    hold() {
+      g.gate = new Promise<void>((r) => (g.open = () => {
+        g.gate = null;
+        r();
+      }));
+    },
+    async head() {
+      return g.headSha;
+    },
+    async resolve(_folder: string, ref: string) {
+      return /^[ch]\d$/.test(ref) ? ref : null;
+    },
+    async isAncestor(_folder: string, a: string, b: string) {
+      if (g.gate) await g.gate;
+      return a === b || g.ancestors.has(`${a}>${b}`);
+    },
+  };
+  return g;
+}
+
+function gatedQueue(folder: string, port: StudioPort, git: ReturnType<typeof gatedGit>) {
+  return new PlaceQueue({ placeId: "1", folder, port, settings: () => FAST_SETTINGS, timings: FAST, git });
+}
+
+test("publish review: an answer keeps its own publish after a newer one; a ticket covered while join asked git is answered", { timeout: 20_000 }, async () => {
+  const { tmp, folder } = makeGame();
+  const { port } = fakeStudio(folder);
+  const g = gatedGit();
+  const queue = gatedQueue(folder, port, g);
+  try {
+    const a: any = await queue.publishes.join(pub("a"));
+    const b: any = await queue.publishes.join(pub("b"));
+    await queue.publishes.claim(a.ticket);
+    await queue.publishes.done(a.ticket, { ok: true, version: 1 });
+    const c: any = await queue.publishes.join(pub("c"));
+    await queue.publishes.claim(c.ticket);
+    await queue.publishes.done(c.ticket, { ok: true, version: 2 });
+    const old: any = await queue.publishes.claim(b.ticket);
+    assert.equal(old.state, "covered");
+    assert.equal(old.publish.version, 1, "b's answer is the publish that covered it, not the newest");
+
+    // d asks with c1 while e's publish of h1 is answered: d must not wait for a publish of its own
+    const e: any = await queue.publishes.join(pub("e"));
+    await queue.publishes.claim(e.ticket);
+    g.hold();
+    const joining = queue.publishes.join(pub("d", { commit: "c1" }));
+    await wait(20);
+    g.open();
+    // e's done runs while d's join waited on git
+    g.hold();
+    const finishing = queue.publishes.done(e.ticket, { ok: true, version: 3 });
+    await wait(20);
+    g.open();
+    await finishing;
+    const d: any = await joining;
+    assert.equal(d.state, "published");
+    assert.equal(queue.lock.state.waiters.length, 0, "d left no place in line");
+  } finally {
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+test("publish review: a hold lost while claim asked git is never 'yours'; a rider that left and came back keeps its new place", { timeout: 20_000 }, async () => {
+  const { tmp, folder } = makeGame();
+  const { port } = fakeStudio(folder);
+  const g = gatedGit();
+  const queue = gatedQueue(folder, port, g);
+  try {
+    const a: any = await queue.publishes.join(pub("a"));
+    await queue.publishes.join(pub("rider", { commit: "c1" }));
+    g.hold();
+    const claiming = queue.publishes.claim(a.ticket);
+    await wait(20);
+    queue.lock.release(null, true);
+    queue.tick();
+    g.open();
+    const answer: any = await claiming;
+    assert.notEqual(answer.state, "yours");
+    assert.equal(answer.state, "failed");
+
+    const p: any = await queue.publishes.join(pub("p"));
+    const r1: any = await queue.publishes.join(pub("r", { commit: "c1" }));
+    const ranked = () => queue.lock.ranked().map((w) => w.publish?.ticket);
+    // The rider stays: p claims only after r1 is not ahead of it
+    for (const w of queue.lock.state.waiters) if (w.publish?.ticket === p.ticket) w.rush = true;
+    assert.equal(((await queue.publishes.claim(p.ticket)) as any).state, "yours");
+    g.hold();
+    const finishing = queue.publishes.done(p.ticket, { ok: true, version: 5 });
+    await wait(20);
+    await queue.publishes.leave(r1.ticket);
+    const r2: any = await queue.publishes.join(pub("r"));
+    g.open();
+    await finishing;
+    assert.equal(((await queue.publishes.claim(r1.ticket)) as any).state, "left", "the ticket that left is not answered");
+    assert.ok(ranked().includes(r2.ticket), "the rider's new place in line stays");
+  } finally {
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+test("publish review: a ticket whose commit left the synced checkout publishes nothing", { timeout: 20_000 }, async () => {
+  const { tmp, folder } = makeGame();
+  const { port } = fakeStudio(folder);
+  const g = gatedGit();
+  const queue = gatedQueue(folder, port, g);
+  try {
+    const a: any = await queue.publishes.join(pub("a", { commit: "c1" }));
+    // A reset in the synced checkout: HEAD no longer holds c1
+    g.headSha = "h9";
+    const answer: any = await queue.publishes.claim(a.ticket);
+    assert.equal(answer.state, "failed");
+    assert.match(answer.reason, /no longer in the synced checkout's HEAD/);
+    assert.equal(queue.lock.state.holder, null, "Studio went back");
+  } finally {
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+test("publish review 2: a request answered at once replaces the client's older one; 'yours' only while Studio is held; no riders for a lost publish", { timeout: 20_000 }, async () => {
+  const { tmp, folder } = makeGame();
+  const { port } = fakeStudio(folder);
+  const g = gatedGit();
+  const queue = gatedQueue(folder, port, g);
+  try {
+    const a: any = await queue.publishes.join(pub("a"));
+    await queue.publishes.claim(a.ticket);
+    await queue.publishes.done(a.ticket, { ok: true, version: 1 });
+    queue.lock.claim({ id: "holder", pid: process.pid }, "solo_playtest");
+    const older: any = await queue.publishes.join(pub("s"));
+    assert.equal(older.position, 1);
+    const again: any = await queue.publishes.join(pub("s", { commit: "h1" }));
+    assert.equal(again.state, "published");
+    assert.equal(((await queue.publishes.claim(older.ticket)) as any).state, "left", "the older request of s left the line");
+    assert.equal(queue.lock.state.waiters.length, 0);
+    queue.lock.release("holder");
+
+    // Studio freed by hand right after "yours", before the second's tick: asking again is not "yours"
+    const b: any = await queue.publishes.join(pub("b"));
+    assert.equal(((await queue.publishes.claim(b.ticket)) as any).state, "yours");
+    queue.lock.release(null, true);
+    assert.equal(((await queue.publishes.claim(b.ticket)) as any).state, "failed");
+    assert.equal(queue.status().publish.current, null);
+
+    // The hold ends while claim computes the riders: no ticket shows as riding a publish that is gone
+    // A new commit landed after the last publish: the rider waits for the next one
+    g.headSha = "h2";
+    g.ancestors.add("c3>h2");
+    const c: any = await queue.publishes.join(pub("c"));
+    const rider: any = await queue.publishes.join(pub("r", { commit: "c3" }));
+    assert.equal(rider.state, "waiting");
+    g.hold();
+    const claiming = queue.publishes.claim(c.ticket);
+    await wait(20);
+    queue.lock.release(null, true);
+    g.open();
+    assert.equal(((await claiming) as any).state, "failed");
+    assert.equal(queue.status().publish.waiting.find((w: any) => w.ticket === rider.ticket)!.rides, false);
   } finally {
     queue.stop();
     removeDir(tmp);

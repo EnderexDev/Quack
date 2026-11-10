@@ -78,7 +78,7 @@ interface Run {
   json: () => any;
 }
 
-function control(port: number, options: { flavor?: Flavor; cwd?: string; interactive?: boolean; answer?: boolean; opened?: string[] } = {}) {
+function control(port: number, options: { flavor?: Flavor; cwd?: string; interactive?: boolean; answer?: boolean; opened?: string[]; runCommand?: ControlContext["runCommand"] } = {}) {
   return async (...argv: string[]): Promise<Run> => {
     const out: string[] = [];
     const err: string[] = [];
@@ -93,6 +93,7 @@ function control(port: number, options: { flavor?: Flavor; cwd?: string; interac
       cwd: options.cwd ?? os.tmpdir(),
       openUri: async (uri) => void options.opened?.push(uri),
       pollMs: 50,
+      ...(options.runCommand ? { runCommand: options.runCommand } : {}),
     };
     const code = await runControl(argv, ctx);
     return { code, out: out.join("\n"), err: err.join("\n"), json: () => JSON.parse(out.join("\n")) };
@@ -1496,4 +1497,41 @@ test("changes --commit-balance: commits Studio's numbers alone through the hub a
   } finally {
     fs.rmSync(remote, { recursive: true, force: true });
   }
+});
+
+// rodada 4 of the queue Spec (10/11/26): several clients waiting to publish, one publish
+test("queue publish: two clients wait to publish, one publish answers both, the second runs nothing", { timeout: 60000 }, async () => {
+  await withHub(async ({ port, folders }) => {
+    const ran: { argv: string[]; env: Record<string, string> }[] = [];
+    const runCommand = (argv: string[], env: Record<string, string>) => {
+      ran.push({ argv, env });
+      fs.writeFileSync(env.QUACK_PUBLISH_RESULT, JSON.stringify({ version: 81 }));
+      return { exit: Promise.resolve(0), kill: () => {} };
+    };
+    const run = control(port, { cwd: folders["111"], runCommand });
+    const post = (pathname: string, body: unknown) =>
+      fetch(`http://127.0.0.1:${port}${pathname}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }).then((r) => r.json());
+    await post("/api/queue/lock", { placeId: "111", op: "claim", client: { id: "s1", name: "session one", pid: process.pid }, tool: "solo_playtest" });
+    const first = run("queue", "publish", "--client", "pa", "--name", "A", "--", "node", "publish.mjs", "--flag");
+    await waitFor(async () => (await run("queue", "--json")).json().waiters.length === 1);
+    const second = run("queue", "publish", "--client", "pb", "--name", "B", "--", "node", "publish.mjs");
+    await waitFor(async () => (await run("queue", "--json")).json().waiters.length === 2);
+    assert.match((await run("queue")).out, /1\. blocking, ~2 min, waiting \d+ s, publish: A \(pa\): publish/);
+    await post("/api/queue/force-release", { placeId: "111" });
+    const [a, b] = await Promise.all([first, second]);
+    assert.equal(a.code, 0, a.out + a.err);
+    assert.match(a.out, /Published version 81\. It answered 1 more: B \(pb\)\./);
+    assert.equal(b.code, 0, b.out + b.err);
+    assert.match(b.out, /Published by A \(pa\): version 81, \d+ s ago\. Nothing to run\./);
+    assert.equal(ran.length, 1, "only one publish ran");
+    assert.deepEqual(ran[0].argv, ["node", "publish.mjs", "--flag"], "everything after -- is the command, never Quack's options");
+    assert.equal(ran[0].env.QUACK_PUBLISH_RIDERS, "1");
+    assert.match((await run("queue")).out, /last publish: version 81 by A \(pa\), \d+ s ago, answered 1 more/);
+
+    assert.equal((await run("queue", "publish")).code, 1, "no command after --");
+    const notGit = await run("queue", "publish", "--commit", "abc1234", "--", "node", "x");
+    assert.equal(notGit.code, 1);
+    assert.match(notGit.err, /commit abc1234 is not in the synced checkout/);
+    assert.equal(ran.length, 1);
+  });
 });

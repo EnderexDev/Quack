@@ -160,6 +160,31 @@ function git(cwd: string, args: string[]): Promise<string> {
   });
 }
 
+/** The git questions a publish asks of the synced checkout (publish.ts), off the event loop */
+export const publishGit = {
+  async head(folder: string): Promise<string | null> {
+    try {
+      return (await git(folder, ["rev-parse", "--verify", "HEAD"])).trim() || null;
+    } catch {
+      return null;
+    }
+  },
+  async resolve(folder: string, ref: string): Promise<string | null> {
+    // A name git could read as an option or a range is no commit
+    if (!/^[\w./-]+$/.test(ref) || ref.startsWith("-")) return null;
+    try {
+      return (await git(folder, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`])).trim() || null;
+    } catch {
+      return null;
+    }
+  },
+  isAncestor(folder: string, commit: string, head: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      execFile("git", ["-C", folder, "merge-base", "--is-ancestor", commit, head], { windowsHide: true, timeout: 20_000 }, (error) => resolve(!error));
+    });
+  },
+};
+
 /**
  * The scripts `folder`'s branch changed since it forked from `syncedRoot`'s HEAD, committed or
  * not (merge-base, diff --name-only, under sync/), as the play's overlay reads them: an untracked
