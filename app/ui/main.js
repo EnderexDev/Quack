@@ -837,39 +837,134 @@ function aiCard(ai) {
 }
 
 /**
- * Connect to AI: finds Claude Code, Cursor and Codex, shows which have this Quack's MCP, and
- * adds it only after the Connect click (the first click only looks).
+ * What a connect puts in place: the MCP server, Quack's rule in the AI's instructions and, in
+ * Claude Code, Quack's guard. A folder missing any of them (an older rule, a folder connected
+ * before the guard existed) needs connecting again.
+ */
+const aiNeeds = (c) => c.installed && (!c.connected || c.guarded === false || c.rule === "outdated" || c.rule === "missing");
+const aiState = (c) => c.problem ? c.problem : t(!c.installed ? "mcpMissing" : !c.connected ? "mcpNo" : aiNeeds(c) ? "mcpUpdate" : "mcpHas");
+
+/**
+ * Connect to AI asks first: every Claude Code, Codex and Cursor config folder found, each with a
+ * box, and only the ones ticked are written. The folders ticked last time come ticked; with no
+ * choice saved yet, only each AI's default folder does, so an account folder (a T3 Code provider,
+ * ~/.claude-*) gets Quack only when the user ticks it. Resolves with the connect's result, or
+ * null when closed without connecting.
+ */
+function aiConnectDialog() {
+  return new Promise((resolve) => {
+    document.getElementById("aiConnect")?.remove();
+    const list = h("div", { class: "setup-options" }, h("p", { class: "note" }, t("mcpFinding")));
+    const go = h("button", { class: "btn yellow chunk-bright press", disabled: true }, t("mcpConnect"));
+    const cancel = h("button", { class: "btn dark chunk press" }, t("cancel"));
+    const picked = new Set();
+    let clients = [];
+    let busy = false;
+    let dialog;
+    const close = (result) => {
+      dialog.remove();
+      resolve(result);
+    };
+    const paint = () => {
+      go.disabled = busy || !picked.size;
+      go.textContent = busy ? t("mcpConnecting") : picked.size ? `${t("mcpConnect")} (${picked.size})` : t("mcpConnect");
+    };
+    const row = (c) => {
+      const box = h("input", { type: "checkbox", disabled: !c.installed || busy });
+      box.checked = picked.has(c.id);
+      box.addEventListener("change", () => {
+        if (box.checked) picked.add(c.id); else picked.delete(c.id);
+        paint();
+      });
+      return h("label", { class: `setup-option ai-option${c.installed ? "" : " off"}` },
+        box,
+        h("div", { class: "grow" }, h("b", {}, c.label), c.dir ? h("span", { class: "mono muted", title: c.dir }, c.dir) : null),
+        h("span", { class: c.connected ? "pill brand" : c.problem ? "pill bad" : "pill", title: c.problem ?? "" }, aiState(c)));
+    };
+    const show = (found) => {
+      clients = found;
+      list.replaceChildren(...clients.map(row));
+      if (!clients.some((c) => c.installed)) list.append(h("p", { class: "note" }, t("mcpNone")));
+      paint();
+    };
+    go.addEventListener("click", async () => {
+      if (busy || !picked.size) return;
+      busy = true;
+      cancel.disabled = true;
+      show(clients);
+      const only = [...picked];
+      try {
+        const result = await invoke("ai_clients", { connect: true, only });
+        if (result.error) throw new Error(result.error);
+        // A saved choice for a folder not found today stays for the day it is back
+        const present = new Set(clients.map((c) => c.id));
+        const kept = (ui.settings.aiTargets ?? []).filter((id) => !present.has(id));
+        await invoke("set_settings", { aiTargets: [...kept, ...only] }).catch(() => {});
+        close({ ...result, only });
+      } catch (error) {
+        fail(error);
+        busy = false;
+        cancel.disabled = false;
+        show(clients);
+      }
+    });
+    cancel.addEventListener("click", () => close(null));
+    dialog = h("div", { id: "aiConnect", class: "overlay" },
+      h("div", { class: "card chunk dialog", role: "dialog", "aria-modal": "true", "aria-labelledby": "aiConnectTitle" },
+        h("span", { class: "label" }, t("mcpCard")),
+        h("h2", { class: "display", id: "aiConnectTitle" }, t("aiPickTitle")),
+        h("div", { class: "bar" }),
+        h("p", {}, t("aiPickNote")),
+        list,
+        h("div", { class: "actions" }, cancel, h("span", { class: "grow" }), go),
+        h("p", { class: "note" }, t("aiPickKeep"))));
+    dialog.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !busy) {
+        event.preventDefault();
+        close(null);
+      }
+    });
+    document.body.append(dialog);
+    cancel.focus();
+    invoke("ai_clients", { connect: false })
+      .then((result) => {
+        if (result?.error && !Array.isArray(result.clients)) throw new Error(result.error);
+        const saved = Array.isArray(ui.settings.aiTargets) ? new Set(ui.settings.aiTargets) : null;
+        for (const c of result.clients) {
+          if (c.installed && (saved ? saved.has(c.id) : !c.id.includes(":"))) picked.add(c.id);
+        }
+        show(result.clients);
+        go.focus();
+      })
+      .catch((error) => {
+        list.replaceChildren(h("p", { class: "note bad" }, String(error?.message ?? error)));
+      });
+  });
+}
+
+/**
+ * Connect to AI in Settings: what each AI folder has, and the button that opens the dialog to
+ * choose which of them to set up.
  */
 function mcpCard() {
   const card = h("div", { class: "card chunk" }, h("span", { class: "label" }, t("mcpCard")), h("p", { class: "note" }, t("mcpNote")));
   const list = h("div", {});
   const button = h("button", { class: "btn yellow chunk-bright press" }, t("mcpFind"));
   let found = null;
-  // One click puts all of it in place: the MCP server, Quack's rule in the AI's instructions and,
-  // in Claude Code, Quack's guard. A client missing any of them (an older rule, a folder
-  // connected before the guard existed) is connected again
-  const needs = (c) => c.installed && (!c.connected || c.guarded === false || c.rule === "outdated" || c.rule === "missing");
   const show = (clients) => {
     found = clients;
     list.replaceChildren(...clients.map((c) => h("div", { class: "field" },
       h("span", { class: "grow" }, c.label),
-      h("span", { class: c.connected ? "pill brand" : "pill", title: c.problem ?? "" }, c.problem ? c.problem : t(!c.installed ? "mcpMissing" : !c.connected ? "mcpNo" : needs(c) ? "mcpUpdate" : "mcpHas")))));
-    const toConnect = clients.filter(needs).length;
+      h("span", { class: c.connected ? "pill brand" : "pill", title: c.problem ?? "" }, aiState(c)))));
     if (!clients.some((c) => c.installed)) list.append(h("p", { class: "note" }, t("mcpNone")));
-    button.textContent = toConnect ? `${t("mcpConnect")} (${toConnect})` : t("mcpFind");
   };
   button.addEventListener("click", async () => {
-    const connect = !!found?.some(needs);
     button.disabled = true;
-    button.textContent = t(connect ? "mcpConnecting" : "mcpFinding");
     try {
-      const result = await invoke("ai_clients", { connect });
-      if (result.error) throw new Error(result.error);
+      const result = await aiConnectDialog();
+      if (!result) return;
       show(result.clients);
-      if (connect && result.clients.some((c) => c.connected)) toast(t("mcpRestart"));
-    } catch (error) {
-      fail(error);
-      button.textContent = t("mcpFind");
+      if (result.clients.some((c) => result.only.includes(c.id) && c.connected)) toast(t("mcpRestart"));
     } finally {
       button.disabled = false;
     }
@@ -980,24 +1075,23 @@ function renderRuleNotice() {
   ruleKey = key;
   bar.classList.toggle("hidden", !visible);
   if (!visible) return;
-  // The same as Settings' Connect to AI: the rule written into each AI's instructions, with its
-  // tools and guard
+  // The same dialog as Settings' Connect to AI: the user ticks which AI folders get the rule,
+  // with its tools and guard
   const connect = h("button", { class: "btn yellow chunk-bright press" }, t("mcpFind"));
   connect.addEventListener("click", async () => {
     connect.disabled = true;
-    connect.textContent = t("mcpConnecting");
     try {
-      const result = await invoke("ai_clients", { connect: true });
-      if (result.error) throw new Error(result.error);
-      const done = (result.clients ?? []).filter((c) => c.connected);
-      if (!done.length) throw new Error(t("mcpNone"));
+      const result = await aiConnectDialog();
+      if (!result) return;
+      // Only the folders ticked now: one connected before and left alone is not news
+      const done = (result.clients ?? []).filter((c) => c.connected && result.only.includes(c.id));
+      if (!done.length) throw new Error((result.clients ?? []).find((c) => c.problem && result.only.includes(c.id))?.problem ?? t("mcpNone"));
       toast(t("ruleConnected", { version, clients: done.map((c) => c.label).join(", ") }));
       await invoke("set_settings", { ruleSeen: version });
     } catch (error) {
       fail(error);
     } finally {
       connect.disabled = false;
-      connect.textContent = t("mcpFind");
     }
   });
   const done = h("button", { class: "btn press" }, t("ruleDone"));

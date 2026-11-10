@@ -120,6 +120,11 @@ struct Settings {
     rule_seen: Option<String>,
     /** The editor "Open in …" uses, by id; unset: the one used last */
     editor: Option<String>,
+    /**
+     * The AI folders ticked in the last Connect to AI (`connect-ai` ids); unset: none chosen yet,
+     * so the dialog ticks only each AI's default folder
+     */
+    ai_targets: Option<Vec<String>>,
 }
 
 impl Default for Settings {
@@ -134,6 +139,7 @@ impl Default for Settings {
             node: "node".into(),
             rule_seen: None,
             editor: None,
+            ai_targets: None,
         }
     }
 }
@@ -291,7 +297,12 @@ fn get_settings(app: AppHandle) -> Settings {
 }
 
 #[tauri::command]
-fn set_settings(app: AppHandle, language: Option<String>, notify: Option<bool>, rule_seen: Option<String>, editor: Option<String>) -> Result<Settings, String> {
+fn set_settings(app: AppHandle, language: Option<String>, notify: Option<bool>, rule_seen: Option<String>, editor: Option<String>, ai_targets: Option<Vec<String>>) -> Result<Settings, String> {
+    if let Some(ids) = &ai_targets {
+        if !valid_ai_targets(ids) {
+            return Err("ai_targets must be connect-ai ids".into());
+        }
+    }
     // An editor id must be one installed here; "" goes back to the one used last
     let editor = match editor.as_deref() {
         None => None,
@@ -319,6 +330,9 @@ fn set_settings(app: AppHandle, language: Option<String>, notify: Option<bool>, 
         }
         if let Some(editor) = editor {
             settings.editor = editor;
+        }
+        if let Some(ids) = ai_targets {
+            settings.ai_targets = Some(ids);
         }
         settings.clone()
     };
@@ -815,13 +829,33 @@ fn write_user_path(value: &str) -> Result<(), String> {
     if output.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&output.stderr).trim().to_string()) }
 }
 
+/** `connect-ai` ids: claude, codex or cursor, or claude:/codex: with a folder; 64 at most */
+fn valid_ai_targets(ids: &[String]) -> bool {
+    ids.len() <= 64
+        && ids.iter().all(|id| {
+            id == "cursor"
+                || ["claude", "codex"].iter().any(|kind| {
+                    id == kind || id.strip_prefix(kind).and_then(|rest| rest.strip_prefix(':')).is_some_and(|dir| !dir.is_empty() && dir.len() < 1024 && !dir.contains(['\0', '\n', '\r']))
+                })
+        })
+}
+
 /**
  * Claude Code, Cursor and Codex on this computer and whether each has this flavor's MCP
  * (`ai-clients`), or the MCP added to each one installed (`connect-ai`): the shipped command
  * does both, so the button and `quack connect-ai` never disagree.
  */
 #[tauri::command]
-async fn ai_clients(app: AppHandle, connect: bool) -> Result<Value, String> {
+async fn ai_clients(app: AppHandle, connect: bool, only: Option<Vec<String>>) -> Result<Value, String> {
+    // The folders ticked in the dialog: each one by its id, and none ticked connects nothing
+    if let Some(ids) = &only {
+        if !valid_ai_targets(ids) {
+            return Err("only takes connect-ai ids".into());
+        }
+        if connect && ids.is_empty() {
+            return Err("no AI chosen".into());
+        }
+    }
     let node = app.state::<Shared>().settings.lock().unwrap().node.clone();
     let cli = if cfg!(debug_assertions) {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("dist").join("control").join("main.js")
@@ -829,9 +863,13 @@ async fn ai_clients(app: AppHandle, connect: bool) -> Result<Value, String> {
         resource(&app, &["hub", "cli.mjs"]).ok_or("the app's files were not found")?
     };
     tauri::async_runtime::spawn_blocking(move || {
-        let output = hidden_command(&node)
-            .arg(&cli)
-            .args(["--flavor", flavor::CLI_FLAVOR, if connect { "connect-ai" } else { "ai-clients" }, "--json"])
+        let mut command = hidden_command(&node);
+        command.arg(&cli).args(["--flavor", flavor::CLI_FLAVOR, if connect { "connect-ai" } else { "ai-clients" }, "--json"]);
+        if let (true, Some(ids)) = (connect, &only) {
+            // After `--`, an id is never read as an option
+            command.arg("--exact").arg("--").args(ids);
+        }
+        let output = command
             .output()
             .map_err(|e| format!("could not run {node}: {e}"))?;
         // Exit 1 still carries the list, with the problem on the client it concerns

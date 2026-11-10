@@ -395,14 +395,18 @@ export function installGuard(file: string, name: string, guard: { command: strin
 
 /**
  * Connects every target named (a kind like "claude" names each of its folders; an id names one;
- * default: every one installed), then reads back what each has
+ * default: every one installed), then reads back what each has. `exact` reads each name as one
+ * target's id: "claude" is then the default folder alone, and no name connects nothing. The app's
+ * dialog sends the folders the user ticked this way, so an account folder left unticked is never
+ * written.
  */
-export async function connectClients(info: FlavorInfo, server: ServerCommand, env: ClientsEnv, only: string[] = []): Promise<ClientStatus[]> {
+export async function connectClients(info: FlavorInfo, server: ServerCommand, env: ClientsEnv, only: string[] = [], exact = false): Promise<ClientStatus[]> {
   const targets = findTargets(env);
   const before = await Promise.all(targets.map((t) => status(t, info, env)));
   const problems = new Map<string, string>();
+  const chosen = (found: ClientStatus) => exact ? only.includes(found.id) : !only.length || only.includes(found.client) || only.includes(found.id);
   for (const [i, found] of before.entries()) {
-    if (!found.installed || (only.length && !only.includes(found.client) && !only.includes(found.id))) continue;
+    if (!found.installed || !chosen(found)) continue;
     try {
       await connectOne(targets[i], info, server, env);
     } catch (error) {

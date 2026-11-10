@@ -244,3 +244,10 @@ body.traybody { background: transparent; overflow: hidden; }
 /* The three labels at the usual 12 px sides needed 299 px of the panel's 290 (measured 23/10/26) */
 .trayfoot .btn { padding-inline: 9px; }
 .traymsg { color: var(--ink-400); text-align: center; padding: 8px 4px; line-height: 1.5; }
+/* Connect to AI: one line per AI config folder, ticked ones get Quack */
+.ai-option { cursor: pointer; }
+.ai-option input { width: 18px; height: 18px; flex: none; accent-color: var(--brand-400); cursor: pointer; }
+.ai-option .grow { min-width: 0; }
+.ai-option .mono { display: block; margin-top: 2px; }
+.ai-option.off { opacity: .45; cursor: default; }
+.ai-option:has(input:checked) { outline: 3px solid var(--brand-400); outline-offset: -3px; }

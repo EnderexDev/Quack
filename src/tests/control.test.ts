@@ -899,22 +899,45 @@ test("connect-ai reaches every config folder: the default, ~/.claude-*, ~/.codex
     const server = { command: process.execPath, args: ["cli.mjs", "--flavor", "official", "mcp"], guard: { command: process.execPath, args: ["C:\\Quack\\guard.mjs"] } };
     const run = async (...argv: string[]) => {
       const out: string[] = [];
-      const code = await runControl([...argv, "--json"], {
+      const code = await runControl(["--json", ...argv], {
         info: flavorInfo("official"), client: new HubClient(await freePort()), out: (l) => out.push(l), err: (l) => out.push(l),
         confirm: async () => false, interactive: false, color: false, cwd: home, openUri: async () => {}, server, clients,
       });
       return { code, clients: JSON.parse(out.join("\n")).clients as any[] };
     };
     const stored = (dir: string) => JSON.parse(fs.readFileSync(path.join(dir, "fake-mcp.json"), "utf8"));
+    const settings = (dir: string) => JSON.parse(fs.readFileSync(path.join(dir, "settings.json"), "utf8"));
 
     const listed = await run("ai-clients");
     assert.deepEqual(listed.clients.map((c) => c.label), [
       "Claude Code", "Claude Code (T3 Code: Proxy, CLIProxyAPI)", "Claude Code (T3 Code: Second)", "Cursor", "Codex", "Codex (.codex-work)",
     ], "~/.claude, a folder with no .claude.json and an empty T3 home are not targets");
 
+    // --exact (the app's dialog): "claude" is the default folder alone, never every Claude folder
+    assert.equal((await run("connect-ai", "--exact")).code, 1, "--exact with nothing ticked connects nothing");
+    const exact = await run("connect-ai", "--exact", "claude");
+    assert.equal(exact.code, 0);
+    assert.deepEqual(exact.clients.filter((c) => c.connected).map((c) => c.id), ["claude"]);
+    for (const dir of [proxy, t3Claude, work]) {
+      assert.equal(fs.existsSync(path.join(dir, "fake-mcp.json")), false, `${dir} left alone`);
+      assert.equal(fs.existsSync(path.join(dir, "CLAUDE.md")), false, `${dir} gets no rule`);
+    }
+    assert.equal(fs.existsSync(path.join(proxy, "settings.json")) && "hooks" in settings(proxy), false, "nor the guard");
+
+    // As the app sends it: the ids after "--", a Windows path inside each
+    const sent = await run("connect-ai", "--exact", "--", "claude", `claude:${proxy}`);
+    assert.equal(sent.code, 0);
+    assert.deepEqual(sent.clients.filter((c) => c.connected).map((c) => c.id), ["claude", `claude:${proxy}`]);
+    assert.ok(stored(proxy).quack);
+    assert.equal(fs.existsSync(path.join(t3Claude, "fake-mcp.json")), false, "a folder not sent stays untouched");
+
+    // Without --exact, an id still names one folder: the others, cleared now, stay without Quack
+    const defaultClaude = `${process.env.QUACK_FAKE_DEFAULT}-claude`;
+    for (const dir of [defaultClaude, proxy]) fs.rmSync(path.join(dir, "fake-mcp.json"));
     const only = await run("connect-ai", `claude:${t3Claude}`);
     assert.equal(only.code, 0);
     assert.deepEqual(only.clients.filter((c) => c.connected).map((c) => c.id), [`claude:${t3Claude}`], "an id connects that folder alone");
+    for (const dir of [defaultClaude, proxy]) assert.equal(fs.existsSync(path.join(dir, "fake-mcp.json")), false, `${dir} untouched`);
     assert.deepEqual(stored(t3Claude).quack, ["--", process.execPath, "cli.mjs", "--flavor", "official", "mcp"].slice(1));
 
     const all = await run("connect-ai", "claude", "codex");
@@ -925,7 +948,6 @@ test("connect-ai reaches every config folder: the default, ~/.claude-*, ~/.codex
     assert.ok(stored(work).quack);
     assert.ok(stored(`${process.env.QUACK_FAKE_DEFAULT}-codex`).quack);
     // Quack's guard goes in each Claude Code folder's settings.json, next to what was there
-    const settings = (dir: string) => JSON.parse(fs.readFileSync(path.join(dir, "settings.json"), "utf8"));
     assert.equal(settings(proxy).env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8317", "the folder's own settings stay");
     for (const dir of [proxy, t3Claude, path.join(home, ".claude")]) {
       const entries = settings(dir).hooks.PreToolUse;

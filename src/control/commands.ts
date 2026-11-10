@@ -895,7 +895,9 @@ AI
                             MCP, the rule in CLAUDE.md / AGENTS.md (an older copy replaced where it
                             is) and, in Claude Code, Quack's guard hook.
                             Every config folder counts: CLAUDE_CONFIG_DIR / CODEX_HOME, ~/.claude-*,
-                            ~/.codex-*, and each T3 Code provider's home
+                            ~/.codex-*, and each T3 Code provider's home. --exact: each name is
+                            one folder's id ("claude" the default folder alone), as the app's
+                            dialog sends the folders ticked
 
 Every command takes --json. Exit codes: 0 ok, 1 error, ${EXIT.offline} hub not running, ${EXIT.timeout} wait timed out.
 push, build and pack stay in the old command: node dist/cli.js.`;
@@ -1199,9 +1201,10 @@ async function aiClients(ctx: ControlContext, options: Options, connect: boolean
   const unknown = names.filter((n) => !CLIENTS.some((kind) => n === kind || (kind !== "cursor" && n.startsWith(`${kind}:`))));
   if (unknown.length) throw new UsageError(`connect-ai takes ${CLIENTS.join(", ")}, not ${unknown.join(", ")}`);
   let found: ClientStatus[];
+  if (options.exact && connect && !names.length) throw new UsageError("connect-ai --exact takes the id of each folder to set up");
   if (connect) {
     if (!ctx.server) throw new UsageError("connect-ai runs only from the installed command");
-    found = await connectClients(ctx.info, ctx.server, env, names);
+    found = await connectClients(ctx.info, ctx.server, env, names, options.exact);
   } else found = await listClients(ctx.info, env);
   const name = serverName(ctx.info);
   ctx.out(options.json ? JSON.stringify({ server: name, clients: found }, null, 2) : found.map((c) =>

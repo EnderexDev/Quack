@@ -6,6 +6,11 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.27] - 2026-11-10
+
+### Changed
+- Connect to AI asks first: a window lists every Claude Code, Codex and Cursor setup found, each account folder on its own line (a T3 Code provider, a `~/.claude-*` folder), and only the ones ticked get Quack's tools, the rule and the guard. The first time, only each AI's default folder comes ticked; after that, the window remembers the choice. The "AI rule" notice opens the same window. `quack connect-ai --exact <id>...` sets up exactly the folders named.
+
 ## [1.0.26] - 2026-11-10
 
 ### Fixed
@@ -327,7 +332,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.26...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.27...HEAD
+[1.0.27]: https://github.com/EnderexDev/Quack/compare/v1.0.26...v1.0.27
 [1.0.26]: https://github.com/EnderexDev/Quack/compare/v1.0.25...v1.0.26
 [1.0.25]: https://github.com/EnderexDev/Quack/compare/v1.0.24...v1.0.25
 [1.0.24]: https://github.com/EnderexDev/Quack/compare/v1.0.23...v1.0.24

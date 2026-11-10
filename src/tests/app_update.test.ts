@@ -104,9 +104,21 @@ test("Settings saves the Open Cloud key through `cloud`, and the rule notice sta
   assert.match(notice, /seen !== version/, "shown while the confirmed version is not the shipped one");
   assert.match(notice, /invoke\("set_settings", \{ ruleSeen: version \}\)/, "only the confirm click hides it");
   assert.match(ui, /invoke\("cloud_settings"/);
+  // 10/11/26: Connect to AI writes only the folders ticked in its dialog (Settings and the notice
+  // alike), never every account folder found
+  assert.match(notice, /await aiConnectDialog\(\)/, "the notice asks which AIs");
+  const card = ui.slice(ui.indexOf("function mcpCard("), ui.indexOf("function ruleButton("));
+  assert.match(card, /await aiConnectDialog\(\)/, "Settings asks which AIs");
+  assert.ok(!/invoke\("ai_clients", \{ connect: true \}\)/.test(ui), "no connect without the folders chosen");
+  assert.match(ui, /invoke\("ai_clients", \{ connect: true, only \}\)/);
+  assert.match(ui, /invoke\("set_settings", \{ aiTargets:/, "the choice is remembered");
+  assert.match(main, /ai_targets: Option<Vec<String>>/);
+  const aiCommand = main.slice(main.indexOf("async fn ai_clients("), main.indexOf("async fn ai_rule("));
+  assert.match(aiCommand, /"--exact"/, "the ids go as exact ids");
+  assert.match(aiCommand, /ids\.is_empty\(\)/, "nothing ticked connects nothing");
 
   const i18n = read("ui/i18n.js");
-  for (const key of ["ruleLabel", "ruleFirst", "ruleChanged", "ruleConnected", "ruleDone", "cloudCard", "cloudNote", "cloudKeySaved", "cloudKeySavedShort", "cloudSave", "cloudRemove", "cloudFile"]) {
+  for (const key of ["aiPickTitle", "aiPickNote", "aiPickKeep", "ruleLabel", "ruleFirst", "ruleChanged", "ruleConnected", "ruleDone", "cloudCard", "cloudNote", "cloudKeySaved", "cloudKeySavedShort", "cloudSave", "cloudRemove", "cloudFile"]) {
     assert.equal([...i18n.matchAll(new RegExp(`\\n\\s+${key}: "`, "g"))].length, 2, key);
   }
 });
