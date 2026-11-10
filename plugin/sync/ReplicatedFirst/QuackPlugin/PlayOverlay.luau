@@ -55,6 +55,9 @@ export type Result = {
 	failed: { string }?,
 	stalls: { string }?,
 	closedTabs: { string }?,
+	-- Each swapped script's branch and place text, by guid: the caller keeps it to tell the swap
+	-- coming back after the restore from an edit (never sent to the daemon)
+	swapped: { [string]: { branch: string, place: string } }?,
 }
 
 --[=[
@@ -67,6 +70,7 @@ function PlayOverlay.run(message: any, guidMap: { [string]: Instance }): Result
 	end
 
 	local restore: { () -> () } = {}
+	local swapped: { [string]: { branch: string, place: string } } = {}
 	local failed: { string } = {}
 	local applied = 0
 	-- The checks go in the daemon's order: patches, then creates, then disables
@@ -109,6 +113,7 @@ function PlayOverlay.run(message: any, guidMap: { [string]: Instance }): Result
 			if ok then
 				applied += 1
 				table.insert(restore, function() (instance :: any).Source = before end)
+				swapped[patch.guid] = { branch = patch.source, place = before }
 				mark(instance)
 			else
 				table.insert(failed, `{instance:GetFullName()}: {err}`)
@@ -172,7 +177,7 @@ function PlayOverlay.run(message: any, guidMap: { [string]: Instance }): Result
 	-- A play with half a branch would test something that exists nowhere
 	if #failed > 0 then
 		undo()
-		return { ok = false, error = "the branch could not be swapped in", failed = failed, applied = applied, closedTabs = closedTabs }
+		return { ok = false, error = "the branch could not be swapped in", failed = failed, applied = applied, closedTabs = closedTabs, swapped = swapped }
 	end
 
 	local startedAt = os.clock()
@@ -207,12 +212,12 @@ function PlayOverlay.run(message: any, guidMap: { [string]: Instance }): Result
 	undo()
 	local windowMs = (os.clock() - startedAt) * 1000
 
-	if not waited then return { ok = false, error = `restored after an error: {waitError}`, windowMs = windowMs, applied = applied } end
-	if startError then return { ok = false, error = startError, windowMs = windowMs, applied = applied } end
+	if not waited then return { ok = false, error = `restored after an error: {waitError}`, windowMs = windowMs, applied = applied, closedTabs = closedTabs, swapped = swapped } end
+	if startError then return { ok = false, error = startError, windowMs = windowMs, applied = applied, closedTabs = closedTabs, swapped = swapped } end
 	if not copied and not StudioTestService.EditModeActive then
 		-- The play started and no stall reached the threshold (a copy too quick to stall the
 		-- edit DataModel): after MAX_HOLD_SECONDS the copy is long done. The play's check decides
-		return { ok = true, windowMs = windowMs, applied = applied, stalls = stalls, closedTabs = closedTabs }
+		return { ok = true, windowMs = windowMs, applied = applied, stalls = stalls, closedTabs = closedTabs, swapped = swapped }
 	end
 	if not copied then
 		return {
@@ -220,9 +225,11 @@ function PlayOverlay.run(message: any, guidMap: { [string]: Instance }): Result
 			error = `Studio did not copy the place within {MAX_HOLD_SECONDS} s; the swap was restored`,
 			windowMs = windowMs,
 			applied = applied,
+			closedTabs = closedTabs,
+			swapped = swapped,
 		}
 	end
-	return { ok = true, windowMs = windowMs, applied = applied, stalls = stalls, closedTabs = closedTabs }
+	return { ok = true, windowMs = windowMs, applied = applied, stalls = stalls, closedTabs = closedTabs, swapped = swapped }
 end
 
 --- Every instance at this path: same-named siblings are all candidates

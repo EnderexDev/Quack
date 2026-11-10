@@ -216,6 +216,93 @@ test("play: only what the branch changed since it forked is swapped; Studio's an
   }
 });
 
+// 10/11/26, Anime Astral (Team Create): a play's swap came back in the edit DataModel ~3 s after
+// the restore, the sync wrote the branch's text of two conflicting scripts to the place's folder,
+// and a land committed it to main as Studio's edits (637f3ac8)
+test("play: the branch's text coming back from Studio after the swap never reaches the place's folder", async () => {
+  const { root, repo, worktree } = fixture();
+  const prev = { syncDir: config.syncDir, sourcemapPath: config.sourcemapPath, port: config.port };
+  let daemon: SyncDaemon | undefined;
+  try {
+    config.syncDir = path.join(repo, "sync");
+    config.sourcemapPath = path.join(repo, "sourcemap.json");
+    config.port = 0;
+    daemon = new SyncDaemon();
+    const sent: any[] = [];
+    (daemon as any).ipc.send = (message: any) => {
+      sent.push(message);
+      return true;
+    };
+    (daemon as any).ipc.isConnected = () => true;
+    (daemon as any).handleStudioMessage({ type: "fullSnapshot", data: placeData, placeId: 5 });
+    git(repo, "add", "-A");
+    git(repo, "commit", "-q", "-m", "place");
+    git(repo, "worktree", "add", "-q", "-b", "feature", worktree);
+
+    // The place's folder changes Config after the fork (a conflict), and Studio has it
+    const config_ = path.join(repo, "sync", "ReplicatedStorage", "Config.luau");
+    write(config_, "return { damage = 12 }");
+    (daemon as any).tree.getNode("cfg").source = "return { damage = 12 }";
+    git(repo, "commit", "-q", "-am", "main moves on");
+    write(path.join(worktree, "sync", "ReplicatedStorage", "Config.luau"), "return { damage = 25 }");
+    git(worktree, "commit", "-q", "-am", "feature");
+
+    const playing = daemon.startPlay(worktree);
+    await new Promise((r) => setTimeout(r, 50));
+    const swap = sent.find((m) => m.type === "playOverlay");
+    assert.deepEqual(swap.patches, [{ guid: "cfg", source: "return { damage = 25 }" }]);
+    (daemon as any).handleStudioMessage({ type: "playOverlayResult", id: swap.id, ok: true, windowMs: 1500 });
+    const state = await playing;
+    assert.equal(state.conflicts.length, 1);
+    sent.length = 0;
+
+    // ~3 s later Studio holds the branch's text again and sends it, as an edit from the place's text
+    const branchBack = { guid: "cfg", source: "return { damage = 25 }", path: ["ReplicatedStorage", "Config"], className: "ModuleScript", base: "return { damage = 12 }" };
+    (daemon as any).handleStudioMessage({ type: "scriptChanged", data: branchBack });
+    assert.equal(fs.readFileSync(config_, "utf8"), "return { damage = 12 }", "the place's folder keeps its text");
+    assert.deepEqual(
+      sent.filter((m) => m.type === "patchScript"),
+      [{ type: "patchScript", guid: "cfg", source: "return { damage = 12 }" }],
+      "Studio gets the place's text back",
+    );
+    assert.equal((daemon as any).tree.getNode("cfg").source, "return { damage = 12 }");
+    assert.equal(git(repo, "status", "--porcelain").trim(), "");
+
+    // A play of another worktree right after, swapping Config with its own text, keeps the first
+    // play's text of Config covered
+    const other = path.join(root, "Game-other");
+    git(repo, "worktree", "add", "-q", "-b", "other", other);
+    write(path.join(other, "sync", "ReplicatedStorage", "Config.luau"), "return { damage = 30 }");
+    git(other, "commit", "-q", "-am", "other");
+    const second = daemon.startPlay(other);
+    await new Promise((r) => setTimeout(r, 50));
+    const swap2 = sent.find((m) => m.type === "playOverlay");
+    assert.deepEqual(swap2.patches, [{ guid: "cfg", source: "return { damage = 30 }" }]);
+    (daemon as any).handleStudioMessage({ type: "playOverlayResult", id: swap2.id, ok: true, windowMs: 1500 });
+    await second;
+    sent.length = 0;
+    (daemon as any).handleStudioMessage({ type: "scriptChanged", data: branchBack });
+    assert.equal(fs.readFileSync(config_, "utf8"), "return { damage = 12 }", "the first play's echo is still refused");
+    assert.equal(sent.filter((m) => m.type === "patchScript").length, 1);
+
+    // A real edit in Studio still goes to disk, during the window or not
+    (daemon as any).handleStudioMessage({
+      type: "scriptChanged",
+      data: { ...branchBack, source: "return { damage = 13 }", base: "return { damage = 12 }" },
+    });
+    assert.equal(fs.readFileSync(config_, "utf8"), "return { damage = 13 }");
+
+    // Once the window is over, the same text is an edit like any other
+    for (const r of (daemon as any).playEcho.get("cfg")) r.until = Date.now() - 1;
+    (daemon as any).handleStudioMessage({ type: "scriptChanged", data: { ...branchBack, base: "return { damage = 13 }" } });
+    assert.equal(fs.readFileSync(config_, "utf8"), "return { damage = 25 }");
+  } finally {
+    await daemon?.stop();
+    Object.assign(config, prev);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("play: Studio failing to swap leaves the play failed, and a second play waits for the first", async () => {
   const { root, repo, worktree } = fixture();
   const prev = { syncDir: config.syncDir, sourcemapPath: config.sourcemapPath, port: config.port };

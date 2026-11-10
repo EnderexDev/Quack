@@ -106,6 +106,9 @@ export type SyncSession = {
 	_offlineSince: number?,
 	-- Scripts sent lately, with the text agreed before: resent after a resume
 	_recentScriptSends: { [string]: { at: number, base: string? } },
+	-- Scripts a `quackdev play` swapped lately, by guid: the branch's and the place's text, and
+	-- when that swap ended (a play started right after keeps the earlier play's scripts covered)
+	_playSwap: { [string]: { { branch: string, place: string, at: number } } },
 	-- True while sendFullSnapshot walks the place: changes wait in the queues until it is sent
 	_snapshotInProgress: boolean?,
 	_batchFlushThread: thread?,
@@ -253,6 +256,7 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 	StudioTools.setGuidResolver(function(guid: string): Instance? return self.guidMap[guid] end)
 	self.lastSyncedSource = {}
 	self._recentScriptSends = {}
+	self._playSwap = {}
 	self.lastInstanceUpdate = {}
 	self.connections = {}
 	self.suppressOutbound = false
@@ -355,6 +359,62 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 	end
 
 
+	--- A play's swapped script holding the branch's text again after the restore is the swap
+	--- coming back, not an edit: the place's text goes back in and nothing is sent. Anime Astral,
+	--- 10/11/26 (Team Create, 261k instances): 9 of 867 plays had the edit DataModel hold the
+	--- branch's text 2.5 to 3.5 s after the restore, and the sync wrote it to the place's folder,
+	--- where a land committed it to main. Only the exact branch text, for 20 s after the swap (it
+	--- came back in ~3 s; someone pasting that exact text in those seconds is undone too, the cost)
+	local PLAY_ECHO_SECONDS = 20
+	--- Drops what is past its window, for every script (a swapped script nobody touches again
+	--- would keep both texts otherwise)
+	local function pruneSwaps()
+		local now = os.clock()
+		for guid, records in self._playSwap do
+			local live: { { branch: string, place: string, at: number } } = {}
+			for _, record in records do
+				if now - record.at <= PLAY_ECHO_SECONDS then table.insert(live, record) end
+			end
+			if #live > 0 then
+				self._playSwap[guid] = live
+			else
+				self._playSwap[guid] = nil
+			end
+		end
+	end
+	local function takeBackSwap(guid: string, instance: Instance?, source: string): boolean
+		local records = self._playSwap[guid]
+		if not records then return false end
+		local now = os.clock()
+		-- Compared as LF, as the daemon does: the same text with other line endings is the same swap
+		local function lf(text: string): string
+			return (string.gsub(text, "\r\n", "\n"))
+		end
+		local sourceLf = lf(source)
+		local match = nil
+		for _, record in records do
+			if now - record.at <= PLAY_ECHO_SECONDS and lf(record.branch) == sourceLf then match = record end
+		end
+		if not match then return false end
+		-- The text Studio and the daemon agree on now: a disk patch after the play (a land) moved it
+		local place = self.lastSyncedSource[guid] or match.place
+		if sourceLf == lf(place) then return false end
+		if not (instance and QuackService.isScript(instance)) then return false end
+		-- An edit still in its debounce when the swap came back: that text goes back in, and the
+		-- change signal of the write queues it again as an edit
+		local pending = self.pendingScriptChanges[guid]
+		local restoreText = if pending and type(pending.source) == "string" and pending.source ~= source then pending.source else place
+		warn(`[Quack]: {instance:GetFullName()} holds the play's branch text again after the swap; the place's text goes back`)
+		self.lastSyncedSource[guid] = place
+		self.pendingScriptChanges[guid] = nil
+		self.pendingScriptChangeReady[guid] = nil
+		task.spawn(function()
+			local ok, err = pcall(QuackService.setScriptSource, instance :: Script, restoreText)
+			if not ok then warn(`[Quack]: Could not put the place's text back in {instance:GetFullName()}:`, err) end
+		end)
+		return true
+	end
+
 	local function flushOutboundQueues()
 		-- A change sent while the snapshot is still being built reached the daemon before it, and
 		-- the snapshot, holding the state from before the change, undid it (a part moved into an
@@ -370,11 +430,17 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 			})
 		end
 
+		-- Collected first: takeBackSwap drops entries from the queue it walks
+		local readyChanges = {}
 		for _, payload in pairs(self.pendingScriptChanges) do
-			if self.pendingScriptChangeReady[payload.guid] == true then
+			if self.pendingScriptChangeReady[payload.guid] == true then table.insert(readyChanges, payload) end
+		end
+		for _, payload in readyChanges do
+			local data = scriptChangeData(payload)
+			if not takeBackSwap(data.guid, self.guidMap[data.guid], data.source) then
 				table.insert(messages, {
 					type = "scriptChanged",
-					data = scriptChangeData(payload),
+					data = data,
 				})
 			end
 		end
@@ -566,6 +632,7 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 			self:debugPrint("Ignoring change (already synced):", `{changedScript.Parent}.{changedScript.Name}`)
 			return
 		end
+		if takeBackSwap(guid, changedScript, source) then return end
 
 		local path = QuackService.getInstancePath(changedScript)
 		if not path then return end
@@ -1510,6 +1577,18 @@ function SyncSession.new(plugin: Plugin, settingsStore: SettingsStore.SettingsSt
 				local ok, result = pcall(PlayOverlay.run, message, self.guidMap)
 				setOutboundSuppressed(false)
 				if not ok then result = { ok = false, error = tostring(result) } end
+				-- Kept here, never sent: it holds both texts of every swapped script
+				local swapped = result.swapped
+				result.swapped = nil
+				pruneSwaps()
+				if swapped then
+					local now = os.clock()
+					for guid, texts in swapped do
+						local records = self._playSwap[guid] or {}
+						table.insert(records, { branch = texts.branch, place = texts.place, at = now })
+						self._playSwap[guid] = records
+					end
+				end
 				-- An edit made in Studio while the swap held (outbound was off) still goes out
 				for _, instance in pairs(self.guidMap) do
 					if QuackService.isScript(instance) then onScriptChanged(instance :: Script) end

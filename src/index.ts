@@ -79,6 +79,9 @@ const COALESCE_DELAY_MS = 150;
 // A successor's slow work after a takeover (inodes, orphan check, sourcemap) waits this long, so
 // the Studio it is taking over reconnects and resumes first
 const TAKEOVER_BACKGROUND_DELAY_MS = 3000;
+// How long after a play's swap Studio sending the branch's text back is the swap, not an edit
+// (it came back 2.5 to 3.5 s after; short, since pasting that exact text in the window is refused)
+const PLAY_ECHO_MS = 20_000;
 
 /**
  * Quack: the instances Studio never lets the sync delete, as the plugin's
@@ -188,6 +191,14 @@ export class SyncDaemon {
   /** The swap behind `play`: which worktree each check answers for */
   private playMerged: MergedPlay | null = null;
   private playResolve: ((result: PlayOverlayResultMessage) => void) | null = null;
+  /**
+   * The branch's text of every script the last play swapped (LF), and until when Studio sending
+   * it back is the swap coming back, not someone's edit. Anime Astral, 10/11/26 (Team Create, a
+   * 261k-instance place): 9 of 867 plays had Studio's edit DataModel hold the branch's text again
+   * 2.5 to 3.5 s after the restore, and the sync wrote it to the place's folder, where a land
+   * committed it to main as "edits from Team Create" (637f3ac8)
+   */
+  private playEcho: Map<string, { branch: string; until: number; play: string }[]> = new Map();
   /** Handed its place to a successor: disk events are no longer this daemon's */
   private handedOff = false;
   /** Disk events seen while on standby, settled at the takeover */
@@ -896,6 +907,8 @@ export class SyncDaemon {
   }): void {
     const { guid, source, path: instancePath, className } = message;
 
+    if (this.isPlayEcho(guid, source)) return;
+
     // Quack: a merge for this script is running; it picks up this newer Studio text when done
     const running = this.merges.get(guid);
     if (running) {
@@ -955,6 +968,35 @@ export class SyncDaemon {
       // ~0.5 s per save on a 262k-instance place, which delayed the next edits (21/10/26).
       if (mappedBefore !== this.fileWriter.getMapping(node.guid)?.filePath) this.scheduleSourcemapWrite();
     }
+  }
+
+  /**
+   * Quack: Studio sending back the text a play swapped in, while the place's folder holds other
+   * text, is the swap coming back (playEcho), never an edit: the disk keeps the place's text and
+   * Studio gets it back. Only the exact branch text, and only for PLAY_ECHO_MS after the swap:
+   * someone pasting that exact text in Studio in those seconds is refused too (the cost)
+   */
+  private isPlayEcho(guid: string, source: string): boolean {
+    const records = this.playEcho.get(guid);
+    if (!records) return false;
+    const now = Date.now();
+    const live = records.filter((r) => now <= r.until);
+    if (live.length === 0) this.playEcho.delete(guid);
+    else if (live.length !== records.length) this.playEcho.set(guid, live);
+    const lf = source.replace(/\r\n/g, "\n");
+    if (!live.some((r) => r.branch === lf)) return false;
+    const branch = lf;
+    const node = this.tree.getNode(guid);
+    if (!node) return false;
+    const filePath = this.fileWriter.getFilePath(node);
+    const place = readFileIfExists(filePath) ?? node.source;
+    // The folder holds the branch's text too (the branch landed): nothing came back
+    if (place === undefined || place.replace(/\r\n/g, "\n") === branch) return false;
+    const relative = path.relative(this.fileWriter.getBaseDir(), filePath);
+    log.warn(`Play: Studio holds the branch's text of ${relative} again after the swap; the place's text stays on disk and goes back to Studio`);
+    this.tree.updateScriptSource(guid, place);
+    this.ipc.patchScript(guid, place);
+    return true;
   }
 
   /**
@@ -2254,6 +2296,15 @@ export class SyncDaemon {
     log.info(`Play of ${label}: ${state.patches} changed, ${state.creates} new, ${state.disables} turned off${state.skipped.length ? `, ${state.skipped.length} the play cannot carry` : ""}`);
     for (const line of state.skipped) log.warn(`Play: ${line}`);
     for (const line of state.conflicts) log.warn(`Play conflict: ${line}`);
+    // From the swap on: Studio sends nothing while it holds the branch, so the branch's text
+    // arriving now is the swap coming back. Kept PLAY_ECHO_MS past the answer (it came back ~3 s
+    // after). One record per play and script: a play started right after, even of the same script
+    // with other text, keeps the earlier play's text covered until its own window ends
+    for (const p of merged.patches) {
+      const records = this.playEcho.get(p.guid) ?? [];
+      records.push({ branch: p.source.replace(/\r\n/g, "\n"), until: Number.POSITIVE_INFINITY, play: id });
+      this.playEcho.set(p.guid, records);
+    }
     const result = await new Promise<PlayOverlayResultMessage>((resolve) => {
       const timer = setTimeout(
         () => resolve({ type: "playOverlayResult", id, ok: false, error: "Studio did not answer in 40 s (a plugin without play support, or the place closed)" }),
@@ -2277,6 +2328,14 @@ export class SyncDaemon {
       }
     });
     this.playResolve = null;
+    // Only this play's records get their end; the expired ones of any play go
+    const now = Date.now();
+    for (const [guid, records] of this.playEcho) {
+      for (const r of records) if (r.play === id) r.until = now + PLAY_ECHO_MS;
+      const live = records.filter((r) => now <= r.until);
+      if (live.length) this.playEcho.set(guid, live);
+      else this.playEcho.delete(guid);
+    }
     state.done = true;
     state.result = {
       ok: result.ok === true,
@@ -2293,7 +2352,8 @@ export class SyncDaemon {
         if (split[i].length) part.swapFailed = split[i].slice(0, 50);
       });
     }
-    if (Array.isArray(result.stalls)) log.info(`Play: stalls in edit mode: ${result.stalls.slice(0, 20).map(String).join(", ") || "none"}`);
+    if (state.result.closedTabs) log.info(`Play: tabs closed before the swap: ${state.result.closedTabs.join(", ")}`);
+    if (Array.isArray(result.stalls)) log.info(`Play: stalls in edit mode:${result.stalls.slice(0, 20).map(String).join(", ") || "none"}`);
     if (state.result.ok) log.success(`Play of ${label} started; the place in edit mode held it ${Math.round(state.result.windowMs ?? 0)} ms`);
     else log.error(`Play of ${label} failed: ${state.result.error ?? "unknown"}`);
     return state;

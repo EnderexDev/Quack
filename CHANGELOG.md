@@ -6,6 +6,11 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.26] - 2026-11-10
+
+### Fixed
+- A `quack play` could leave the branch's text in the place: in a big Team Create place, Studio sometimes held a swapped script's branch text again a few seconds after the swap was undone, and the sync wrote it to the place's folder as an edit from Studio, where a commit could pick it up. The plugin now puts the place's text back and sends nothing. For 20 seconds after a play, the daemon refuses that exact text from Studio and sends the place's text back, also when another play started in between. The daemon log also lists the tabs the play closed before the swap.
+
 ## [1.0.25] - 2026-11-10
 
 ### Added
@@ -322,7 +327,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.25...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.26...HEAD
+[1.0.26]: https://github.com/EnderexDev/Quack/compare/v1.0.25...v1.0.26
 [1.0.25]: https://github.com/EnderexDev/Quack/compare/v1.0.24...v1.0.25
 [1.0.24]: https://github.com/EnderexDev/Quack/compare/v1.0.23...v1.0.24
 [1.0.23]: https://github.com/EnderexDev/Quack/compare/v1.0.22...v1.0.23
