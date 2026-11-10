@@ -8,7 +8,7 @@ import { PassThrough } from "node:stream";
 import { runControl } from "../control/commands.js";
 import { flavorInfo, HubClient } from "../control/hubClient.js";
 import { serveMcp } from "../control/mcp.js";
-import { assetThumbnail, cloudSettings, docSecurity, downloadPlace, placeVersions, saveCloudSettings, robloxDocs, robloxEnv, searchAssets, uploadAsset, type RobloxEnv } from "../control/roblox.js";
+import { assetThumbnail, cloudSettings, docSecurity, downloadPlace, placeVersions, saveCloudSettings, robloxDocs, robloxEnv, searchAssets, uploadAsset, versionsText, type RobloxEnv } from "../control/roblox.js";
 import { Vault, type Dpapi } from "../cloud/vault.js";
 import { registerCloudOps } from "../cloud/ops.js";
 import { lintTranslations } from "../cloud/localization.js";
@@ -565,7 +565,7 @@ test("place versions and download: the key goes to Open Cloud only, a version's 
     const web = fakeWeb((url, init) => {
       if (url.host === "apis.roblox.com" && url.pathname === "/assets/v1/assets/555/versions") {
         assert.equal(init.headers["x-api-key"], KEY);
-        return json({ assetVersions: [{ path: "assets/555/versions/12", createTime: "2026-11-09T19:32:04.123Z", moderationResult: { moderationState: "Approved" } }, { path: "assets/555/versions/11", createTime: "2026-11-08T10:00:00Z" }], nextPageToken: "tok" });
+        return json({ assetVersions: [{ path: "assets/555/versions/12", createTime: "2026-11-09T19:32:04.123Z", moderationResult: { moderationState: "Approved" }, published: true }, { path: "assets/555/versions/11", createTime: "2026-11-08T10:00:00Z" }], nextPageToken: "tok" });
       }
       if (url.pathname === "/assets/v1/assets/666/versions") return json({ code: "PERMISSION_DENIED", message: `bad key ${KEY}` }, 403);
       if (url.pathname === "/asset-delivery-api/v1/assetId/555/version/11") return json({ location: "https://cdn.example.com/place-11" });
@@ -581,7 +581,9 @@ test("place versions and download: the key goes to Open Cloud only, a version's 
     fs.writeFileSync(path.join(dataDir, "open-cloud.env"), `ROBLOX_OPEN_CLOUD_API_KEY=${KEY}\n`);
 
     const page = await placeVersions(env, { placeId: "555", limit: 2, pageToken: "abc" });
-    assert.deepEqual(page.versions, [{ version: 12, createdAt: "2026-11-09T19:32:04.123Z", moderation: "Approved" }, { version: 11, createdAt: "2026-11-08T10:00:00Z" }]);
+    // published: true is what tells a version players got from one only saved (the changelog's boundary)
+    assert.deepEqual(page.versions, [{ version: 12, createdAt: "2026-11-09T19:32:04.123Z", moderation: "Approved", published: true }, { version: 11, createdAt: "2026-11-08T10:00:00Z" }]);
+    assert.match(versionsText(page), /version 12 {2}2026-11-09 19:32:04Z {2}published\n {2}version 11 {2}2026-11-08 10:00:00Z\n/);
     assert.equal(page.nextPageToken, "tok");
     const asked = web.calls.at(-1)!.url;
     assert.deepEqual([asked.searchParams.get("maxPageSize"), asked.searchParams.get("pageToken")], ["2", "abc"]);

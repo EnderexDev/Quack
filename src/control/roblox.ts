@@ -844,6 +844,8 @@ export interface PlaceVersion {
   version: number;
   createdAt?: string;
   moderation?: string;
+  /** Published to players; a version without it was only saved (Studio's save, an upload) */
+  published?: boolean;
 }
 
 /** A place's saved versions, newest first, a page at a time (Open Cloud assets/v1, asset:read) */
@@ -859,6 +861,7 @@ export async function placeVersions(env: RobloxEnv, args: { placeId: unknown; li
     version: Number(/versions\/(\d+)$/.exec(String(v?.path ?? ""))?.[1] ?? 0),
     ...(v?.createTime ? { createdAt: String(v.createTime) } : {}),
     ...(v?.moderationResult?.moderationState ? { moderation: String(v.moderationResult.moderationState) } : {}),
+    ...(v?.published === true ? { published: true } : {}),
   }));
   return { placeId, versions, ...(body?.nextPageToken ? { nextPageToken: String(body.nextPageToken) } : {}) };
 }
@@ -866,7 +869,7 @@ export async function placeVersions(env: RobloxEnv, args: { placeId: unknown; li
 export function versionsText(r: Awaited<ReturnType<typeof placeVersions>>): string {
   if (!r.versions.length) return `Place ${r.placeId}: no saved version on this page.`;
   const lines = [`Place ${r.placeId}, newest first:`];
-  for (const v of r.versions) lines.push(`  version ${v.version}${v.createdAt ? `  ${v.createdAt.replace("T", " ").replace(/\.\d+Z$/, "Z")}` : ""}${v.moderation && v.moderation !== "Approved" ? `  (${v.moderation})` : ""}`);
+  for (const v of r.versions) lines.push(`  version ${v.version}${v.createdAt ? `  ${v.createdAt.replace("T", " ").replace(/\.\d+Z$/, "Z")}` : ""}${v.published ? "  published" : ""}${v.moderation && v.moderation !== "Approved" ? `  (${v.moderation})` : ""}`);
   if (r.nextPageToken) lines.push(`More: --page ${r.nextPageToken}`);
   return lines.join("\n");
 }

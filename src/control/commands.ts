@@ -716,9 +716,9 @@ Roblox (no hub needed)
   asset thumbnail <id> [--size 150x150|420x420|768x432] [--out <file.png>]   Its thumbnail as a PNG
   asset upload <file> [place] --type Decal|Audio|Model|Animation|Video --name <name>
                [--description <text>] [--user <id> | --group <id>] [--force]
-                            Open Cloud: the key and creator from ROBLOX_OPEN_CLOUD_API_KEY,
-                            ROBLOX_CREATOR_USER_ID / _GROUP_ID or open-cloud.env next to the
-                            registry; the same file uploaded again answers the asset it made
+                            Open Cloud, run by the hub with the key it keeps encrypted; the
+                            creator is the one in the app's Settings unless --user or --group;
+                            the same file uploaded again answers the asset it made
                             (--force posts anyway); a Decal also gets its image id
   place versions [place id] [--limit <n>] [--page <token>]   A place's saved versions, newest
                             first (Open Cloud, the key needs asset:read)

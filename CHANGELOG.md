@@ -6,6 +6,14 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.22] - 2026-11-10
+
+### Added
+- `quack place versions` (and the MCP's `list_place_versions`) marks each version players got as `published`; the others were only saved. It tells a fix shipped to players from one only saved in Studio.
+
+### Fixed
+- The help of `quack asset upload` and the MCP's `upload_asset` still said the key came from an environment variable or a plain-text file. They now say Quack's hub uploads with the key it keeps encrypted, and the creator is the one in the app's Settings.
+
 ## [1.0.21] - 2026-11-10
 
 ### Changed
@@ -295,7 +303,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.21...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.22...HEAD
+[1.0.22]: https://github.com/EnderexDev/Quack/compare/v1.0.21...v1.0.22
 [1.0.21]: https://github.com/EnderexDev/Quack/compare/v1.0.20...v1.0.21
 [1.0.20]: https://github.com/EnderexDev/Quack/compare/v1.0.19...v1.0.20
 [1.0.19]: https://github.com/EnderexDev/Quack/compare/v1.0.18...v1.0.19

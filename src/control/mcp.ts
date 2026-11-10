@@ -786,7 +786,7 @@ export const TOOLS: Tool[] = [
   },
   {
     name: "upload_asset",
-    description: "Uploads a file to Roblox through Open Cloud: Decal (png, jpg, bmp, tga), Audio (mp3, ogg, wav, flac), Model (fbx, gltf, glb, rbxm, rbxmx), Animation (rbxm, rbxmx) or Video (mp4, mov). The key and creator come from ROBLOX_OPEN_CLOUD_API_KEY and ROBLOX_CREATOR_USER_ID / ROBLOX_CREATOR_GROUP_ID (the group wins) or open-cloud.env in Quack's folder (%APPDATA%\\quack). Every upload is logged by the file's hash, type, name and creator: the same upload again answers the asset it already made (or keeps waiting for one still processing) instead of making a duplicate, so retrying after a timeout is safe; force posts anyway. A Decal also answers its image id (what an ImageLabel takes), read from the Creator Store or the place's Studio.",
+    description: "Uploads a file to Roblox through Open Cloud: Decal (png, jpg, bmp, tga), Audio (mp3, ogg, wav, flac), Model (fbx, gltf, glb, rbxm, rbxmx), Animation (rbxm, rbxmx) or Video (mp4, mov). Quack's hub uploads it with the key it keeps encrypted (never ask for the key); the creator is the one saved in Quack's Settings (Open Cloud), or userId / groupId. Every upload is logged by the file's hash, type, name and creator: the same upload again answers the asset it already made (or keeps waiting for one still processing) instead of making a duplicate, so retrying after a timeout is safe; force posts anyway. A Decal also answers its image id (what an ImageLabel takes), read from the Creator Store or the place's Studio.",
     inputSchema: {
       type: "object",
       properties: {
