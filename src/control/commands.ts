@@ -1434,7 +1434,7 @@ async function doctor(ctx: ControlContext, options: Options): Promise<number> {
   const pluginFile = path.join(plugins, ctx.info.plugin);
   const shipped = ctx.bundleDir ? path.join(ctx.bundleDir, "..", "plugin", ctx.info.plugin) : undefined;
   if (!fs.existsSync(pluginFile)) checks.push({ ok: false, what: `Plugin ${ctx.info.plugin}`, detail: `not in ${plugins}: ${ctx.info.appName} installs it when it starts` });
-  else if (shipped && fs.existsSync(shipped) && !fs.readFileSync(shipped).equals(fs.readFileSync(pluginFile))) {
+  else if (shipped && fs.existsSync(shipped) && !samePluginCode(fs.readFileSync(shipped, "utf8"), fs.readFileSync(pluginFile, "utf8"))) {
     checks.push({ ok: "warn", what: `Plugin ${ctx.info.plugin} differs from the one ${ctx.info.appName} ships`, detail: "restart the app to install it, then reopen the places in Studio" });
   } else checks.push({ ok: true, what: `Plugin ${ctx.info.plugin} installed` });
 
@@ -1452,6 +1452,16 @@ async function doctor(ctx: ControlContext, options: Options): Promise<number> {
   if (options.json) ctx.out(JSON.stringify(checks, null, 2));
   else for (const c of checks) ctx.out(`${c.ok === true ? "ok  " : c.ok === "warn" ? "warn" : "FAIL"}  ${c.what}${c.detail && c.ok !== true ? `\n      ${c.detail}` : ""}`);
   return checks.some((c) => c.ok === false) ? EXIT.error : EXIT.ok;
+}
+
+/**
+ * True when the installed plugin is the shipped one. The app writes its version over the
+ * shipped placeholder when it installs the plugin (stamp_plugin in app/src-tauri/src/main.rs),
+ * so the installed copy is compared with that one line put back.
+ */
+export function samePluginCode(shipped: string, installed: string): boolean {
+  const unstamped = installed.replace(/(QuackService\.APP_VERSION = ")[^"]*"/, '$1@@quack-app-version@@"');
+  return unstamped === shipped;
 }
 
 /** The hub stops with its daemons; the app sees it gone and starts the hub it ships */

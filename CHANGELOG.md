@@ -6,6 +6,14 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.23] - 2026-11-10
+
+### Added
+- Settings shows the version of the Studio plugin ("Studio plugin"), next to the app's. Not every app update changes the plugin, so the two can differ.
+
+### Changed
+- The plugin's header shows its own version, the app version that last changed the plugin, instead of a fixed 1.0.0. An app update that leaves the plugin alone no longer rewrites it in Studio's Plugins folder. The plugin's new number shows after the place reopens.
+
 ## [1.0.22] - 2026-11-10
 
 ### Added
@@ -303,7 +311,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.22...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.23...HEAD
+[1.0.23]: https://github.com/EnderexDev/Quack/compare/v1.0.22...v1.0.23
 [1.0.22]: https://github.com/EnderexDev/Quack/compare/v1.0.21...v1.0.22
 [1.0.21]: https://github.com/EnderexDev/Quack/compare/v1.0.20...v1.0.21
 [1.0.20]: https://github.com/EnderexDev/Quack/compare/v1.0.19...v1.0.20

@@ -1015,11 +1015,13 @@ async function copyText(text) {
 async function renderSettings(target) {
   const s = state();
   const mine = generation;
-  const [autostart, daemon, ai, queueSettings] = await Promise.all([
+  const [autostart, daemon, ai, queueSettings, pluginVersion] = await Promise.all([
     invoke("get_autostart").catch(() => false),
     invoke("read_daemon_config"),
     api.get(`/api/ai${ui.aiRefresh ? "?refresh=1" : ""}`).catch(() => null),
     api.get("/api/queue/settings").then((r) => r.settings).catch(() => null),
+    // The app version that last changed the plugin: not every app update does
+    invoke("plugin_version").catch(() => null),
   ]);
   ui.aiRefresh = false;
   if (mine !== generation) return;
@@ -1141,7 +1143,9 @@ async function renderSettings(target) {
           h("div", { class: "field" }, h("span", { class: "grow" }, t("editorSetting"), h("span", { class: "hint" }, t("editorHint"))), editorSelect),
           h("div", { class: "field" }, h("span", { class: "grow" }, t("version")),
             h("span", { class: "mono muted", title: `hub ${s?.build ?? "?"}` }, `${ui.app.version}${ui.app.build ? ` · ${ui.app.build}` : ""}`),
-            checkUpdate)),
+            checkUpdate),
+          h("div", { class: "field" }, h("span", { class: "grow" }, t("pluginVersion"), h("span", { class: "hint" }, t("pluginVersionHint"))),
+            h("span", { class: "mono muted" }, pluginVersion ?? t("pluginVersionUnknown")))),
         aiCard(ai),
         queueCard(queueSettings),
         mcpCard(),

@@ -960,7 +960,7 @@ local function buildContent(self, scope: Scope, helpers)
 				scope:Text {
 					AnchorPoint = Vector2.new(1, 0.5),
 					Position = UDim2.fromScale(1, 0.5),
-					Text = `v{QuackService.VERSION}`,
+					Text = `v{QuackService.displayVersion()}`,
 					Font = Theme.Fonts.Mono,
 					TextSize = Theme.TextSize.Small,
 					Color = Theme.Colors.TextDimmed,

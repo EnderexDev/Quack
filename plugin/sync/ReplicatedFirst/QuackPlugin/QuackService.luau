@@ -1,6 +1,18 @@
 --!strict
 local QuackService = {}
+--- The protocol version: the daemon and the plugin must agree on its major.minor
 QuackService.VERSION = "1.0.0"
+--- The plugin's version: the app version that last changed this code, written over the placeholder
+--- when that app copies the plugin into Studio's Plugins folder (install_plugin in
+--- app/src-tauri/src/main.rs). An app update that leaves the code alone leaves the number too.
+QuackService.APP_VERSION = "@@quack-app-version@@"
+
+--- The version the plugin shows: the app's, or the protocol's when no app stamped it (a plugin
+--- built straight into Plugins by build-rbxmx.mjs, or installed by a debug app)
+function QuackService.displayVersion(): string
+	if QuackService.APP_VERSION:sub(1, 2) == "@@" then return QuackService.VERSION end
+	return QuackService.APP_VERSION
+end
 
 -- Services
 local ScriptEditorService = game:GetService("ScriptEditorService")

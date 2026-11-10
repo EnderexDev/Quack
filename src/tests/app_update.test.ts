@@ -21,6 +21,25 @@ test("Settings can check for an update now", () => {
   assert.match(settings, /t\("checkUpdate"\)/);
 });
 
+// 09/11/26: not every app update changes the plugin, so Settings shows the plugin's own version
+// (the app version that last changed it), read when Settings opens: the install runs on its own
+// thread at start and can finish after the window first asked the app for its info
+test("Settings shows the version of the plugin in Studio's Plugins folder", () => {
+  const main = read("src-tauri/src/main.rs");
+  assert.match(main, /#\[tauri::command\]\r?\nfn plugin_version\(\) -> Option<String>/);
+  const handlers = main.slice(main.indexOf("generate_handler!["), main.indexOf("])", main.indexOf("generate_handler![")));
+  assert.match(handlers, /\bplugin_version,/, "plugin_version is registered as a command");
+
+  const ui = read("ui/main.js");
+  const settings = ui.slice(ui.indexOf("async function renderSettings("), ui.indexOf("// ---------- Navigation"));
+  assert.match(settings, /invoke\("plugin_version"\)/);
+  assert.match(settings, /t\("pluginVersion"\)/);
+  const i18n = read("ui/i18n.js");
+  for (const key of ["pluginVersion", "pluginVersionHint", "pluginVersionUnknown"]) {
+    assert.equal([...i18n.matchAll(new RegExp(`\\n\\s+${key}: "`, "g"))].length, 2, key);
+  }
+});
+
 test("every language has the update check's texts", async () => {
   const i18n = read("ui/i18n.js");
   for (const key of ["checkUpdate", "checkingUpdate", "upToDate"]) {

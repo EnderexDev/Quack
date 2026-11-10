@@ -376,6 +376,16 @@ fn app_info(app: AppHandle) -> Value {
     json!({ "version": app.package_info().version.to_string(), "build": bundled_build(&app), "flavor": flavor::CLI_FLAVOR })
 }
 
+/**
+ * The version of the plugin in Studio's Plugins folder: the app version that last changed its
+ * code (not every app update changes the plugin). Read when Settings opens: the install runs
+ * on its own thread at start and can finish after the window asked app_info.
+ */
+#[tauri::command]
+fn plugin_version() -> Option<String> {
+    installed_plugin_version()
+}
+
 /** Whether something still listens on the hub's port */
 fn port_open(port: u16) -> bool {
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -574,8 +584,68 @@ fn finish_update(app: AppHandle) {
 }
 
 /** Copies `from` over `to` when their bytes differ, through a temporary file; true if it copied */
+#[cfg(test)]
 fn copy_if_changed(from: &Path, to: &Path) -> std::io::Result<bool> {
     write_if_changed(&fs::read(from)?, to)
+}
+
+/** Where the shipped plugin waits for the app's version (QuackService.APP_VERSION) */
+const PLUGIN_VERSION_PLACEHOLDER: &str = "@@quack-app-version@@";
+const PLUGIN_VERSION_LINE: &str = "QuackService.APP_VERSION = \"";
+
+/** The plugin with this app's version in place of the placeholder, so its header shows it */
+fn stamp_plugin(shipped: &str, version: &str) -> String {
+    shipped.replacen(PLUGIN_VERSION_PLACEHOLDER, version, 1)
+}
+
+/** An installed plugin with its stamped version put back to the placeholder */
+fn unstamp_plugin(installed: &str) -> String {
+    let Some(start) = installed.find(PLUGIN_VERSION_LINE).map(|i| i + PLUGIN_VERSION_LINE.len()) else {
+        return installed.to_string();
+    };
+    let Some(len) = installed[start..].find('"') else { return installed.to_string() };
+    format!("{}{PLUGIN_VERSION_PLACEHOLDER}{}", &installed[..start], &installed[start + len..])
+}
+
+/** The app version stamped in a plugin's text; None when it was never stamped */
+fn stamped_version(plugin: &str) -> Option<String> {
+    let start = plugin.find(PLUGIN_VERSION_LINE)? + PLUGIN_VERSION_LINE.len();
+    let version = &plugin[start..start + plugin[start..].find('"')?];
+    (!version.is_empty() && !version.starts_with("@@")).then(|| version.to_string())
+}
+
+/** The plugin in Studio's Plugins folder: the app version whose plugin code it is, for Settings */
+fn installed_plugin_version() -> Option<String> {
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    stamped_version(&fs::read_to_string(PathBuf::from(local).join("Roblox").join("Plugins").join(flavor::PLUGIN)).ok()?)
+}
+
+#[derive(Debug, PartialEq)]
+enum PluginInstall {
+    /** The installed plugin has this code: left alone, with the version that brought it */
+    Unchanged,
+    /** New code (or no plugin there yet): Studio loads it when a place reopens */
+    Updated,
+}
+
+/**
+ * Writes the shipped plugin, stamped with `version`, over `to` when its code differs. Same code
+ * keeps its old stamp, so the number the plugin shows is the app version that last changed it.
+ */
+fn install_plugin_file(shipped: &[u8], version: &str, to: &Path) -> std::io::Result<PluginInstall> {
+    let Ok(shipped) = std::str::from_utf8(shipped) else {
+        return Ok(if write_if_changed(shipped, to)? { PluginInstall::Updated } else { PluginInstall::Unchanged });
+    };
+    let installed = fs::read_to_string(to).ok();
+    let same_code = installed.as_deref().is_some_and(|text| unstamp_plugin(text) == shipped);
+    if same_code && installed.as_deref().and_then(stamped_version).is_some() {
+        return Ok(PluginInstall::Unchanged);
+    }
+    if !write_if_changed(stamp_plugin(shipped, version).as_bytes(), to)? {
+        return Ok(PluginInstall::Unchanged);
+    }
+    // A plugin of the same code that only lacked a stamp is nothing new for Studio
+    Ok(if same_code { PluginInstall::Unchanged } else { PluginInstall::Updated })
 }
 
 /** Writes `new` to `to` when the file holds other bytes, through a temporary file; true if it wrote */
@@ -595,6 +665,8 @@ fn write_if_changed(new: &[u8], to: &Path) -> std::io::Result<bool> {
 /**
  * Puts the plugin this app ships into Studio's Plugins folder when it differs from the one
  * there, so the plugin always matches the hub. Studio loads it when a place is opened again.
+ * The plugin shows the version of the app that last changed its code: an update that leaves
+ * the plugin's code alone leaves the file alone too.
  */
 fn install_plugin(app: &AppHandle) {
     if cfg!(debug_assertions) {
@@ -603,8 +675,9 @@ fn install_plugin(app: &AppHandle) {
     let Some(from) = resource(app, &["plugin", flavor::PLUGIN]) else { return };
     let Some(local) = std::env::var_os("LOCALAPPDATA") else { return };
     let to = PathBuf::from(local).join("Roblox").join("Plugins").join(flavor::PLUGIN);
-    match copy_if_changed(&from, &to) {
-        Ok(true) => {
+    let version = app.package_info().version.to_string();
+    match fs::read(&from).and_then(|shipped| install_plugin_file(&shipped, &version, &to)) {
+        Ok(PluginInstall::Updated) => {
             let pt = app.state::<Shared>().settings.lock().unwrap().language == "pt";
             let body = if pt {
                 "Plugin atualizado. Reabra os places no Studio pra carregar."
@@ -613,7 +686,7 @@ fn install_plugin(app: &AppHandle) {
             };
             let _ = app.notification().builder().title(flavor::NAME).body(body).show();
         }
-        Ok(false) => {}
+        Ok(PluginInstall::Unchanged) => {}
         Err(error) => eprintln!("Could not install the plugin at {}: {error}", to.display()),
     }
 }
@@ -1291,6 +1364,36 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // Not every app update changes the plugin: the plugin keeps the version of the app that last
+    // changed its code, and only new code asks Ender to reopen his places (on Official that drops
+    // Astral's Studio for a moment)
+    #[test]
+    fn the_plugin_keeps_the_version_of_the_app_that_last_changed_its_code() {
+        let dir = std::env::temp_dir().join(format!("quack-plugin-stamp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let to = dir.join("Roblox").join("Plugins").join("Quack.rbxmx");
+        let shipped = |code: &str| format!("{code}\nQuackService.APP_VERSION = \"{PLUGIN_VERSION_PLACEHOLDER}\"\n");
+        let installed = || stamped_version(&fs::read_to_string(&to).unwrap());
+        let v1 = shipped("print(1)");
+        assert_eq!(stamped_version(&v1), None, "the shipped plugin carries no version");
+        assert_eq!(install_plugin_file(v1.as_bytes(), "1.0.7", &to).unwrap(), PluginInstall::Updated, "first install");
+        assert_eq!(fs::read_to_string(&to).unwrap(), "print(1)\nQuackService.APP_VERSION = \"1.0.7\"\n");
+        assert_eq!(install_plugin_file(v1.as_bytes(), "1.0.8", &to).unwrap(), PluginInstall::Unchanged, "same code");
+        assert_eq!(installed().as_deref(), Some("1.0.7"), "the app version that brought this code");
+        let v2 = shipped("print(2)");
+        assert_eq!(install_plugin_file(v2.as_bytes(), "1.0.9", &to).unwrap(), PluginInstall::Updated, "new code");
+        assert_eq!(fs::read_to_string(&to).unwrap(), "print(2)\nQuackService.APP_VERSION = \"1.0.9\"\n");
+        // Built straight into Plugins (never stamped): the same code gets a version, quietly
+        fs::write(&to, &v2).unwrap();
+        assert_eq!(install_plugin_file(v2.as_bytes(), "1.0.10", &to).unwrap(), PluginInstall::Unchanged);
+        assert_eq!(installed().as_deref(), Some("1.0.10"));
+        // A plugin from before the stamp has no such line: the shipped one is new code
+        fs::write(&to, "print(2)\n").unwrap();
+        assert_eq!(installed(), None);
+        assert_eq!(install_plugin_file(v2.as_bytes(), "1.0.10", &to).unwrap(), PluginInstall::Updated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_command_folder_joins_the_path_once_and_keeps_every_other_entry() {
         let dir = Path::new(r"C:\Users\Ender\AppData\Local\Quack Dev\bin");
@@ -1857,6 +1960,7 @@ fn main() {
             project_roots,
             make_folder,
             app_info,
+            plugin_version,
             restart_hub,
             update_status,
             check_update,

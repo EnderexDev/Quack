@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { samePluginCode } from "../control/commands.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const script = path.join(here, "..", "..", "plugin", "scripts", "build-rbxmx.mjs");
@@ -31,6 +32,29 @@ test("every log prefix of the Dev plugin says QuackDev", () => {
 
 test("the Official plugin never says QuackDev", () => {
   assert.ok(!build(false).includes("QuackDev"));
+});
+
+// The app writes its version over this placeholder when it installs the plugin (install_plugin,
+// app/src-tauri/src/main.rs): it stamps the first one and finds the line by this exact shape
+test("both plugins carry one app-version placeholder on the line the app stamps", () => {
+  for (const plugin of [build(false), build(true)]) {
+    assert.equal(plugin.split("@@quack-app-version@@").length - 1, 1);
+    assert.ok(plugin.includes('QuackService.APP_VERSION = "@@quack-app-version@@"'));
+    assert.equal(plugin.split('QuackService.APP_VERSION = "').length - 1, 1);
+    assert.match(plugin, /Text = `v\{QuackService\.displayVersion\(\)\}`/);
+  }
+});
+
+// quack doctor compares the installed plugin with the shipped one: the app's version stamp alone
+// is no difference, or every install would warn "differs" for good
+test("doctor sees a plugin stamped with the app's version as the shipped one", () => {
+  const shipped = build(false);
+  const stamped = shipped.replace("@@quack-app-version@@", "1.0.12");
+  assert.notEqual(stamped, shipped);
+  assert.ok(samePluginCode(shipped, stamped));
+  assert.ok(samePluginCode(shipped, shipped), "a plugin built straight into Plugins, never stamped");
+  assert.ok(!samePluginCode(shipped, stamped.replace("QuackService.VERSION = ", "QuackService.VERSION =  ")), "other code");
+  assert.ok(!samePluginCode(shipped, shipped.replace('QuackService.APP_VERSION = "@@quack-app-version@@"', "")), "from before the stamp");
 });
 
 // Dev tells apart from Official by colour alone: green brand and green toolbar Q, never yellow
