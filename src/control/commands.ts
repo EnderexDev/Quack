@@ -17,6 +17,9 @@ import {
 import { BADGE_COST } from "../cloud/economy.js";
 import { lintTranslations, LOC_TABLE_MAX } from "../cloud/localization.js";
 import { ANALYTICS_KINDS, defaultAnalyticsBody } from "../cloud/analytics.js";
+import { projectRoot, runAnalyze } from "../analyze/command.js";
+import { buttonsCode, errorPlace, installCode, nodeForPath, probeErrorLine, probeErrors, readCode, removeCode, requireCode, signature, type CollectedError } from "../analyze/probe.js";
+import { loadTree } from "../analyze/tree.js";
 
 /**
  * `quack` / `quackdev`: the hub from a terminal. Every command is one or a few calls to the
@@ -116,6 +119,8 @@ interface Options {
   /** gui, mouse, and the tools after them */
   depth?: string;
   limit?: string;
+  /** errors: how many days back */
+  days?: string;
   hidden: boolean;
   button?: string;
   space?: string;
@@ -302,6 +307,7 @@ function parse(full: string[]): { command?: string; args: string[]; options: Opt
       width: { type: "string" },
       depth: { type: "string" },
       limit: { type: "string" },
+      days: { type: "string" },
       hidden: { type: "boolean" },
       button: { type: "string" },
       space: { type: "string" },
@@ -470,6 +476,7 @@ function parse(full: string[]): { command?: string; args: string[]; options: Opt
       width: values.width,
       depth: values.depth,
       limit: values.limit,
+      days: values.days,
       hidden: values.hidden === true,
       button: values.button,
       space: values.space,
@@ -605,6 +612,14 @@ See
   conflict <id> [place]     A conflict's saved disk version and the script as it is now
   choices                   Connections waiting for a choice (folder in use, second Studio, Set up)
   doctor                    Checks the hub, its build, the plugin and the registered folders
+  analyze [file...] [--path <folder>] [--json]   A static check of the synced Luau: Quack's
+                            own parser and linter (a syntax error, an undefined variable, a
+                            wrong argument count...), and what only Quack knows (the tree, which
+                            module each require reaches): a module member that is not there
+                            (X:Removed()), a child the tree lacks (:WaitForChild("Typo")).
+                            "-- quack: allow(rule)" silences one. Reads only the disk: no hub,
+                            no Studio. Files: only those reported (the whole place is still
+                            read). Exit 1 when it finds something
 
 Wait
   wait [place]              Until Studio is connected and nothing has synced for a while
@@ -625,6 +640,11 @@ Studio (through the ${info.appName} plugin; the code goes as --code=<luau> or --
   eval-server [place]       Luau in the play server's game VM, with the game's require cache;
                             prints what it printed and what it returned
   eval-client [place]       The same in the play client
+  probe <place> [--limit <clicks>] [--seconds <s>]   A robot in the play already running in a
+                            TEST place: requires every module on the server and the client,
+                            presses every button a player could press (and those the windows it
+                            opens bring), then lists each new error with its file and line. It
+                            changes the play as a player would: never where the play's data is real
   exec [place]              Luau in the edit plugin (Studio in edit mode)
   playtest start|stop|status [place] [--run] [--players <n>]   A solo play (--run: Run mode, no
                             client), or a multiplayer test with n players (Studio's Local Server);
@@ -810,6 +830,9 @@ Open Cloud (run by the hub with its key; a create, change or delete asks you in 
   loc check <universeId> <source text> [--locales <a,b>]   The latest translation of one string
   loc langs <universeId> [pt=on de=off ...]   Which languages get automatic translation; a change asks
   analytics <universeId> [--body=<json> | --file <query.json>] [--kind metrics|dimension-values]
+  errors [place] [--days <n>] [--limit <n>] [--universe <id>]   The live game's errors, most
+                            frequent first (Error Reporting, read-only): count, client or server,
+                            the message, and the script file and line in the place's folder
                             The Analytics Query API, read-only (default: daily active users, 3 days)
 The live game (Open Cloud, run by the hub with its key; every change asks the user in Quack's app
 and runs only after their Accept. [place] is the last argument and names the experience
@@ -1091,6 +1114,8 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
       return locCommand(ctx, options, args);
     case "analytics":
       return analyticsCommand(ctx, options, args);
+    case "errors":
+      return errorsCommand(ctx, options, args[0]);
     case "rule": {
       const { version, text } = rule(ctx.info);
       const body = options.prompt ? rulePrompt(ctx.info) : text;
@@ -1116,6 +1141,8 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
       return device(ctx, options, args[0]);
     case "click":
       return click(ctx, options, args);
+    case "probe":
+      return probe(ctx, options, args[0]);
     case "wait-for":
       return waitFor(ctx, options, args[0]);
     case "record":
@@ -1128,6 +1155,25 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
       return mouse(ctx, options, args);
     case "verify":
       return verifySync(ctx, options, args[0]);
+    case "analyze":
+      return runAnalyze({
+        cwd: ctx.cwd,
+        root: options.path,
+        files: [...args, ...(options.files ? options.files.split(",").map((f) => f.trim()).filter(Boolean) : [])],
+        json: options.json,
+        out: ctx.out,
+        placeFolders: async () => ((await client.get("/api/state")).places as Place[]).map((p) => p.folder),
+        // only a play already running is read: analyze never starts one
+        live: {
+          places: async () => ((await client.get("/api/state")).places as Place[]).map((p) => ({ folder: p.folder, name: placeLabel(p), id: p.placeId })),
+          // no daemon or no Studio for the place: no play either
+          playing: async (placeId) => {
+            const status = await studio(ctx, { placeId, folder: "" }, "playtest", { action: "status" }, 5000).catch(() => null);
+            return !!(status?.editConnected && status?.playing);
+          },
+          evalServer: (placeId, code, timeoutMs) => studio(ctx, { placeId, folder: "" }, "eval", { code, peer: "server", timeoutMs }, timeoutMs),
+        },
+      });
     case "changes":
       return changes(ctx, options, args[0]);
     case "perf":
@@ -1895,6 +1941,111 @@ async function click(ctx: ControlContext, options: Options, args: string[]): Pro
   }
   ctx.out(clickSummary(result));
   return EXIT.ok;
+}
+
+/**
+ * probe: requires every module on both sides of a running play, presses every button a player
+ * could press until none is new (or --limit clicks / --seconds), and lists the errors the game
+ * raised meanwhile with their file and line. The place is never taken from the folder: the robot
+ * changes the play's state, so the caller names the test place. It never starts a play
+ */
+async function probe(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  if (!query) throw new UsageError("usage: probe <place> [--limit <clicks>] [--seconds <s>]: name the test place; the robot presses every button of its running play");
+  const place = await resolvePlace(ctx, query);
+  const status = await studio(ctx, place, "playtest", { action: "status" }, 15_000);
+  if (!status.editConnected) throw new Error(`${placeLabel(place)}: Studio is not connected.`);
+  if (!status.playing || !status.client) throw new Error(`${placeLabel(place)}: no play with a client is running. Start one in the test place (playtest start); probe never starts one.`);
+  const maxClicks = options.limit === undefined ? 150 : wholeOption(options.limit, "limit")!;
+  const clickSeconds = secondsOption(options.seconds, "seconds") ?? 240;
+  const started = Date.now();
+  const evalIn = async (peer: "server" | "client", code: string, timeoutMs = 30_000): Promise<string | undefined> => {
+    const r = await studio(ctx, place, "eval", { code, peer, timeoutMs }, timeoutMs);
+    if (!r.ok) throw new Error(`the play ${peer}: ${String(r.error).split("\n")[0]}`);
+    return r.values?.[0];
+  };
+  const collected: { side: "server" | "client"; errors: CollectedError[] }[] = [];
+  let dropped = 0;
+  /** The errors since the last read, and the tag of the next ones */
+  const read = async (peer: "server" | "client", tag: string): Promise<CollectedError[]> => {
+    const answer = JSON.parse((await evalIn(peer, readCode(tag))) ?? "{}");
+    if (answer.missing) throw new Error(`the play ${peer} lost the error collector (did the play restart?)`);
+    dropped += Number(answer.dropped ?? 0);
+    return Array.isArray(answer.errors) ? answer.errors : [];
+  };
+  const sides = ["server", "client"] as const;
+  for (const side of sides) await evalIn(side, installCode());
+  const requires: Record<string, { p: string; r: string; e?: string }[]> = {};
+  const clicked: string[] = [];
+  let pressed = 0;
+  try {
+    // errors already repeating (a loop that errors every frame) are the game's before the robot: left out
+    await sleep(3000);
+    const baseline = new Set<string>();
+    for (const side of sides) for (const e of await read(side, "require")) baseline.add(signature(side, e));
+    for (const side of sides) {
+      requires[side] = JSON.parse((await evalIn(side, requireCode(side, 2, 150), 240_000)) ?? "[]");
+      collected.push({ side, errors: await read(side, "after requires") });
+    }
+    // a module whose require fails or raises an error (in a thread it starts, too) on one side and
+    // is clean on the other is written for the other side
+    const dirty = new Set<string>();
+    for (const side of sides) for (const x of requires[side] ?? []) if (x.r !== "ok") dirty.add(`${side}|${x.p}`);
+    for (const { side, errors } of collected) for (const e of errors) if (e.g.startsWith("require ")) dirty.add(`${side}|${e.g.slice(8)}`);
+    const sideSpecific = new Set<string>();
+    for (const side of sides) {
+      const other = side === "server" ? "client" : "server";
+      for (const x of requires[side] ?? []) {
+        const there = requires[other]?.find((y) => y.p === x.p);
+        if (dirty.has(`${side}|${x.p}`) && there?.r === "ok" && !dirty.has(`${other}|${x.p}`)) sideSpecific.add(`${side}|${x.p}`);
+      }
+    }
+    // every button, again after each round: the windows the clicks opened bring new ones
+    const seen = new Set<string>();
+    let misses = 0;
+    rounds: while (pressed < maxClicks && Date.now() - started < clickSeconds * 1000) {
+      const buttons: string[] = JSON.parse((await evalIn("client", buttonsCode())) ?? "[]");
+      const fresh = buttons.filter((b) => !seen.has(b));
+      if (!fresh.length) break;
+      for (const b of fresh) {
+        if (pressed >= maxClicks || Date.now() - started >= clickSeconds * 1000) break rounds;
+        seen.add(b);
+        for (const side of sides) collected.push({ side, errors: await read(side, `click ${b}`) });
+        try {
+          const r = await studio(ctx, place, "click", { path: b }, 20_000);
+          pressed++;
+          clicked.push(b);
+          misses = r.activated || r.mouseButton1Click ? 0 : misses + 1;
+        } catch {
+          misses++;
+        }
+        // three presses in a row that fired nothing: a prompt (a purchase, a teleport) took the input
+        if (misses >= 3) {
+          await studio(ctx, place, "key", { keyCode: "Escape" }, 15_000).catch(() => undefined);
+          misses = 0;
+        }
+        await sleep(250);
+      }
+    }
+    await sleep(1000);
+    for (const side of sides) collected.push({ side, errors: await read(side, "after clicks") });
+    const tree = loadTree(place.folder, path.join(place.folder, "sync"), path.join(place.folder, "sourcemap.json"));
+    const errors = probeErrors(tree, collected, baseline, sideSpecific);
+    const count = (side: string, r: string) => (requires[side] ?? []).filter((x) => x.r === r).length;
+    if (options.json) {
+      ctx.out(JSON.stringify({ place: placeLabel(place), errors, requires, clicked, dropped, ms: Date.now() - started }, null, 2));
+    } else {
+      for (const e of errors) ctx.out(probeErrorLine(e, place.folder));
+      const req = sides.map((side) => `${side}: ${(requires[side] ?? []).filter((x) => x.r !== "budget").length} modules required (${count(side, "error")} failed, ${count(side, "wait")} did not return${count(side, "budget") ? ", stopped at the time budget" : ""})`).join("; ");
+      ctx.out(`${errors.length ? `${errors.length} new error${errors.length === 1 ? "" : "s"}` : "No new error"} in ${placeLabel(place)}'s play. ${req}; ${pressed} buttons pressed in ${((Date.now() - started) / 1000).toFixed(0)} s.${dropped ? ` ${dropped} errors past the first 2000 were not kept.` : ""}`);
+      const side = [...sideSpecific].length;
+      if (side) ctx.out(`${side} module(s) failed or raised an error on one side and loaded clean on the other: written for the other side, their errors there left out.`);
+    }
+    return errors.length ? EXIT.error : EXIT.ok;
+  } finally {
+    for (const side of sides) await evalIn(side, removeCode()).catch(() => undefined);
+    // the hub's "new errors" notes after each call repeat what the report says
+    NOTES.get(ctx)?.splice(0);
+  }
 }
 
 /** One line on a click: where, how, and which of the button's signals fired */
@@ -2826,6 +2977,54 @@ async function analyticsCommand(ctx: ControlContext, options: Options, args: str
   else {
     ctx.out(`${kind} of universe ${universeId}${body === undefined ? ` (default: ${(defaultAnalyticsBody(Date.now()) as any).metric}, the last 3 days)` : ""}:`);
     ctx.out(JSON.stringify(r.result, null, 2));
+  }
+  return EXIT.ok;
+}
+
+/**
+ * errors: the live game's most frequent errors of the last days, each with its count, its side,
+ * its message and the file and line it points at in the place's synced folder (the path in the
+ * message or the stack, mapped as the probe maps a play's errors)
+ */
+async function errorsCommand(ctx: ControlContext, options: Options, query: string | undefined): Promise<number> {
+  const universeId = await universeOf(ctx, options, query);
+  const days = options.days === undefined ? 3 : wholeOption(options.days, "days")!;
+  const limit = options.limit === undefined ? 20 : positiveInt(options.limit, "limit")!;
+  const place = options.universe === undefined ? await resolvePlace(ctx, query).catch(() => undefined) : undefined;
+  const r = await cloudCall(ctx, "errors.list", { universeId, days, limit });
+  // the place's synced folder, or the project the command runs in (a place the other hub syncs)
+  // when its sourcemap's stamped place is in the same experience: another game's tree would name other files
+  const own = async (): Promise<string | undefined> => {
+    const root = projectRoot(ctx.cwd);
+    if (!root) return undefined;
+    let stamped: unknown;
+    try {
+      const map = JSON.parse(fs.readFileSync(path.join(root, "sourcemap.json"), "utf8"));
+      stamped = map?._quack?.placeId ?? map?._azul?.placeId;
+    } catch {
+      return undefined;
+    }
+    if (typeof stamped !== "number" || stamped <= 0) return undefined;
+    const same = await universeOf(ctx, { ...options, universe: undefined }, String(stamped)).then((u) => u === universeId, () => false);
+    return same ? root : undefined;
+  };
+  const folder = place?.folder && fs.existsSync(path.join(place.folder, "sync")) ? place.folder : await own();
+  const tree = folder ? loadTree(folder, path.join(folder, "sync"), path.join(folder, "sourcemap.json")) : undefined;
+  const fileOf = (e: { message?: string; stacktrace?: string }): string | undefined => {
+    const at = errorPlace({ m: e.message ?? "", t: e.stacktrace ?? "", s: "", g: "" });
+    if (!at) return undefined;
+    const node = tree ? nodeForPath(tree, at.path) : null;
+    return node?.file && folder ? `${path.relative(folder, node.file).replace(/\\/g, "/")}:${at.line}` : `${at.path}:${at.line}`;
+  };
+  const errors = (r.errors ?? []).map((e: any) => ({ ...e, at: fileOf(e) }));
+  if (options.json) {
+    ctx.out(JSON.stringify({ ...r, errors }, null, 2));
+    return EXIT.ok;
+  }
+  ctx.out(`${r.kinds} kinds of error, ${r.total} in all, in universe ${universeId} since ${String(r.startTime).slice(0, 10)} (counted over the 100 most frequent kinds)${r.kinds > errors.length ? `; the ${errors.length} most frequent` : ""}:`);
+  for (const e of errors) {
+    const message = (e.message ?? "(no log kept for it in these days)").replace(/^.+?:\d+: /, "").split("\n")[0];
+    ctx.out(`${String(e.count).padStart(7)}  ${(e.source ?? "?").toLowerCase().padEnd(6)}  ${e.at ?? "(no script)"}  ${message}`);
   }
   return EXIT.ok;
 }

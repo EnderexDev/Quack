@@ -164,6 +164,34 @@ export const TOOLS: Tool[] = [
     argv: (args) => ["eval-client", ...text(args, "place"), codeFlag(args), ...number(args, "timeoutSeconds", "--timeout")],
   },
   {
+    name: "production_errors",
+    description: "The live game's errors, most frequent first (Roblox's Error Reporting, read-only, run by Quack's hub with its key, which needs universe.analytics:read): each one's count over the last days, client or server, its message and stack, and the script file and line it points at in the place's synced folder. Start a production bug hunt here.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...placeProp,
+        universe: { type: "string", description: "The experience (universe) id, instead of the place" },
+        days: { type: "number", description: "Days back (default 3, at most 30)" },
+        limit: { type: "number", description: "The most frequent errors to show (default 20, at most 100)" },
+      },
+    },
+    argv: (args) => ["errors", ...text(args, "place"), ...(args.universe !== undefined ? [`--universe=${String(args.universe)}`] : []), ...number(args, "days", "--days"), ...number(args, "limit", "--limit")],
+  },
+  {
+    name: "probe",
+    description: "A robot that presses every button and requires every module in the play already running in a TEST place, then lists each new error with its file and line and what it was doing (the module required, the button pressed). It changes the play as a player would (buys, opens, resets): only in a test place, never where the play's data is real; the place must be named. It never starts a play (solo_playtest start first). Errors already repeating before it started, and a module's errors on the side it was not written for, are left out.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        place: { type: "string", description: "The test place (name or id): required, never taken from the folder" },
+        maxClicks: { type: "number", description: "Buttons to press at most (default 150; 0 only requires the modules)" },
+        seconds: { type: "number", description: "Time for the clicks (default 240)" },
+      },
+      required: ["place"],
+    },
+    argv: (args) => ["probe", String(args.place ?? ""), ...number(args, "maxClicks", "--limit"), ...number(args, "seconds", "--seconds")],
+  },
+  {
     name: "execute_luau",
     description: "Runs Luau in the Quack plugin of Studio in edit mode (plugin security: Source, Selection, ChangeHistoryService). What it changes in the place syncs to disk like any edit in Studio. Its require gives fresh module copies, not the running game's: use the eval tools for a running play.",
     inputSchema: luauSchema,
@@ -385,6 +413,28 @@ export const TOOLS: Tool[] = [
       const files = args.files;
       if (files !== undefined && (!Array.isArray(files) || files.some((f) => typeof f !== "string" || !f || f.includes(",")))) throw new ToolInputError("files must be a list of paths, none with a comma");
       return ["verify", ...text(args, "place"), ...(Array.isArray(files) && files.length ? [`--files=${files.join(",")}`] : [])];
+    },
+  },
+  {
+    name: "analyze",
+    description: "A static check of a synced project's Luau with what Quack knows and a linter does not: the place's instance tree (the sourcemap) and which module each require or Library.getX(\"Name\") reaches. Finds a module member that is not there (X:Removed() after X lost it: the call errors at run time), a child the tree lacks (:WaitForChild(\"Typo\") waits forever, .Missing errors), and what Quack's own Luau linter finds in any project (a syntax error with the line the unclosed block opened at, an undefined variable such as a local function called above its definition, a wrong argument count, a duplicate table key). Reads the disk, a second or two for a whole game, with no Studio needed. When a play is already running in the place's Studio, it also reads there the keys of the modules whose text does not say them (wrapped, a metatable, extended by another module), only modules the game's server requires anyway; it never starts a play. It stays quiet where it cannot be sure (a module filled on demand, a child made by code), so what it reports is worth reading. Run it after editing scripts, before a playtest. Errors when it finds something.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        files: { type: "array", items: { type: "string" }, description: "Report only these script files (absolute, or from the project folder or its sync folder); the whole place is still read. Default: every script" },
+        path: { type: "string", description: "The project folder (the one holding sync/). Default: found from the first file or the folder the AI runs in" },
+        json: { type: "boolean", description: "The whole report as JSON: findings (file, line, column, rule, message), stats, the modules not checked and why" },
+      },
+    },
+    argv: (args) => {
+      const files = args.files;
+      if (files !== undefined && (!Array.isArray(files) || files.some((f) => typeof f !== "string" || !f || f.startsWith("-")))) throw new ToolInputError("files must be a list of paths, none starting with \"-\"");
+      return [
+        "analyze",
+        ...(Array.isArray(files) ? (files as string[]) : []),
+        ...(text(args, "path").length ? [`--path=${args.path}`] : []),
+        ...(args.json === true ? ["--json"] : []),
+      ];
     },
   },
   {
