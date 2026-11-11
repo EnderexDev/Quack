@@ -23,19 +23,26 @@ const flag = (name, fallback) => {
   return i >= 0 ? args[i + 1] : fallback;
 };
 /** Flags that take a value: the argument after one of them is not the folder */
-const VALUED = new Set(["--limit", "--grep", "--json"]);
+const VALUED = new Set(["--limit", "--grep", "--json", "--sync", "--sourcemap"]);
 const project = path.resolve(args.find((a, i) => !a.startsWith("--") && !VALUED.has(args[i - 1])) ?? ".");
 const limit = Number(flag("limit", "200"));
 const all = args.includes("--all");
 /** Words a fix's message carries, in English and Portuguese */
 const FIX = new RegExp(flag("grep", "\\b(fix(es|ed)?|bug|crash(es)?|broke(n)?|regress\\w*|error|nil|wrong|corrig\\w*|conserta\\w*|arruma\\w*|quebr\\w*)\\b"), "i");
-const sourcemap = path.join(project, "sourcemap.json");
+const sourcemap = path.resolve(project, flag("sourcemap", "sourcemap.json"));
 
 const git = (...a) => execFileSync("git", ["-c", "core.quotepath=off", "-C", project, ...a], { encoding: "utf8", maxBuffer: 1 << 28, windowsHide: true });
-const SCRIPT = /^sync\/.*\.luau?$/;
+/** The scripts' folder in the repository: sync/ in a Quack project, src/ (or another) in a Rojo one */
+// as git writes paths: forward slashes, no "./" in front, no "/" at the end; "." (the whole repository) is ""
+const NORMAL = path.posix.normalize(flag("sync", "sync").replace(/\\/g, "/")).replace(/\/$/, "");
+// only a literal "./" in front, or "." alone, goes: a folder may start with a dot (".sync")
+const SYNC = NORMAL === "." ? "" : NORMAL.replace(/^\.\//, "");
+const SCRIPT = new RegExp(`^${SYNC ? `${SYNC.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/` : ""}.*\\.luau?$`);
+/** The pathspec git takes for it */
+const SPEC = SYNC || ".";
 
 /** sha, parent, subject of the commits that changed a script, newest first (merges left out) */
-const commits = git("log", "--no-merges", "--format=%H %P%x09%s", "-n", String(limit * 20), "--", "sync")
+const commits = git("log", "--no-merges", "--format=%H %P%x09%s", "-n", String(limit * 20), "--", SPEC)
   .split("\n")
   .filter(Boolean)
   .map((l) => {
@@ -50,7 +57,7 @@ const commits = git("log", "--no-merges", "--format=%H %P%x09%s", "-n", String(l
 function touched(c) {
   const out = new Map();
   let file = null;
-  for (const line of git("diff", "-U0", c.parent, c.sha, "--", "sync").split("\n")) {
+  for (const line of git("diff", "-U0", c.parent, c.sha, "--", SPEC).split("\n")) {
     if (line.startsWith("--- ")) file = line.startsWith("--- a/") ? line.slice(6) : null;
     const m = /^@@ -(\d+)(?:,(\d+))? /.exec(line);
     if (m && file && SCRIPT.test(file)) {
@@ -65,14 +72,14 @@ function touched(c) {
 }
 
 function extract(sha, dir) {
-  const archive = execFileSync("git", ["-C", project, "archive", "--format=tar", sha, "sync"], { maxBuffer: 1 << 30, windowsHide: true });
+  const archive = execFileSync("git", ["-C", project, "archive", "--format=tar", sha, SPEC], { maxBuffer: 1 << 30, windowsHide: true });
   fs.mkdirSync(dir, { recursive: true });
   // through stdin, from inside the folder: a "C:" path reads as a remote host to GNU tar
   execFileSync("tar", ["-xf", "-"], { cwd: dir, input: archive, maxBuffer: 1 << 30, windowsHide: true });
 }
 
 function findings(root, files) {
-  const r = analyzeProject(root, { files, sourcemap: fs.existsSync(sourcemap) ? sourcemap : undefined });
+  const r = analyzeProject(root, { files, syncDir: SYNC || ".", sourcemap: fs.existsSync(sourcemap) ? sourcemap : undefined });
   return r.findings.map((f) => ({ file: path.relative(root, f.file).split(path.sep).join("/"), line: f.line, rule: f.rule, message: f.message }));
 }
 

@@ -134,6 +134,8 @@ interface Chain {
   value?: Expr;
   /** The chain is a local's value (`local hit = Remotes.Hit`): its uses go through the local */
   init?: boolean;
+  /** The chain is the value of `T.field = <chain>` (T a name): its uses go through that field */
+  field?: Extract<Expr, { kind: "Member" }>;
   /** The whole expression */
   expr: Expr;
 }
@@ -1076,7 +1078,7 @@ function readScript(file: string, tree: GameTree): ScriptFile {
   return parseScript(fs.readFileSync(file, "utf8"), file, tree.byFile.get(fileKey(file)));
 }
 
-function parseScript(src: string, file: string, node?: TreeNode): ScriptFile {
+export function parseScript(src: string, file: string, node?: TreeNode): ScriptFile {
   const lineStarts = [0];
   for (let i = src.indexOf("\n"); i >= 0; i = src.indexOf("\n", i + 1)) lineStarts.push(i + 1);
   const s: ScriptFile = { file, src, node, lineStarts, bound: new Map(), loaderCalls: [] };
@@ -1200,7 +1202,10 @@ function collectFacts(chunk: Chunk): Facts {
         s.values.forEach((v, i) => {
           const u = unwrap(v);
           // `X = Remotes.Hit` into a local declared earlier: the local's value, followed through its uses
-          if (s.targets[i]?.kind === "Name" && (u.kind === "Member" || u.kind === "Index" || u.kind === "Call")) chain(u, "read", undefined, true);
+          const t = s.targets[i];
+          if (t?.kind === "Name" && (u.kind === "Member" || u.kind === "Index" || u.kind === "Call")) chain(u, "read", undefined, true);
+          // `State.Event = f("Hit")`: the channel lives in that field
+          else if (t?.kind === "Member" && t.object.kind === "Name" && u.kind === "Call") chain(u, "read", undefined, false, t);
           else expr(v);
         });
         s.targets.forEach((t, i) => target(t, "target", s.values[i]));
@@ -1253,9 +1258,9 @@ function collectFacts(chunk: Chunk): Facts {
   };
 
   /** A chain's own name and steps; the expressions inside its steps (arguments, keys) are walked too */
-  const chain = (e: Expr, role: Chain["role"], value?: Expr, init?: boolean) => {
+  const chain = (e: Expr, role: Chain["role"], value?: Expr, init?: boolean, field?: Extract<Expr, { kind: "Member" }>) => {
     const { base, ops } = flatten(e);
-    if (base.kind === "Name") facts.chains.push({ base, ops, role, scope: here(), value, init, expr: e });
+    if (base.kind === "Name") facts.chains.push({ base, ops, role, scope: here(), value, init, expr: e, field });
     else expr(base);
     let callee: Expr = base;
     for (const op of ops) {
@@ -1856,6 +1861,278 @@ function isAssignTarget(s: ScriptFile, n: NameExpr): boolean {
   return !!d && d.at !== n.start && s.src.slice(n.end).trimStart().startsWith("=") && !s.src.slice(n.end).trimStart().startsWith("==");
 }
 
+/**
+ * Every string the game writes under each field name: `{ ActionBridge = "X" }` and `t.ActionBridge = "X"`.
+ * A field also written with anything else (a variable, a call, a computed key) is open: it may hold any name
+ */
+function fieldStrings(scripts: ScriptFile[]): Map<string, { values: Set<string>; open: boolean }> {
+  const out = new Map<string, { values: Set<string>; open: boolean }>();
+  const note = (name: string, value: Expr | undefined) => {
+    if (!out.has(name)) out.set(name, { values: new Set(), open: false });
+    const e = out.get(name)!;
+    const v = value && unwrap(value);
+    if (v?.kind === "String") e.values.add(v.value);
+    else e.open = true;
+  };
+  for (const s of scripts) {
+    if (!s.chunk) continue;
+    /** A table's fields, and (`Bridges = { Request = "X" }`) under its parent field's name too */
+    const table = (e: Extract<Expr, { kind: "Table" }>, parent?: string): void => {
+      // the values of a table under a field (`Bridges = { a = "X", b = "Y" }`): what a loop over it gives
+      if (parent) for (const f of e.fields) note(`${parent}[]`, f.value);
+      for (const f of e.fields) {
+        if (f.kind === "Named") {
+          note(f.name.name, f.value);
+          if (parent) note(`${parent}.${f.name.name}`, f.value);
+          const v = unwrap(f.value);
+          if (v.kind === "Table") {
+            table(v, f.name.name);
+            continue;
+          }
+        }
+        if (f.kind === "Keyed") expr(f.key);
+        expr(f.value);
+      }
+    };
+    const expr = (e: Expr): void => {
+      switch (e.kind) {
+        case "Table":
+          table(e);
+          return;
+        case "Call":
+          expr(e.callee);
+          e.args.forEach(expr);
+          return;
+        case "Member":
+          expr(e.object);
+          return;
+        case "Index":
+          expr(e.object);
+          expr(e.key);
+          return;
+        case "Function":
+          block(e.body);
+          return;
+        case "Binary":
+          expr(e.left);
+          expr(e.right);
+          return;
+        case "Unary":
+          expr(e.operand);
+          return;
+        case "Paren":
+        case "Cast":
+          expr(e.expr);
+          return;
+        case "IfElse":
+          for (const c of e.clauses) {
+            expr(c.cond);
+            expr(c.value);
+          }
+          expr(e.orelse);
+          return;
+        case "Interp":
+          e.parts.forEach(expr);
+          return;
+        default:
+          return;
+      }
+    };
+    const block = (b: Block): void => {
+      for (const st of b.body) {
+        switch (st.kind) {
+          case "Local":
+            st.values.forEach(expr);
+            break;
+          case "Assign":
+            st.values.forEach((v, i) => {
+              const t = st.targets[i];
+              const u = unwrap(v);
+              if (t?.kind === "Member" && u.kind === "Table") table(u, t.name.name);
+              else expr(v);
+            });
+            st.targets.forEach((t, i) => {
+              if (t.kind === "Member") {
+                note(t.name.name, st.values[i]);
+                if (t.object.kind === "Member") note(`${t.object.name.name}.${t.name.name}`, st.values[i]);
+              }
+              expr(t);
+            });
+            break;
+          case "CompoundAssign":
+            if (st.target.kind === "Member") {
+              note(st.target.name.name, undefined);
+              if (st.target.object.kind === "Member") note(`${st.target.object.name.name}.${st.target.name.name}`, undefined);
+            }
+            expr(st.value);
+            break;
+          case "CallStat":
+            expr(st.call);
+            break;
+          case "Return":
+            st.values.forEach(expr);
+            break;
+          case "LocalFunction":
+          case "Function":
+            block(st.func.body);
+            break;
+          case "If":
+            for (const c of st.clauses) {
+              expr(c.cond);
+              block(c.body);
+            }
+            if (st.orelse) block(st.orelse);
+            break;
+          case "While":
+          case "Repeat":
+            expr(st.cond);
+            block(st.body);
+            break;
+          case "NumericFor":
+          case "GenericFor":
+          case "Do":
+            block(st.body);
+            break;
+          default:
+            break;
+        }
+      }
+    };
+    block(s.chunk);
+  }
+  return out;
+}
+
+/** The field a generic for's value variable walks (`for _, v in pairs(x.Bridges)` -> "Bridges"), when it walks one */
+function loopedTable(s: ScriptFile, d: Decl): string | null {
+  let found: string | null = null;
+  const visit = (b: Block) => {
+    for (const st of b.body) {
+      if (found !== null) return;
+      if (st.kind === "GenericFor" && st.vars[1]?.start === d.at) {
+        const first = st.exprs[0] && unwrap(st.exprs[0]);
+        const over = first?.kind === "Call" && !first.method && first.args.length === 1 && (isGlobal(s, first.callee, "pairs") || isGlobal(s, first.callee, "ipairs")) ? unwrap(first.args[0]) : st.exprs.length === 1 ? first : undefined;
+        found = over?.kind === "Member" ? over.name.name : "";
+        return;
+      }
+      if (st.kind === "If") {
+        st.clauses.forEach((c) => visit(c.body));
+        if (st.orelse) visit(st.orelse);
+      } else if (st.kind === "LocalFunction" || st.kind === "Function") visit(st.func.body);
+      else if ("body" in st && st.body && (st.body as Block).body) visit(st.body as Block);
+    }
+  };
+  if (s.chunk) visit(s.chunk);
+  return found || null;
+}
+
+/** The literal start and end of a name built at run time (`prefix .. "Action"`, `` `{x}Result` ``): "" when not literal */
+function literalEnds(e: Expr): { prefix: string; suffix: string } {
+  const parts: Expr[] = [];
+  const walk = (x: Expr) => {
+    x = unwrap(x);
+    if (x.kind === "Binary" && x.op === "..") {
+      walk(x.left);
+      walk(x.right);
+    } else if (x.kind === "Interp") x.parts.forEach(walk);
+    else parts.push(x);
+  };
+  walk(e);
+  const text = (x: Expr | undefined) => (x?.kind === "String" ? x.value : x?.kind === "Number" ? x.raw : null);
+  let prefix = "";
+  for (const p of parts) {
+    const t = text(p);
+    if (t === null) break;
+    prefix += t;
+  }
+  let suffix = "";
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const t = text(parts[i]);
+    if (t === null) break;
+    suffix = t + suffix;
+  }
+  // all literal: the whole name is known, but it came by an unusual way; keep it as a pattern of itself
+  return prefix.length === 0 && suffix.length === 0 ? { prefix: "", suffix: "" } : { prefix, suffix: prefix === suffix && parts.every((p) => text(p) !== null) ? "" : suffix };
+}
+
+/**
+ * Names a file declares in a list: a local table of three or more strings whose every use is a
+ * loop over it, and whose loop variable is only passed to calls or used as a key written
+ * (`for _, name in Names do Bridges[name] = Make(name) end`). Such a list makes the channels;
+ * it neither sends nor connects any
+ */
+export function declaredNames(s: ScriptFile): string[] {
+  if (!s.chunk || !s.scopes) return [];
+  const out: string[] = [];
+  for (const d of s.scopes.decls) {
+    const init = d.kind === "local" && !d.assigned.length && d.init ? unwrap(d.init) : undefined;
+    if (init?.kind !== "Table" || init.fields.length < 3 || !init.fields.every((f) => f.kind === "Item" && unwrap(f.value).kind === "String")) continue;
+    const uses = s.scopes.uses(d);
+    const loops: Extract<Stat, { kind: "GenericFor" }>[] = [];
+    const visit = (b: Block) => {
+      for (const st of b.body) {
+        if (st.kind === "GenericFor") loops.push(st);
+        for (const inner of st.kind === "If" ? [...st.clauses.map((c) => c.body), ...(st.orelse ? [st.orelse] : [])] : "body" in st && st.body && (st.body as Block).body ? [st.body as Block] : []) visit(inner);
+        if (st.kind === "LocalFunction" || st.kind === "Function") visit(st.func.body);
+      }
+    };
+    visit(s.chunk);
+    const iterated = (st: Extract<Stat, { kind: "GenericFor" }>) => {
+      const first = st.exprs[0] && unwrap(st.exprs[0]);
+      const list = first?.kind === "Call" && first.args.length === 1 ? unwrap(first.args[0]) : first;
+      return list?.kind === "Name" && s.scopes!.of(list) === d ? st : null;
+    };
+    const mine = loops.filter(iterated);
+    // every use of the list is one of these loops
+    if (!uses.length || uses.length !== mine.length) continue;
+    const ok = mine.every((st) => {
+      const v = s.scopes!.decls.find((x) => x.at === (st.vars[1] ?? st.vars[0]).start);
+      if (!v) return false;
+      return s.scopes!.uses(v).every((n) => {
+        const after = s.src.slice(n.end).trimStart();
+        const before = s.src.slice(0, n.start).trimEnd();
+        // an argument (`Make(name)`, `f(x, name)`), a key written (`t[name] =`), or a key tested (`if not t[name] then`)
+        return ((before.endsWith("(") || before.endsWith(",")) && (after.startsWith(")") || after.startsWith(","))) || (before.endsWith("[") && (/^\]\s*=[^=]/.test(after) || /^\]\s*(then|and|or|do|==|~=)(?!w)/.test(after)));
+      });
+    });
+    if (!ok) continue;
+    for (const f of init.fields) out.push((unwrap(f.value) as Extract<Expr, { kind: "String" }>).value);
+  }
+  return out;
+}
+
+/**
+ * The uses of a channel kept in a field (`State.Event = f("Hit")`, then `State.Event:Fire()`), in
+ * the file: one assignment only, the table a local of the file that is never handed on (every
+ * use of it reads a field). Anything else is one unknown use
+ */
+function fieldUses(s: ScriptFile, field: Extract<Expr, { kind: "Member" }>): { use: ChannelUse; at: number }[] {
+  const unknown = [{ use: "unknown" as ChannelUse, at: field.start }];
+  const table = writer(s, field.object as NameExpr);
+  if (!table || table.kind === "param" || table === returnedDecl(s)) return unknown;
+  const name = field.name.name;
+  const out: { use: ChannelUse; at: number }[] = [];
+  let assigned = 0;
+  for (const c of s.facts!.chains) {
+    if (writer(s, c.base) !== table) continue;
+    const [first] = c.ops;
+    // any use of the table other than reading a field: it may be handed on with the field
+    if (first?.kind !== "member") return unknown;
+    if (first.name.name !== name) continue;
+    if (c.role === "target" && c.ops.length === 1) {
+      assigned++;
+      continue;
+    }
+    if (c.ops.length === 1) return unknown;
+    out.push({ use: channelUse(c.ops.slice(1), c.role), at: c.ops[1].kind === "call" && c.ops[1].method ? c.ops[1].method.start : first.name.start });
+  }
+  // a bare use of the table (passed, returned) is no chain: compare its uses with the chains on it
+  const chained = s.facts!.chains.filter((c) => writer(s, c.base) === table).length;
+  const named = s.scopes!.decls.filter((d) => d === table || (d.kind === "self" && d.methodOf && s.scopes!.of(d.methodOf) === table)).reduce((n, d) => n + s.scopes!.uses(d).length, 0);
+  if (assigned !== 1 || named > chained + 0) return unknown;
+  return out;
+}
+
 /** Methods that send on a channel (a remote, a bindable, a networking library's object) */
 const SEND_METHODS = new Set(["Fire", "FireServer", "FireClient", "FireAllClients", "FireExcept", "FireAllExcept", "Invoke", "InvokeServer", "InvokeClient", "InvokeServerAsync"]);
 /** Methods that receive on one directly (`bridge:Connect(fn)`) */
@@ -1869,7 +2146,8 @@ type ChannelUse = "send" | "receive" | "other" | "unknown";
 function channelUse(ops: Op[], role: Chain["role"]): ChannelUse {
   const [a, b] = ops;
   if (!a) return "unknown";
-  if (a.kind === "call" && a.method) return SEND_METHODS.has(a.method.name) ? "send" : RECEIVE_METHODS.has(a.method.name) ? "receive" : "other";
+  // Fire, FireServer, FireAll, FireExcept, Invoke, InvokeServer...: the engine's and every networking library's verbs
+  if (a.kind === "call" && a.method) return SEND_METHODS.has(a.method.name) || /^(Fire|Invoke)([A-Z]\w*)?$/.test(a.method.name) ? "send" : RECEIVE_METHODS.has(a.method.name) ? "receive" : "other";
   if (a.kind === "member" && RECEIVE_MEMBERS.has(a.name.name)) {
     if (role === "target" && ops.length === 1) return "receive";
     if (b?.kind === "call" && b.method && RECEIVE_METHODS.has(b.method.name)) return "receive";
@@ -1896,14 +2174,17 @@ function checkChannels(scripts: ScriptFile[]): { findings: Map<ScriptFile, { at:
     at: number;
     uses: { use: ChannelUse; at: number }[];
   }
-  /** A call with a name the text does not give, by what it does with the channel: it may be any name */
-  const byFactory = new Map<string, { calls: Call[]; dynamic: Set<ChannelUse> }>();
+  /** Calls with a name the text does not give: what they do with the channel, and the names they may be */
+  const byFactory = new Map<string, { calls: Call[]; dynamic: { use: ChannelUse; prefix: string; suffix: string; names?: Set<string> }[] }>();
+  const fields = fieldStrings(scripts);
   const literalCount = new Map<string, number>();
   const stringCount = new Map<string, number>();
   for (const s of scripts) {
     if (s.facts) for (const str of s.facts.strings) stringCount.set(str, (stringCount.get(str) ?? 0) + 1);
     // a file that does not parse may send or connect any name it quotes
     else for (const m of s.src.matchAll(/(["'])([^"'\n]+)\1/g)) stringCount.set(m[2], Infinity);
+    // a list of names only walked to make each one (`for _, n in Names do t[n] = Make(n) end`) declares them: no use
+    for (const str of declaredNames(s)) stringCount.set(str, (stringCount.get(str) ?? 0) - 1);
   }
   for (const s of scripts) {
     if (!s.facts) continue;
@@ -1918,9 +2199,24 @@ function checkChannels(scripts: ScriptFile[]): { findings: Map<ScriptFile, { at:
       else if (a?.kind === "call") [key, call, rest] = [`${fileKey(mod.file!)}()`, a, c.ops.slice(1)];
       else if (a?.kind === "member" && b?.kind === "call" && !b.method) [key, call, rest] = [`${fileKey(mod.file!)}.${a.name.name}`, b, c.ops.slice(2)];
       else continue;
-      const arg = call.args[0] && unwrap(call.args[0]);
+      let arg = call.args[0] && unwrap(call.args[0]);
       if (!arg) continue;
-      if (!byFactory.has(key)) byFactory.set(key, { calls: [], dynamic: new Set() });
+      // a local with one value is that value (`local RESYNC = "GamemodeResync"`, `local actionName = prefix .. "Action"`)
+      let looped: Set<string> | undefined;
+      for (let i = 0; i < 3 && arg.kind === "Name"; i++) {
+        const d = s.scopes!.of(arg);
+        // `for _, name in pairs(x.Bridges)`: one of the strings the game writes in a Bridges table
+        if (d?.kind === "for") {
+          const over = loopedTable(s, d);
+          const known = over ? fields.get(`${over}[]`) : undefined;
+          if (known && !known.open) looped = known.values;
+          break;
+        }
+        const v = d?.kind === "local" ? valueOf(d) : undefined;
+        if (!v) break;
+        arg = unwrap(v);
+      }
+      if (!byFactory.has(key)) byFactory.set(key, { calls: [], dynamic: [] });
       const factory = byFactory.get(key)!;
       const uses: Call["uses"] = [];
       if (rest.length) uses.push({ use: channelUse(rest, c.role), at: arg.start });
@@ -1936,10 +2232,20 @@ function checkChannels(scripts: ScriptFile[]): { findings: Map<ScriptFile, { at:
             uses.push({ use: ch ? channelUse(ch.ops, ch.role) : "unknown", at: ch ? (ch.ops[0].kind === "call" && ch.ops[0].method ? ch.ops[0].method.start : n.start) : n.start });
           }
         }
+      } else if (c.field) {
+        for (const u of fieldUses(s, c.field)) uses.push(u);
       } else uses.push({ use: "unknown", at: arg.start });
       if (arg.kind !== "String") {
-        // a parameter passed through is its caller's name; anything else may be any channel
-        if (!(arg.kind === "Name" && s.scopes!.of(arg)?.kind === "param")) for (const u of uses) factory.dynamic.add(u.use);
+        // a parameter passed through is its caller's name; anything else may be any channel, or
+        // only those its literal parts allow (`prefix .. "Action"` ends in "Action")
+        if (!(arg.kind === "Name" && s.scopes!.of(arg)?.kind === "param")) {
+          const { prefix, suffix } = literalEnds(arg);
+          // `config.ActionBridge`: only the strings the game writes as ActionBridge, when every one is a literal
+          const parent = arg.kind === "Member" && arg.object.kind === "Member" ? fields.get(`${arg.object.name.name}.${arg.name.name}`) : undefined;
+          const known = parent ?? (arg.kind === "Member" ? fields.get(arg.name.name) : undefined);
+          const names = looped ?? (known && !known.open ? known.values : undefined);
+          for (const u of uses) factory.dynamic.push({ use: u.use, prefix, suffix, names });
+        }
         continue;
       }
       factory.calls.push({ file: s, name: arg.value, at: arg.start, uses });
@@ -1947,14 +2253,16 @@ function checkChannels(scripts: ScriptFile[]): { findings: Map<ScriptFile, { at:
   }
   /** Every send and receive of a name, over every factory that qualified */
   const byName = new Map<string, { sends: { file: ScriptFile; at: number }[]; receives: { file: ScriptFile; at: number }[]; unknown: boolean }>();
-  /** Some call with a name the text does not give may receive (so a send may have a listener), or send */
-  let anyReceives = false;
-  let anySends = false;
+  /** Calls with a built name that may receive (so a send of a name they match may have a listener there), or send */
+  const dynamicReceives: { prefix: string; suffix: string; names?: Set<string> }[] = [];
+  const dynamicSends: { prefix: string; suffix: string; names?: Set<string> }[] = [];
   for (const [, f] of byFactory) {
     const named = new Set(f.calls.filter((c) => c.uses.some((u) => u.use === "send" || u.use === "receive")).map((c) => c.name));
     if (named.size < 3) continue;
-    if (f.dynamic.has("receive") || f.dynamic.has("unknown")) anyReceives = true;
-    if (f.dynamic.has("send") || f.dynamic.has("unknown")) anySends = true;
+    for (const d of f.dynamic) {
+      if (d.use === "receive" || d.use === "unknown") dynamicReceives.push(d);
+      if (d.use === "send" || d.use === "unknown") dynamicSends.push(d);
+    }
     for (const c of f.calls) {
       literalCount.set(c.name, (literalCount.get(c.name) ?? 0) + 1);
       if (!byName.has(c.name)) byName.set(c.name, { sends: [], receives: [], unknown: false });
@@ -1981,6 +2289,10 @@ function checkChannels(scripts: ScriptFile[]): { findings: Map<ScriptFile, { at:
       const found = [...byName].filter(([n, x]) => n !== name && x[other].length && distance(n.toLowerCase(), name.toLowerCase()) <= 2).map(([n]) => n);
       return found.length === 1 ? ` (did you mean "${found[0]}"?)` : "";
     };
+    const fits = (d: { prefix: string; suffix: string; names?: Set<string> }) =>
+      d.names ? d.names.has(name) : name.startsWith(d.prefix) && name.endsWith(d.suffix) && name.length >= d.prefix.length + d.suffix.length;
+    const anyReceives = dynamicReceives.some(fits);
+    const anySends = dynamicSends.some(fits);
     if (!e.receives.length && !anyReceives) for (const x of e.sends) add(x.file, x.at, "remote-no-listener", `"${name}" is sent here, but no code connects to "${name}"${near("receives")}`);
     if (!e.sends.length && !anySends) for (const x of e.receives) add(x.file, x.at, "remote-no-sender", `"${name}" is connected here, but no code sends on "${name}"${near("sends")}`);
   }

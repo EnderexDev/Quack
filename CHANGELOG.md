@@ -6,6 +6,11 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.29] - 2026-11-11
+
+### Changed
+- `quack analyze` follows remotes and channels through more of the shapes games use: a central list of names a module walks once to make every channel (no longer read as a use of each name), a name built at run time (`prefix .. "Action"` may only be a name ending in "Action"), a name kept in a config field (`config.Bridges.Request` is one of the strings the game writes as `Bridges.Request`) or walked from such a table, a name in a local constant, a channel kept in a field (`State.Event = get("X")`, then `State.Event:Fire()`), and any `Fire...` or `Invoke...` method as a send (`FireAll`, `FireExcept`).
+
 ## [1.0.28] - 2026-11-11
 
 ### Added
@@ -337,7 +342,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.28...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.29...HEAD
+[1.0.29]: https://github.com/EnderexDev/Quack/compare/v1.0.28...v1.0.29
 [1.0.28]: https://github.com/EnderexDev/Quack/compare/v1.0.27...v1.0.28
 [1.0.27]: https://github.com/EnderexDev/Quack/compare/v1.0.26...v1.0.27
 [1.0.26]: https://github.com/EnderexDev/Quack/compare/v1.0.25...v1.0.26

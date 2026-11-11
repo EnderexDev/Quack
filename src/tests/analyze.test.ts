@@ -552,6 +552,67 @@ setup(Shared)
   ]);
 });
 
+test("analyze: channels named in a central list, built names, names in config fields and loops, channels kept in a field, and any Fire* verb", () => {
+  // the shapes of a game that lists every name once and builds some at run time (Anime Astral, 11/11/26)
+  const net = `local Net = {}
+local Names = { "Hit", "Buy", "Sell", "Orphan", "Lonely", "Tick" }
+local Cache = {}
+for _, name in ipairs(Names) do
+	if not Cache[name] then Cache[name] = make(name) end
+end
+function Net.get(name: string)
+	return Cache[name]
+end
+return Net
+`;
+  const root = project({
+    "ReplicatedStorage/Net.luau": net,
+    "ReplicatedStorage/Shop.luau": `local Shop = { Bridges = { Request = "Buy", Result = "Sell" } }\nreturn Shop\n`,
+    "ReplicatedStorage/Modes.luau": `local Modes = {}\nModes.Bridges = { Raid = "RaidReady", Tower = "TowerReady" }\nreturn Modes\n`,
+    "ReplicatedFirst/Client.client.luau": `local RS = game:GetService("ReplicatedStorage")
+local Net = require(RS.Net)
+local Shop = require(RS.Shop)
+local Modes = require(RS.Modes)
+local State = {}
+local function open(config)
+	Net.get(config.Bridges.Request):Fire()
+end
+open(Shop)
+Net.get("Hit"):Fire(1)
+Net.get("Orphan"):Fire()
+Net.get("RaidAction"):Fire()
+for _, bridgeName in pairs(Modes.Bridges) do
+	Net.get(bridgeName):Connect(print)
+end
+function init()
+	State.TickEvent = Net.get("Tick")
+end
+State.TickEvent:Connect(print)
+`,
+    "ServerScriptService/Server.server.luau": `local RS = game:GetService("ReplicatedStorage")
+local Net = require(RS.Net)
+local Shop = require(RS.Shop)
+local RESULT = "Hit"
+local function serve(config)
+	Net.get(config.Bridges.Request):Connect(print)
+	Net.get(config.Bridges.Result):FireAll()
+end
+serve(Shop)
+Net.get(RESULT):Connect(print)
+for _, prefix in { "Raid", "Tower" } do
+	Net.get(prefix .. "Action"):Connect(print)
+end
+Net.get("Lonely"):Connect(print)
+Net.get("RaidReady"):FireAll()
+Net.get("Tick"):FireAllExcept()
+`,
+  });
+  assert.deepEqual(brief(root).filter((f) => f.includes(" remote-")), [
+    `ReplicatedFirst/Client.client.luau:11 remote-no-listener "Orphan" is sent here, but no code connects to "Orphan"`,
+    `ServerScriptService/Server.server.luau:14 remote-no-sender "Lonely" is connected here, but no code sends on "Lonely"`,
+  ]);
+});
+
 test("analyze: a channel made by a function from a literal name (a remote by name, a networking library's object) is matched by that name across the game", () => {
   const net = `local Net = {}\nfunction Net.get(name: string)\n\treturn script:FindFirstChild(name)\nend\nreturn Net\n`;
   const root = project({
