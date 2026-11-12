@@ -62,7 +62,8 @@ pause.addEventListener("click", async () => {
   }
 });
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") window.__TAURI__.window.getCurrentWindow().hide();
+  // Through the app, which also tells WebView2 the page is off screen
+  if (event.key === "Escape") invoke("hide_window");
 });
 
 await start({

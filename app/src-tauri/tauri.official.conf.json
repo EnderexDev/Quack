@@ -18,6 +18,8 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-gpu",
         "title": "Quack",
         "url": "index.html",
         "width": 1120,
@@ -30,6 +32,8 @@
       },
       {
         "label": "tray",
+        "create": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-gpu",
         "title": "Quack",
         "url": "tray.html",
         "width": 320,

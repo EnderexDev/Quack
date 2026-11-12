@@ -6,6 +6,12 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.34] - 2026-11-12
+
+### Changed
+- The app uses less memory while it sits in the tray: hiding its window or panel now also tells the page it is off screen, so the page stops keeping its drawing ready. With everything hidden the app went from about 280 MB to 230 MB of memory, and the window's page from 0.01 of a CPU core to almost nothing (measured 12/11/26).
+- The app's window and tray panel draw without the graphics card. They look the same and open as fast, and the app uses about 60 MB less memory, hidden or open (measured 12/11/26). Scrolling a long log without stopping costs more CPU while it lasts.
+
 ## [1.0.33] - 2026-11-12
 
 ### Fixed
@@ -371,7 +377,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.33...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.34...HEAD
+[1.0.34]: https://github.com/EnderexDev/Quack/compare/v1.0.33...v1.0.34
 [1.0.33]: https://github.com/EnderexDev/Quack/compare/v1.0.32...v1.0.33
 [1.0.32]: https://github.com/EnderexDev/Quack/compare/v1.0.31...v1.0.32
 [1.0.31]: https://github.com/EnderexDev/Quack/compare/v1.0.30...v1.0.31

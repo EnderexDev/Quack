@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "The two windows only talk to the app's own commands and events",
   "windows": ["main", "tray"],
-  "permissions": ["core:default", "core:window:allow-hide"]
+  "permissions": ["core:default"]
 }

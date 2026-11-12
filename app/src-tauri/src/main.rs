@@ -1189,7 +1189,7 @@ fn open_path(app: AppHandle, path: String, editor: bool) -> Result<(), String> {
 #[tauri::command]
 fn show_main(app: AppHandle, place_id: Option<String>, view: Option<String>, id: Option<String>) {
     if let Some(tray) = app.get_webview_window("tray") {
-        let _ = tray.hide();
+        hide(&tray);
     }
     show_main_window(&app);
     let _ = app.emit_to("main", "navigate", json!({ "placeId": place_id, "view": view, "id": id }));
@@ -1208,9 +1208,48 @@ fn quit(app: AppHandle) {
     app.exit(0);
 }
 
+/** The panel's Esc: hides through hide() here, which also stops its WebView2 */
+#[tauri::command]
+fn hide_window(window: WebviewWindow) {
+    hide(&window);
+}
+
+/**
+ * Shows the window and its WebView2. A window hidden by Windows alone leaves its WebView2
+ * thinking it is on screen: it keeps a compositor and renderer running for a page nobody sees.
+ */
+fn show(window: &WebviewWindow) {
+    let webview: &tauri::Webview = window.as_ref();
+    let _ = webview.show();
+    let _ = window.show();
+}
+
+/** Hides the window and tells its WebView2 (SetIsVisible false), which then stops drawing */
+fn hide(window: &WebviewWindow) {
+    let _ = window.hide();
+    let webview: &tauri::Webview = window.as_ref();
+    let _ = webview.hide();
+}
+
+/**
+ * The WebView2 folder of both windows. They run with --disable-gpu (additionalBrowserArgs in
+ * both tauri confs), and WebView2 refuses to start with other arguments in a folder another
+ * process still uses (0x8007139F, seen in Quack Presence next to its older version still
+ * open). A folder only this configuration uses is never shared with a version from before it.
+ * If the arguments change again, the folder's name changes with them.
+ */
+const WEBVIEW_DIR: &str = "webview-sem-gpu";
+
+/** Builds a window of tauri.conf.json (both have "create": false) in WEBVIEW_DIR */
+fn build_window(app: &AppHandle, label: &str) -> tauri::Result<WebviewWindow> {
+    let config = app.config().app.windows.iter().find(|w| w.label == label).cloned().ok_or(tauri::Error::WindowNotFound)?;
+    let dir = app.path().app_local_data_dir()?.join(WEBVIEW_DIR);
+    tauri::WebviewWindowBuilder::from_config(app, &config)?.data_directory(dir).build()
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
+        show(&window);
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
@@ -1251,6 +1290,27 @@ fn tray_position(icon: (f64, f64, f64, f64), panel: (f64, f64), area: (f64, f64,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_share_the_webview2_arguments_in_both_flavors() {
+        // The official conf replaces the whole windows array, so both files carry the same
+        // arguments and "create": false. Windows with different arguments cannot share one
+        // WebView2: the second would not open. Without the GPU the windows draw the same and
+        // WebView2 uses ~60 MB less (measured 12/11/26); the --disable-features is what wry
+        // passes by default when a window has no arguments of its own.
+        let dev: Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let official: Value = serde_json::from_str(include_str!("../tauri.official.conf.json")).unwrap();
+        for conf in [&dev, &official] {
+            let windows = conf["app"]["windows"].as_array().unwrap();
+            assert_eq!(windows.len(), 2);
+            for w in windows {
+                let args = w["additionalBrowserArgs"].as_str().unwrap_or("");
+                assert_eq!(args, "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-gpu", "{}", w["label"]);
+                // Built by build_window, in WEBVIEW_DIR
+                assert_eq!(w["create"], false, "{} would be built outside build_window", w["label"]);
+            }
+        }
+    }
 
     #[test]
     fn the_token_reaches_the_hub_on_stdin_and_stdin_then_ends() {
@@ -1571,7 +1631,7 @@ fn toggle_tray(app: &AppHandle, rect: (f64, f64, f64, f64)) {
     let Some(window) = app.get_webview_window("tray") else { return };
     let shared = app.state::<Shared>();
     if window.is_visible().unwrap_or(false) {
-        let _ = window.hide();
+        hide(&window);
         return;
     }
     // Clicking the icon while the panel is open first takes its focus, which hides it: that
@@ -1581,7 +1641,7 @@ fn toggle_tray(app: &AppHandle, rect: (f64, f64, f64, f64)) {
     }
     *shared.tray_rect.lock().unwrap() = Some(rect);
     place_tray(app, &window);
-    let _ = window.show();
+    show(&window);
     let _ = window.set_focus();
     let _ = app.emit_to("tray", "tray-shown", ());
 }
@@ -1798,7 +1858,8 @@ fn alert_approval(app: &AppHandle, language: &str, approval: &Value) -> Option<a
     if let Some(window) = app.get_webview_window("main") {
         if !window.is_visible().unwrap_or(false) {
             // tao: a hidden window minimized stays hidden but iconic, and the show then puts it
-            // on the taskbar minimized
+            // on the taskbar minimized. Its WebView2 stays hidden until the user brings it up
+            // (Focused(true) in main), so only the window's own show here.
             let _ = window.minimize();
             let _ = window.show();
         }
@@ -2047,10 +2108,14 @@ fn main() {
             editors,
             open_path,
             show_main,
+            hide_window,
             tray_fit,
             quit
         ])
         .setup(move |app| {
+            // Both windows are built here, in WEBVIEW_DIR, before any thread that may show one
+            build_window(app.handle(), "main")?;
+            build_window(app.handle(), "tray")?;
             // No native menu: Windows opens it under the cursor, over the taskbar, which covers
             // it whenever a fullscreen game keeps the foreground. Quit lives in the panel.
             TrayIconBuilder::with_id(TRAY_ID)
@@ -2077,6 +2142,10 @@ fn main() {
             thread::spawn(move || finish_update(handle));
             let handle = app.handle().clone();
             thread::spawn(move || update_loop(handle));
+            // The windows start hidden (tauri.conf.json), but their WebView2 starts visible
+            for window in app.webview_windows().values() {
+                hide(window);
+            }
             if !started_hidden {
                 show_main_window(app.handle());
             }
@@ -2086,11 +2155,24 @@ fn main() {
             // Closing the window keeps Quack running in the tray; quitting is in the tray menu
             ("main", WindowEvent::CloseRequested { api, .. }) => {
                 api.prevent_close();
-                let _ = window.hide();
+                if let Some(main) = window.app_handle().get_webview_window("main") {
+                    hide(&main);
+                }
+            }
+            // A window that reached the screen without show() (alert_approval's minimized one,
+            // brought up from the taskbar) gets its WebView2 back when it takes the focus. Only a
+            // window on screen: the hidden main gets a focus event at startup, after setup.
+            ("main", WindowEvent::Focused(true)) => {
+                if let Some(main) = window.app_handle().get_webview_window("main").filter(|w| w.is_visible().unwrap_or(false)) {
+                    let webview: &tauri::Webview = main.as_ref();
+                    let _ = webview.show();
+                }
             }
             ("tray", WindowEvent::Focused(false)) => {
                 if window.is_visible().unwrap_or(false) {
-                    let _ = window.hide();
+                    if let Some(tray) = window.app_handle().get_webview_window("tray") {
+                        hide(&tray);
+                    }
                     *window.app_handle().state::<Shared>().tray_hidden_at.lock().unwrap() = Some(Instant::now());
                 }
             }

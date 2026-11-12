@@ -96,3 +96,24 @@ test("app idle: every background poll of the main window goes through every(), t
     assert.match(main, new RegExp(`every\\(${poll}, `), poll);
   }
 });
+
+test("app idle: every hide and show of a window goes through hide() and show(), which also tell WebView2", () => {
+  // 12/11/26: a window hidden by Windows alone keeps its WebView2 believing it is on screen,
+  // compositing a page nobody sees. hide()/show() in main.rs also call SetIsVisible.
+  const rust = read("src-tauri/src/main.rs");
+  const raw = [...rust.matchAll(/(\w+)\.(hide|show)\(\)/g)].map((m) => m[0]);
+  // The two helpers and the WebView2 wake on focus; nothing else hides or shows raw.
+  // alert_approval's minimized show is the one window.show() left (Focused(true) wakes it).
+  const allowed = new Set(["window.hide()", "webview.hide()", "webview.show()", "window.show()"]);
+  assert.deepEqual(raw.filter((call) => !allowed.has(call)), []);
+  assert.equal(raw.filter((call) => call === "window.hide()").length, 1, "only hide() hides a window raw");
+  assert.equal(raw.filter((call) => call === "window.show()").length, 2, "show() and alert_approval's minimized show");
+  assert.match(rust, /for window in app\.webview_windows\(\)\.values\(\) \{\s*hide\(window\);/, "both WebView2 start hidden");
+  assert.match(rust, /\("main", WindowEvent::Focused\(true\)\)/);
+  assert.match(rust, /\bhide_window,/);
+  // The panel's Esc goes through the app; the pages cannot hide a window themselves
+  const tray = read("ui/tray.js");
+  assert.doesNotMatch(tray + read("ui/main.js") + read("ui/common.js"), /\.hide\(\)/);
+  assert.match(tray, /invoke\("hide_window"\)/);
+  assert.doesNotMatch(read("src-tauri/capabilities/default.json"), /allow-hide/);
+});
