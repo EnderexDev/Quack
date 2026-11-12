@@ -1820,6 +1820,9 @@ fn poll_loop(app: AppHandle) {
     let mut shown_icon = "";
     let mut shown_tooltip = String::new();
     let mut known_conflicts: Option<HashMap<String, u64>> = None;
+    // The production errors not dismissed per place, and the places whose key cannot read them
+    let mut known_errors: Option<HashMap<String, u64>> = None;
+    let mut known_problems: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut known_choices: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut approvals = ApprovalWatch::default();
     // Each waiting write's toast, kept alive until that write is answered or gone
@@ -1881,6 +1884,40 @@ fn poll_loop(app: AppHandle) {
                 now.insert(id, count);
             }
             known_conflicts = Some(now);
+
+            // A new production error (the hub checks each place once an hour): its own setting
+            // turns it on, so it is told even with the conflict notifications off. A key that
+            // cannot read a game's errors is told once, when it first shows up
+            let mut errors_now = HashMap::new();
+            let mut problems_now = std::collections::HashSet::new();
+            for place in state["places"].as_array().into_iter().flatten() {
+                let id = place["placeId"].as_str().unwrap_or_default().to_string();
+                let name = place["name"].as_str().unwrap_or(&id).to_string();
+                let count = place["newErrors"].as_u64().unwrap_or(0);
+                if let Some(before) = &known_errors {
+                    if count > *before.get(&id).unwrap_or(&0) {
+                        let latest = &place["latestError"];
+                        let message: String = latest["message"].as_str().unwrap_or_default().chars().take(140).collect();
+                        let at = latest["at"].as_str().map(|a| format!(" ({a})")).unwrap_or_default();
+                        let title = if language == "pt" { format!("{name}: erro novo em produção") } else { format!("{name}: new production error") };
+                        let _ = app.notification().builder().title(title).body(format!("{message}{at}")).show();
+                    }
+                }
+                errors_now.insert(id.clone(), count);
+                if place["errorsProblem"].is_string() {
+                    if known_errors.is_some() && !known_problems.contains(&id) {
+                        let body = if language == "pt" {
+                            format!("{name}: a chave da Open Cloud não lê os erros deste jogo (falta universe.analytics:read)")
+                        } else {
+                            format!("{name}: the Open Cloud key cannot read this game's errors (it lacks universe.analytics:read)")
+                        };
+                        let _ = app.notification().builder().title(flavor::NAME).body(body).show();
+                    }
+                    problems_now.insert(id);
+                }
+            }
+            known_errors = Some(errors_now);
+            known_problems = problems_now;
 
             // A connection waiting for the user's choice brings the window up, once per choice
             let mut current = std::collections::HashSet::new();

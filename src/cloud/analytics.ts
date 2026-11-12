@@ -89,37 +89,48 @@ export const ANALYTICS_OPS: Record<string, CloudOp> = {
       if (!Number.isInteger(days) || days < 1 || days > 30) throw new RobloxError("days must be a whole number from 1 to 30");
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new RobloxError("limit must be a whole number from 1 to 100");
       const placeId = args.placeId === undefined ? undefined : idArg(args.placeId, "the place id");
-      const day = 24 * 3600 * 1000;
-      const now = ctx.env.now();
-      const iso = (ms: number) => `${new Date(ms).toISOString().slice(0, 10)}T00:00:00Z`;
-      const startTime = iso(now - days * day);
-      const endTime = iso(now + day);
-      const answer = await analyticsQuery(ctx.env, universeId, "metrics", { metric: "ErrorCount", granularity: "None", startTime, endTime, breakdown: ["MessageHash"], limit: MAX_HASHES });
-      const errors: ProductionError[] = [];
-      for (const v of answer?.response?.values ?? []) {
-        const hash = v?.breakdowns?.find((b: any) => b?.dimension === "MessageHash")?.value;
-        const count = (v?.dataPoints ?? []).reduce((sum: number, p: any) => sum + (Number(p?.value) || 0), 0);
-        if (typeof hash === "string" && /^-?\d+$/.test(hash)) errors.push({ hash, count });
-      }
-      errors.sort((a, b) => b.count - a.count);
+      const { startTime, endTime, errors } = await errorCounts(ctx.env, universeId, days);
       const top = errors.slice(0, limit);
-      // the logs window: the same days as the counts, ending now
-      const detailsEnd = new Date(now).toISOString().replace(/\.\d+Z$/, "Z");
-      for (let i = 0; i < top.length; i += DETAILS_BATCH) {
-        const batch = top.slice(i, i + DETAILS_BATCH);
-        const query = [...batch.map((e) => `messageHashIds=${encodeURIComponent(e.hash)}`), `startTime=${startTime}`, `endTime=${detailsEnd}`, ...(placeId ? [`placeId=${placeId}`] : [])].join("&");
-        const details = await cloudRequest(ctx.env, { method: "GET", url: `${ERRORS_HOST}/universe/${universeId}/log-details?${query}`, permission: PERMISSION, what: `the error logs of universe ${universeId}` });
-        for (const d of details?.values ?? []) {
-          const e = batch.find((x) => x.hash === String(d?.id));
-          if (!e) continue;
-          e.message = typeof d.message === "string" ? d.message : undefined;
-          e.stacktrace = typeof d.stacktrace === "string" ? d.stacktrace : undefined;
-          e.source = typeof d.logSource === "string" ? d.logSource : undefined;
-          e.firstSeen = typeof d.firstSeenUtc === "string" ? d.firstSeenUtc : undefined;
-          if (placeId) e.firstSeenPlaceVersion = typeof d.firstSeenPlaceVersion === "number" ? d.firstSeenPlaceVersion : null;
-        }
-      }
+      await errorDetails(ctx.env, universeId, top, startTime, placeId);
       return { universeId, days, startTime, endTime, total: errors.reduce((s, e) => s + e.count, 0), kinds: errors.length, errors: top };
     },
   },
 };
+
+/** The 100 most frequent error hashes of the last `days` days (and today), most frequent first: one request */
+export async function errorCounts(env: CloudContext["env"], universeId: string, days: number): Promise<{ startTime: string; endTime: string; errors: ProductionError[] }> {
+  const day = 24 * 3600 * 1000;
+  const now = env.now();
+  const iso = (ms: number) => `${new Date(ms).toISOString().slice(0, 10)}T00:00:00Z`;
+  const startTime = iso(now - days * day);
+  const endTime = iso(now + day);
+  const answer = await analyticsQuery(env, universeId, "metrics", { metric: "ErrorCount", granularity: "None", startTime, endTime, breakdown: ["MessageHash"], limit: MAX_HASHES });
+  const errors: ProductionError[] = [];
+  for (const v of answer?.response?.values ?? []) {
+    const hash = v?.breakdowns?.find((b: any) => b?.dimension === "MessageHash")?.value;
+    const count = (v?.dataPoints ?? []).reduce((sum: number, p: any) => sum + (Number(p?.value) || 0), 0);
+    if (typeof hash === "string" && /^-?\d+$/.test(hash)) errors.push({ hash, count });
+  }
+  errors.sort((a, b) => b.count - a.count);
+  return { startTime, endTime, errors };
+}
+
+/** Fills each error's message, stack, side and first sighting from the error logs, 20 hashes a request */
+export async function errorDetails(env: CloudContext["env"], universeId: string, list: ProductionError[], startTime: string, placeId?: string): Promise<void> {
+  // the logs window: the same days as the counts, ending now
+  const detailsEnd = new Date(env.now()).toISOString().replace(/\.\d+Z$/, "Z");
+  for (let i = 0; i < list.length; i += DETAILS_BATCH) {
+    const batch = list.slice(i, i + DETAILS_BATCH);
+    const query = [...batch.map((e) => `messageHashIds=${encodeURIComponent(e.hash)}`), `startTime=${startTime}`, `endTime=${detailsEnd}`, ...(placeId ? [`placeId=${placeId}`] : [])].join("&");
+    const details = await cloudRequest(env, { method: "GET", url: `${ERRORS_HOST}/universe/${universeId}/log-details?${query}`, permission: PERMISSION, what: `the error logs of universe ${universeId}` });
+    for (const d of details?.values ?? []) {
+      const e = batch.find((x) => x.hash === String(d?.id));
+      if (!e) continue;
+      e.message = typeof d.message === "string" ? d.message : undefined;
+      e.stacktrace = typeof d.stacktrace === "string" ? d.stacktrace : undefined;
+      e.source = typeof d.logSource === "string" ? d.logSource : undefined;
+      e.firstSeen = typeof d.firstSeenUtc === "string" ? d.firstSeenUtc : undefined;
+      if (placeId) e.firstSeenPlaceVersion = typeof d.firstSeenPlaceVersion === "number" ? d.firstSeenPlaceVersion : null;
+    }
+  }
+}

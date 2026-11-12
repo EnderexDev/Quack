@@ -813,11 +813,13 @@ test("connect-ai: Cursor's file keeps every other server and key, a broken one i
   try {
     const clients = { home, claudeBin: "quack-no-such-claude", codexBin: "quack-no-such-codex", env: {} };
     const server = { command: process.execPath, args: ["cli.mjs", "--flavor", "dev", "mcp"] };
+    let reviewing = false;
     const run = async (...argv: string[]) => {
       const out: string[] = [];
       const code = await runControl([...argv, "--json"], {
         info: flavorInfo("dev"), client: new HubClient(await freePort()), out: (l) => out.push(l), err: (l) => out.push(l),
-        confirm: async () => false, interactive: false, color: false, cwd: home, openUri: async () => {}, server, clients,
+        confirm: async () => false, interactive: false, color: false, cwd: home, openUri: async () => {}, clients,
+        server: reviewing ? { ...server, review: { command: process.execPath, args: ["C:\\Quack Dev\\review.mjs"], port: 3826 } } : server,
       });
       return { code, json: () => JSON.parse(out.join("\n")) };
     };
@@ -838,6 +840,19 @@ test("connect-ai: Cursor's file keeps every other server and key, a broken one i
     assert.deepEqual(written.mcpServers.Other, { command: "x" });
     assert.equal(written.keep, 1);
     assert.deepEqual(written.mcpServers["quack-dev"], server);
+
+    // Quack's review after each edit: Cursor's postToolUse in ~/.cursor/hooks.json, its other hooks kept
+    const hooksFile = path.join(home, ".cursor", "hooks.json");
+    fs.writeFileSync(hooksFile, JSON.stringify({ version: 1, hooks: { stop: [{ command: "other" }] } }));
+    reviewing = true;
+    await run("connect-ai", "cursor");
+    await run("connect-ai", "cursor");
+    const hooks = JSON.parse(fs.readFileSync(hooksFile, "utf8"));
+    assert.deepEqual(hooks.hooks.stop, [{ command: "other" }]);
+    assert.equal(hooks.version, 1);
+    assert.equal(hooks.hooks.postToolUse.length, 1, "connecting again replaces it");
+    assert.match(hooks.hooks.postToolUse[0].command, /"C:\/Quack Dev\/review\.mjs" --port 3826 --client cursor --quack-review quack-dev$/);
+    assert.equal(byName((await run("ai-clients")).json()).cursor.reviewed, true);
 
     fs.writeFileSync(file, "{ not json");
     const broken = await run("connect-ai", "cursor");
@@ -896,7 +911,12 @@ test("connect-ai reaches every config folder: the default, ~/.claude-*, ~/.codex
     // This process runs inside one of them, as a T3 session does: the default must still be the default
     process.env.CLAUDE_CONFIG_DIR = proxy;
     const clients = { home, claudeBin: path.join(bin, "claude.cmd"), codexBin: path.join(bin, "codex.cmd"), env: {}, t3Settings };
-    const server = { command: process.execPath, args: ["cli.mjs", "--flavor", "official", "mcp"], guard: { command: process.execPath, args: ["C:\\Quack\\guard.mjs"] } };
+    const server = {
+      command: process.execPath,
+      args: ["cli.mjs", "--flavor", "official", "mcp"],
+      guard: { command: process.execPath, args: ["C:\\Quack\\guard.mjs"] },
+      review: { command: process.execPath, args: ["C:\\Quack\\review.mjs"], port: 3825 },
+    };
     const run = async (...argv: string[]) => {
       const out: string[] = [];
       const code = await runControl(["--json", ...argv], {
@@ -957,6 +977,23 @@ test("connect-ai reaches every config folder: the default, ~/.claude-*, ~/.codex
     }
     assert.equal(fs.existsSync(path.join(work, "settings.json")), false, "Codex gets no Claude Code hook");
     assert.ok(all.clients.filter((c) => c.client === "claude").every((c) => c.guarded), "ai-clients reads the guard back");
+    // Quack's review after each edit: a PostToolUse hook next to the guard (Claude Code), and in
+    // each Codex folder's hooks.json on apply_patch; connecting again replaces it, never adds one
+    await run("connect-ai", "claude", "codex");
+    for (const dir of [proxy, t3Claude, path.join(home, ".claude")]) {
+      const entries = settings(dir).hooks.PostToolUse;
+      assert.equal(entries.length, 1, dir);
+      assert.equal(entries[0].matcher, "Edit|Write|MultiEdit");
+      assert.match(entries[0].hooks[0].command, /"C:\/Quack\/review\.mjs" --port 3825 --client claude --quack-review quack$/);
+      assert.equal(settings(dir).hooks.PreToolUse.length, 1, "the guard stays alone in PreToolUse");
+    }
+    for (const dir of [work, path.join(home, ".codex")]) {
+      const entries = JSON.parse(fs.readFileSync(path.join(dir, "hooks.json"), "utf8")).hooks.PostToolUse;
+      assert.equal(entries.length, 1, dir);
+      assert.match(entries[0].matcher, /apply_patch/);
+      assert.match(entries[0].hooks[0].command, /--client codex --quack-review quack$/);
+    }
+    assert.ok((await run("ai-clients")).clients.filter((c) => c.client !== "cursor").every((c) => c.reviewed), "ai-clients reads the review back");
     // and the rule in each Claude Code folder's CLAUDE.md and each Codex folder's AGENTS.md
     const officialRule = rule(flavorInfo("official")).text;
     for (const file of [path.join(proxy, "CLAUDE.md"), path.join(t3Claude, "CLAUDE.md"), path.join(home, ".claude", "CLAUDE.md"), path.join(work, "AGENTS.md"), path.join(home, ".codex", "AGENTS.md")]) {

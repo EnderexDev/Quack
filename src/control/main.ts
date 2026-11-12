@@ -65,6 +65,8 @@ const code = argv[0] === "mcp" && argv.length === 1
         args: [path.resolve(process.argv[1]), "--flavor", flavor, "mcp"],
         // The hook each tool call starts: one small file, not this whole command
         guard: { command: process.execPath, args: [path.join(here, BUNDLED ? "guard.mjs" : "guardMain.js")] },
+        // The review after each edit asks this flavor's hub for the findings
+        review: { command: process.execPath, args: [path.join(here, BUNDLED ? "review.mjs" : "reviewMain.js")], port: info.port },
       },
       // The app ships this as resources/hub/cli.mjs, next to the BUILD of the hub it starts
       bundleDir: BUNDLED ? here : undefined,

@@ -21,12 +21,15 @@ test("app: no button is tied to VS Code; each one opens the editor the app found
   for (const [name, text] of [["main.js", main], ["index.html", html], ["i18n.js", read("ui", "i18n.js")]]) {
     assert.doesNotMatch(text, /openVsc|VS Code"/, `${name} still names VS Code`);
   }
-  // Every "open in an editor" goes through the one button with the list beside it
+  // Every "open in an editor" goes through the one button with the list beside it, or is a
+  // finding's file in the Analysis tab (the row is the button), opened in the same editor
   const from = main.indexOf("function editorButtons(");
   const to = main.indexOf("\nfunction ", main.indexOf("function editorMenu("));
+  const analysisFrom = main.indexOf("async function renderAnalysis(");
+  const analysisTo = main.indexOf("\n// ----------", analysisFrom);
   const direct = [...main.matchAll(/invoke\("open_path", \{ path(?::\s*[\w.]+)?, editor: true \}\)/g)].map((m) => m.index);
-  assert.equal(direct.length, 2, "the button and a pick in its list");
-  assert.ok(direct.every((at) => at > from && at < to), "only editorButtons and its list open an editor");
+  assert.equal(direct.length, 3, "the button, a pick in its list, a finding's file");
+  assert.ok(direct.every((at) => (at > from && at < to) || (at > analysisFrom && at < analysisTo)), "only editorButtons, its list and a finding open an editor");
   assert.equal([...main.matchAll(/editorButtons\(/g)].length, 4, "nav, Folder tab, conflict view, and its definition");
   // The app answers both calls the window makes
   const rust = read("src-tauri", "src", "main.rs");

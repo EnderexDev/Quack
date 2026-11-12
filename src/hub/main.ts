@@ -67,7 +67,13 @@ if (command === "register") {
   // The app that answers Open Cloud writes: the bundled hub sits in <install>/resources/hub,
   // next to the app's quack-app.exe two folders up; from dist/ only --app names one
   const appExe = option("--app") ?? (BUNDLED && process.platform === "win32" ? path.join(here, "..", "..", "quack-app.exe") : undefined);
-  const hub = new QuackHub({ port, registryFile, daemonCli, daemonBuild, takeover, onShutdownRequest: shutdown, cloud: { appExe } });
+  // The pre-commit hook Quack's setting installs runs this flavor's CLI (hub-dev.json: Dev)
+  const precommit = {
+    node: process.execPath,
+    cli: BUNDLED ? path.join(here, "cli.mjs") : path.join(here, "..", "control", "main.js"),
+    flavor: (path.basename(registryFile).includes("-dev") ? "dev" : "official") as "dev" | "official",
+  };
+  const hub = new QuackHub({ port, registryFile, daemonCli, daemonBuild, takeover, onShutdownRequest: shutdown, cloud: { appExe }, precommit });
   // --token-stdin: the app's approval token comes on stdin (never argv, env or a file), and only
   // answers carrying it accept or refuse a write. Without the flag stdin is never read
   if (args.includes("--token-stdin")) {

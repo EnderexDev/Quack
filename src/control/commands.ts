@@ -22,6 +22,7 @@ import { projectFileOf, sourcemapFromProject } from "../analyze/project.js";
 import type { SourcemapNode } from "../analyze/tree.js";
 import { buttonsCode, errorPlace, installCode, nodeForPath, probeErrorLine, probeErrors, readCode, removeCode, requireCode, signature, type CollectedError } from "../analyze/probe.js";
 import { loadTree } from "../analyze/tree.js";
+import { FINDINGS_EXIT, runPrecommit } from "../auto/precommit.js";
 
 /**
  * `quack` / `quackdev`: the hub from a terminal. Every command is one or a few calls to the
@@ -631,6 +632,10 @@ See
                             nodes whose children the disk does not say all marked _quack.open
                             (a $path not there, a binary model, a node Rojo lets keep unknown
                             instances). A folder Quack syncs already has one: Studio's tree
+  precommit                 The pre-commit check Quack's settings put in a place's repository:
+                            the staged Luau files' findings, exit ${FINDINGS_EXIT} when there are any
+                            (the hook then stops the commit), 0 when the check is off or Quack
+                            cannot answer
 
 Wait
   wait [place]              Until Studio is connected and nothing has synced for a while
@@ -1168,6 +1173,14 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
       return verifySync(ctx, options, args[0]);
     case "sourcemap":
       return sourcemapCommand(ctx, options, args[0]);
+    case "precommit":
+      // The git hook Quack's setting installs (auto/precommit.ts): 9 stops the commit
+      return runPrecommit({
+        cwd: ctx.cwd,
+        out: ctx.err,
+        registry: ctx.info.registry,
+        ask: (files) => client.post("/api/analyze", { files, feature: "precommit" }, 60_000).catch(() => null),
+      });
     case "analyze":
       return runAnalyze({
         cwd: ctx.cwd,

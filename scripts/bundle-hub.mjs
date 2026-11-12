@@ -38,6 +38,10 @@ export async function bundleHub(outDir = path.join(root, "app", "src-tauri", "re
   // Quack's guard, the hook "Connect to AI" installs in Claude Code: it runs on every tool call,
   // so it is its own small file with no require banner
   await build({ ...common, banner: undefined, entryPoints: [path.join(root, "dist", "control", "guardMain.js")], outfile: path.join(outDir, "guard.mjs") });
+  // Quack's review after each AI edit, the other hook "Connect to AI" installs: small, like the guard
+  await build({ ...common, banner: undefined, entryPoints: [path.join(root, "dist", "control", "reviewMain.js")], outfile: path.join(outDir, "review.mjs") });
+  // The hub's analysis thread (src/auto/worker.ts), started from hub.mjs by its file name
+  await build({ ...common, entryPoints: [path.join(root, "dist", "auto", "worker.js")], outfile: path.join(outDir, "analysis-worker.mjs") });
   // The daemon's backstop watcher (src/fs/backstopWatcher.ts), a native binary esbuild cannot
   // inline; the daemon loads a copy of it, so an install can overwrite this one. The app ships
   // on Windows x64, where a bundle without it is an error; elsewhere there is no such binary
@@ -50,7 +54,9 @@ export async function bundleHub(outDir = path.join(root, "app", "src-tauri", "re
   const daemonBuild = stampBuildId(path.join(outDir, "daemon.mjs"), undefined, watcherBinary ? createHash("sha256").update(watcherBinary).digest("hex") : "");
   // The hub's id covers the daemon too: an update that changes only daemon.mjs still restarts
   // the hub, whose successor then replaces each daemon (handing its tree to the new one)
-  const hubBuild = stampBuildId(path.join(outDir, "hub.mjs"), undefined, daemonBuild);
+  // ...and its analysis thread, which it loads from analysis-worker.mjs
+  const workerHash = createHash("sha256").update(fs.readFileSync(path.join(outDir, "analysis-worker.mjs"))).digest("hex");
+  const hubBuild = stampBuildId(path.join(outDir, "hub.mjs"), undefined, daemonBuild + workerHash);
   stampBuildId(path.join(outDir, "cli.mjs"), hubBuild);
   fs.writeFileSync(path.join(outDir, "VERSION"), `${version}\n`);
   // What the app compares with the running hub's /api/state build
@@ -85,7 +91,7 @@ export function bundlePlugins(outDir = path.join(root, "app", "src-tauri", "reso
 
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
   const out = await bundleHub(process.argv[2] ? path.resolve(process.argv[2]) : undefined);
-  for (const file of ["hub.mjs", "daemon.mjs", "cli.mjs", "guard.mjs"]) {
+  for (const file of ["hub.mjs", "daemon.mjs", "cli.mjs", "guard.mjs", "review.mjs", "analysis-worker.mjs"]) {
     console.log(`${path.join(out, file)}  ${(fs.statSync(path.join(out, file)).size / 1024).toFixed(0)} KB`);
   }
   if (!process.argv[2]) bundlePlugins();

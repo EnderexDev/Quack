@@ -19,6 +19,11 @@ import { runCloudOp, type CloudContext } from "../cloud/ops.js";
 import { Vault, type Dpapi } from "../cloud/vault.js";
 import { RobloxError, robloxEnv, type RobloxEnv } from "../control/roblox.js";
 import type { StudioPort, Timings } from "../queue/queue.js";
+import { AnalysisService } from "../auto/service.js";
+import { HubAutomation } from "../auto/hubAuto.js";
+import { AUTO_FEATURES, autoSettingsPath, flavorFile, type AutoFeature, type AutoPatch } from "../auto/settings.js";
+import { ErrorsWatch } from "../auto/errorsWatch.js";
+import type { PrecommitEntry } from "../auto/precommit.js";
 
 /**
  * Quack hub: one port for every Studio. It reads the place from the plugin's handshake, starts
@@ -68,6 +73,10 @@ export interface HubOptions {
    * itself, how the app is launched, the approval's timeout, Roblox's web.
    */
   cloud?: { dpapi?: Dpapi; approve?: Approver; appExe?: string; launchApp?: (exe: string) => void; approvalTimeoutMs?: number; env?: Partial<RobloxEnv> };
+  /** The resident analysis (tests): its settings file, worker, idle stop and debounce */
+  /** How a git pre-commit hook starts this flavor's CLI (main.ts); none: the hub installs no hook */
+  precommit?: PrecommitEntry;
+  auto?: { settingsFile?: string; workerFile?: string; idleMs?: number; debounceMs?: number; hooksFile?: string; errorsFile?: string; errorsEveryMs?: number };
 }
 
 /** A daemon the last hub left running that this one replaces instead of adopting */
@@ -294,9 +303,22 @@ export class QuackHub {
   private readonly log: (line: string) => void;
   /** The Studio queue of every place: jobs, the lock and who waits for it */
   readonly queues: HubQueues;
+  /** The resident analysis (a worker thread) and what runs on its own: the AI's review, the panel */
+  readonly analysis: AnalysisService;
+  readonly auto: HubAutomation;
+  private autoTimer?: NodeJS.Timeout;
 
   constructor(private readonly options: HubOptions) {
     this.log = options.log ?? ((line) => console.log(`[${new Date().toISOString()}] ${line}`));
+    this.analysis = new AnalysisService({ workerFile: options.auto?.workerFile, idleMs: options.auto?.idleMs, log: (line) => this.log(line) });
+    this.auto = new HubAutomation({
+      settingsFile: options.auto?.settingsFile ?? autoSettingsPath(options.registryFile),
+      places: () => this.registry().places,
+      service: this.analysis,
+      log: (line) => this.log(line),
+      ...(options.auto?.debounceMs !== undefined ? { debounceMs: options.auto.debounceMs } : {}),
+      ...(options.precommit ? { precommit: options.precommit, hooksFile: options.auto?.hooksFile ?? flavorFile(options.registryFile, "precommit-hooks") } : {}),
+    });
     this.queues = new HubQueues({
       registryFile: options.registryFile,
       places: () => this.registry().places,
@@ -327,7 +349,18 @@ export class QuackHub {
       approve: options.cloud?.approve ?? this.approvals.approver(),
       log: (line) => this.log(line),
     };
+    this.errorsWatch = new ErrorsWatch({
+      file: options.auto?.errorsFile ?? flavorFile(options.registryFile, "production-errors"),
+      env: this.cloud.env,
+      places: () => this.registry().places,
+      enabled: (placeId) => this.auto.enabled("errors", placeId),
+      log: (line) => this.log(line),
+      ...(options.auto?.errorsEveryMs !== undefined ? { everyMs: options.auto.errorsEveryMs } : {}),
+    });
   }
+
+  /** The alert of a new production error, an hour apart per place */
+  readonly errorsWatch: ErrorsWatch;
 
   private readonly cloud: CloudContext;
   /** The writes waiting for the user's answer in the app, and the token only the app holds */
@@ -423,6 +456,11 @@ export class QuackHub {
     }
     // Known before the app asks: a place with both AIs and no choice shows it at once
     this.aiStatus().catch(() => {});
+    // The findings panel of each place; a place registered or moved from a terminal shows up within 30 s
+    this.auto.start();
+    this.autoTimer = setInterval(() => this.auto.refresh(), 30_000);
+    this.autoTimer.unref();
+    this.errorsWatch.start();
   }
 
   /** The hub on this port leaves its daemons (already adopted by this one) and closes its port */
@@ -479,6 +517,10 @@ export class QuackHub {
     this.stopping = true;
     this.queues.stop();
     this.approvals.close();
+    if (this.autoTimer) clearInterval(this.autoTimer);
+    this.auto.stop();
+    this.analysis.stop();
+    this.errorsWatch.stop();
     // A start or replacement already under way finishes first, so its daemon is in the list below
     await Promise.allSettled([...this.replacing.values()]);
     await Promise.allSettled([...this.starting.values()]);
@@ -704,6 +746,7 @@ export class QuackHub {
     const registry = this.registry();
     const now = Date.now();
     for (const [id, refusal] of this.refusals) if (now - refusal.at > REFUSAL_SHOWN_MS) this.refusals.delete(id);
+    const findings = this.auto.counts();
     const places = Object.entries(registry.places).map(([placeId, entry]) => {
       let merges = { today: 0, conflicts: 0 };
       try {
@@ -712,13 +755,13 @@ export class QuackHub {
       } catch {
         // an unreadable folder shows no merges
       }
-      return { placeId, name: entry.name, folder: entry.folder, ...merges };
+      return { placeId, name: entry.name, folder: entry.folder, ...merges, ...(findings.has(placeId) ? { findings: findings.get(placeId) } : {}), ...this.errorsWatch.summary(placeId) };
     });
     for (const [id, choice] of this.pending) if (now - choice.lastSeen > PENDING_STALE_MS) this.pending.delete(id);
     return {
       build: BUNDLED_BUILD ?? "dist",
       // What this hub can do beyond syncing: clients look here before using an API
-      capabilities: ["queue", "approvals", "publish"],
+      capabilities: ["queue", "approvals", "publish", "analysis", "automation", "production-errors"],
       queues: this.queues.summary(),
       startedAt: this.startedAt,
       paused: this.paused,
@@ -863,6 +906,18 @@ export class QuackHub {
           case "/api/queue/job":
           case "/api/queue/settings":
             return send(200, this.queues.handleGet(url.pathname, q));
+          case "/api/automation":
+            return send(200, this.automationView());
+          case "/api/analysis": {
+            const placeId = q.get("placeId");
+            this.folderOf(placeId);
+            return send(200, this.auto.panel(placeId!));
+          }
+          case "/api/production-errors": {
+            const placeId = q.get("placeId");
+            this.folderOf(placeId);
+            return send(200, this.errorsWatch.view(placeId!));
+          }
           case "/api/unsynced": {
             const session = this.playSession(q.get("placeId"));
             daemonRequest<{ files: string[] }>(session.childPort, session.token, "GET", "/unsynced").then((answer) => send(200, answer), fail);
@@ -952,6 +1007,35 @@ export class QuackHub {
             );
             return;
           }
+          if (url.pathname === "/api/analyze") {
+            // An AI client's hook after an edit (review.ts), or the pre-commit check: the files'
+            // findings, from the resident analysis. Read-only, like `quack analyze`
+            const files: unknown[] = Array.isArray(body.files) ? body.files : [];
+            if (!files.length || files.length > 200 || files.some((f) => typeof f !== "string" || !path.isAbsolute(f))) throw new ApiError(400, "files must be absolute paths");
+            const feature = body.feature === "precommit" ? "precommit" : "review";
+            this.auto.review(files as string[], feature).then((answer) => send(200, answer), fail);
+            return;
+          }
+          if (url.pathname === "/api/automation") {
+            return send(200, this.setAutomation(body));
+          }
+          if (url.pathname === "/api/production-errors/dismiss" || url.pathname === "/api/production-errors/check") {
+            const placeId = typeof body.placeId === "string" ? body.placeId : null;
+            this.folderOf(placeId);
+            if (url.pathname.endsWith("/dismiss")) {
+              this.errorsWatch.dismiss(placeId!);
+              return send(200, this.errorsWatch.view(placeId!));
+            }
+            if (!this.auto.enabled("errors", placeId)) throw new ApiError(409, "the production errors alert is off for this place");
+            this.errorsWatch.check(placeId!).then((view) => send(200, view), fail);
+            return;
+          }
+          if (url.pathname === "/api/analysis/run") {
+            const placeId = typeof body.placeId === "string" ? body.placeId : null;
+            this.folderOf(placeId);
+            this.auto.rerun(placeId!);
+            return send(200, { ok: true });
+          }
           if (url.pathname === "/api/unsynced") {
             const session = this.playSession(typeof body.placeId === "string" ? body.placeId : null);
             daemonRequest<{ files: string[] }>(session.childPort, session.token, "POST", "/unsynced", {}).then((answer) => send(200, answer), fail);
@@ -1020,6 +1104,39 @@ export class QuackHub {
     this.log(`AI merge: ${patch.ai === undefined ? "" : patch.ai ? "on" : "off"}${patch.provider ? ` ${patch.provider}` : ""}`.trim());
   }
 
+  /** The automation settings and what each registered place gets from them */
+  private automationView() {
+    const settings = this.auto.settings();
+    const places: Record<string, Record<AutoFeature, boolean>> = {};
+    for (const id of Object.keys(this.registry().places)) {
+      places[id] = Object.fromEntries(AUTO_FEATURES.map((f) => [f, this.auto.enabled(f, id)])) as Record<AutoFeature, boolean>;
+    }
+    return { features: AUTO_FEATURES, settings, effective: places, precommitHooks: this.auto.hookStatus() };
+  }
+
+  /** { global: { panel: false } } or { placeId, values: { panel: true | false | null } } */
+  private setAutomation(body: Record<string, unknown>) {
+    const patch: AutoPatch = {};
+    const pick = (value: unknown, allowNull: boolean) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new ApiError(400, "values must be an object");
+      const out: Record<string, boolean | null> = {};
+      for (const [k, v] of Object.entries(value)) {
+        if (!(AUTO_FEATURES as readonly string[]).includes(k)) throw new ApiError(400, `unknown feature ${k}`);
+        if (typeof v !== "boolean" && !(allowNull && v === null)) throw new ApiError(400, `${k} must be true or false${allowNull ? " or null" : ""}`);
+        out[k] = v;
+      }
+      return out;
+    };
+    if (body.global !== undefined) patch.global = pick(body.global, false) as Partial<Record<AutoFeature, boolean>>;
+    if (body.placeId !== undefined) {
+      if (typeof body.placeId !== "string" || !this.registry().places[body.placeId]) throw new ApiError(404, `place ${String(body.placeId)} is not registered`);
+      patch.place = { placeId: body.placeId, values: pick(body.values, true) };
+    }
+    if (!patch.global && !patch.place) throw new ApiError(400, "send global or placeId with values");
+    this.auto.setSettings(patch);
+    return this.automationView();
+  }
+
   private handlePost(pathname: string, body: Record<string, unknown>): void {
     switch (pathname) {
       case "/api/pause":
@@ -1045,6 +1162,8 @@ export class QuackHub {
         // Registered: its setup request is answered
         this.pending.delete(`setup:${placeId}`);
         this.log(`Registered ${name ?? placeId} -> ${folder}`);
+        // its panel, and its pre-commit hook (refresh sees the registry changed)
+        this.auto.refresh();
         // Moved to another folder while syncing: its daemon must not keep writing the old one.
         // Its Studio, talking to that daemon directly, reconnects and lands on the new folder.
         const running = this.sessions.get(placeId);
@@ -1079,6 +1198,8 @@ export class QuackHub {
           session.daemon.kill();
         }
         this.log(`Unregistered ${body.placeId}`);
+        // its panel, and its pre-commit hook (refresh sees the registry changed)
+        this.auto.refresh();
         return;
       }
     }

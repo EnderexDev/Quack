@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { run } from "../merge/cli.js";
 import { GUARD_MATCHER } from "./guard.js";
+import { CODEX_REVIEW_MATCHER, REVIEW_MATCHER } from "./review.js";
 import { markers, rule } from "./rule.js";
 import type { FlavorInfo } from "./hubClient.js";
 
@@ -36,6 +37,8 @@ export interface ClientStatus {
   connected: boolean;
   /** Claude Code: Quack's guard is in this folder's settings.json */
   guarded?: boolean;
+  /** Quack's review after each edit is in the client's hooks (Claude Code's settings.json, Codex's and Cursor's hooks.json) */
+  reviewed?: boolean;
   /** Claude Code and Codex: Quack's rule in the folder's instructions, as this Quack has it or older */
   rule?: "current" | "outdated" | "missing";
   problem?: string;
@@ -64,6 +67,8 @@ export interface ServerCommand {
   args: string[];
   /** Quack's guard (guard.ts), installed as a PreToolUse hook in each Claude Code folder */
   guard?: { command: string; args: string[] };
+  /** Quack's review after each edit (review.ts), a PostToolUse hook in each client; it asks the hub on `port` */
+  review?: { command: string; args: string[]; port: number };
 }
 
 export const defaultClientsEnv = (): ClientsEnv => ({
@@ -203,7 +208,7 @@ async function status(target: Target, info: FlavorInfo, env: ClientsEnv): Promis
     if (target.client === "cursor") {
       if (!fs.existsSync(path.join(env.home, ".cursor"))) return { ...base, installed: false, connected: false };
       const config = readCursor(env);
-      return { ...base, installed: true, connected: !!config?.mcpServers && Object.hasOwn(config.mcpServers, name) };
+      return { ...base, installed: true, connected: !!config?.mcpServers && Object.hasOwn(config.mcpServers, name), reviewed: hasReview(target, env, name) };
     }
     const { bin, vars } = cli(target, env);
     // `mcp get` exits 0 only when the server is there
@@ -211,7 +216,7 @@ async function status(target: Target, info: FlavorInfo, env: ClientsEnv): Promis
     const guarded = target.client === "claude" ? hasGuard(claudeSettings(target, env), name) : undefined;
     const found = findRule(configDir(target, env), target.client, info);
     const ruleState = !found ? "missing" : found.version === rule(info).version ? "current" : "outdated";
-    return { ...base, installed: true, connected: r.code === 0, ...(guarded === undefined ? {} : { guarded }), rule: ruleState };
+    return { ...base, installed: true, connected: r.code === 0, ...(guarded === undefined ? {} : { guarded }), reviewed: hasReview(target, env, name), rule: ruleState };
   } catch (error) {
     if (missing(error)) return { ...base, installed: false, connected: false };
     return { ...base, installed: true, connected: false, problem: (error as Error).message };
@@ -231,6 +236,7 @@ async function connectOne(target: Target, info: FlavorInfo, server: ServerComman
     const next = { ...config, mcpServers: { ...servers, [name]: { command: server.command, args: server.args } } };
     fs.mkdirSync(path.dirname(cursorFile(env)), { recursive: true });
     fs.writeFileSync(cursorFile(env), `${JSON.stringify(next, null, 2)}\n`);
+    if (server.review) installReview(target, env, name, server.review);
     return;
   }
   const { bin, vars } = cli(target, env);
@@ -240,6 +246,7 @@ async function connectOne(target: Target, info: FlavorInfo, server: ServerComman
   const r = await run(bin, ["mcp", "add", ...scope, name, "--", server.command, ...server.args], undefined, TIMEOUT_MS, os.tmpdir(), vars);
   if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || `${target.label} answered ${r.code}`);
   if (target.client === "claude" && server.guard) installGuard(claudeSettings(target, env), name, server.guard);
+  if (server.review) installReview(target, env, name, server.review);
   installRule(configDir(target, env), target.client, info);
 }
 
@@ -389,6 +396,51 @@ export function installGuard(file: string, name: string, guard: { command: strin
     ...settings,
     hooks: { ...hooks, PreToolUse: [...before, { matcher: GUARD_MATCHER, hooks: [{ type: "command", command, timeout: 10 }] }] },
   };
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`);
+}
+
+/** Marks the review hook of each flavor, apart from the guard's, so each is replaced on its own */
+const reviewMark = (name: string) => `--quack-review ${name}`;
+
+const isReviewHook = (h: any, name: string) => typeof h?.command === "string" && h.command.trimEnd().endsWith(` ${reviewMark(name)}`);
+/** Claude Code and Codex nest the commands in each entry's hooks; Cursor lists them directly */
+const isReviewEntry = (entry: any, name: string) => isReviewHook(entry, name) || (Array.isArray(entry?.hooks) && entry.hooks.some((h: any) => isReviewHook(h, name)));
+
+/** Where a client keeps its hooks, and under which event the review goes */
+function reviewPlace(target: Target, env: ClientsEnv): { file: string; event: string } {
+  if (target.client === "claude") return { file: claudeSettings(target, env), event: "PostToolUse" };
+  if (target.client === "codex") return { file: path.join(configDir(target, env), "hooks.json"), event: "PostToolUse" };
+  return { file: path.join(env.home, ".cursor", "hooks.json"), event: "postToolUse" };
+}
+
+function hasReview(target: Target, env: ClientsEnv, name: string): boolean {
+  try {
+    const { file, event } = reviewPlace(target, env);
+    const list = readSettings(file).hooks?.[event];
+    return Array.isArray(list) && list.some((entry) => isReviewEntry(entry, name));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Quack's review as a hook run after each edit: Claude Code's PostToolUse on its edit tools,
+ * Codex's PostToolUse on apply_patch (hooks.json in its folder; Codex asks the user to trust it
+ * once in /hooks), Cursor's postToolUse (~/.cursor/hooks.json). An older entry of this flavor is
+ * replaced, every other hook and key stays as it was.
+ */
+function installReview(target: Target, env: ClientsEnv, name: string, review: { command: string; args: string[]; port: number }): void {
+  const { file, event } = reviewPlace(target, env);
+  const settings = readSettings(file);
+  const hooks = settings.hooks && typeof settings.hooks === "object" && !Array.isArray(settings.hooks) ? settings.hooks : {};
+  const before = Array.isArray(hooks[event]) ? hooks[event].filter((entry: any) => !isReviewEntry(entry, name)) : [];
+  const command = [review.command, ...review.args].map(quote).join(" ") + ` --port ${review.port} --client ${target.client} ${reviewMark(name)}`;
+  // A cold analysis of a big place takes a few seconds; the hook gives up quietly before this
+  const entry = target.client === "cursor"
+    ? { command, timeout: 30 }
+    : { matcher: target.client === "claude" ? REVIEW_MATCHER : CODEX_REVIEW_MATCHER, hooks: [{ type: "command", command, timeout: 30 }] };
+  const next = { ...(target.client === "cursor" && settings.version === undefined ? { version: 1 } : {}), ...settings, hooks: { ...hooks, [event]: [...before, entry] } };
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`);
 }

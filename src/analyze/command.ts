@@ -108,7 +108,7 @@ export async function runAnalyze(req: AnalyzeRequest): Promise<number> {
   return report.findings.length ? 1 : 0;
 }
 
-function gitCommonDir(dir: string): string | undefined {
+export function gitCommonDir(dir: string): string | undefined {
   try {
     const out = execFileSync("git", ["-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir"], { encoding: "utf8", windowsHide: true, timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }).trim();
     return fileKey(out);
@@ -118,7 +118,7 @@ function gitCommonDir(dir: string): string | undefined {
 }
 
 /** The sourcemap of the one registered place folder in the same repository as `root` */
-async function borrowedSourcemap(root: string, placeFolders: () => Promise<string[]>): Promise<string | undefined> {
+export async function borrowedSourcemap(root: string, placeFolders: () => Promise<string[]>): Promise<string | undefined> {
   const mine = gitCommonDir(root);
   if (!mine) return undefined;
   const folders = (await placeFolders()).filter((f) => fileKey(f) !== fileKey(root) && fs.existsSync(path.join(f, "sourcemap.json")) && gitCommonDir(f) === mine);

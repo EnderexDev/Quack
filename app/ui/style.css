@@ -163,6 +163,12 @@ html.dev .brand .mark { background-image: url(logo-dev.svg); }
 .mrow { display: grid; grid-template-columns: 96px 1fr auto auto; gap: 10px; align-items: center; padding: 8px 6px; border-top: 3px solid var(--ink-800); }
 .mrow:first-child { border-top: 0; }
 .mrow .file { color: var(--ink-200); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* A finding or a production error: where (opens the file), the rule or side, the message */
+.frow { display: grid; grid-template-columns: minmax(0, 2fr) auto minmax(0, 3fr); gap: 10px; align-items: center; padding: 7px 6px; border-top: 3px solid var(--ink-800); }
+.frow:first-child { border-top: 0; }
+.frow .file { font: inherit; font-family: var(--mono); font-size: 11.5px; text-align: left; background: none; border: 0; padding: 0; cursor: pointer; color: var(--ink-200); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.frow .file:hover { color: var(--brand-400); text-decoration: underline; }
+.frow .msg { color: var(--ink-300); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
 
 .view { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 14px; padding-right: 4px; }
 .diff { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }

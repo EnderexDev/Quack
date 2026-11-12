@@ -45,7 +45,18 @@ export interface AnalyzeOptions {
   sourcemap?: string;
   /** The place's tree already built (from a project file: project.ts); its scripts are the ones read when no syncDir is given */
   tree?: GameTree;
+  /** The sourcemap's tree loaded by an earlier run (the hub's resident analysis): used as is, the scripts still come from the sync folder */
+  loadedTree?: GameTree;
+  /**
+   * Parses kept between runs (the hub's resident analysis): a file whose size and time did not
+   * change is not read or parsed again. Each run binds them anew, so a kept parse is never
+   * changed by a run (the tests run every case twice through one cache and compare)
+   */
+  cache?: ParseCache;
 }
+
+/** A file's parse, by fileKey, with the size and time it was read at */
+export type ParseCache = Map<string, { stamp: string; parsed: ScriptFile }>;
 
 export interface AnalyzeReport {
   root: string;
@@ -186,7 +197,7 @@ interface Facts {
   tested: Set<NameExpr>;
 }
 
-interface ScriptFile {
+export interface ScriptFile {
   file: string;
   src: string;
   node?: TreeNode;
@@ -230,12 +241,17 @@ const SERVER_REQUIRABLE = new Set(["ReplicatedStorage", "ReplicatedFirst", "Serv
 export function loadProject(root: string, options: AnalyzeOptions = {}): Project {
   const t0 = Date.now();
   const syncDir = path.resolve(root, options.syncDir ?? "sync");
-  const tree = options.tree ?? loadTree(root, syncDir, path.resolve(root, options.sourcemap ?? "sourcemap.json"));
+  const tree = options.tree ?? options.loadedTree ?? loadTree(root, syncDir, path.resolve(root, options.sourcemap ?? "sourcemap.json"));
   // a project's tree names its scripts (they may sit in several folders: lib, Packages), and a sync folder given adds its own
   const files = options.tree
     ? [...new Set([...[...tree.byFile.values()].map((n) => n.file!), ...(options.syncDir ? listScripts(syncDir) : [])].map((f) => path.resolve(f)))].filter((f) => fs.existsSync(f))
     : listScripts(syncDir);
-  const scripts = files.map((file) => readScript(file, tree));
+  const scripts = files.map((file) => readScript(file, tree, options.cache));
+  if (options.cache) {
+    // a file gone from the place leaves the cache with it
+    const present = new Set(files.map(fileKey));
+    for (const key of options.cache.keys()) if (!present.has(key)) options.cache.delete(key);
+  }
   const byFile = new Map(scripts.map((s) => [fileKey(s.file), s]));
 
   for (const s of scripts) bindAll(s, tree);
@@ -1081,8 +1097,25 @@ function listScripts(dir: string): string[] {
   return out;
 }
 
-function readScript(file: string, tree: GameTree): ScriptFile {
-  return parseScript(fs.readFileSync(file, "utf8"), file, tree.byFile.get(fileKey(file)));
+function readScript(file: string, tree: GameTree, cache?: ParseCache): ScriptFile {
+  const key = fileKey(file);
+  const node = tree.byFile.get(key);
+  if (!cache) return parseScript(fs.readFileSync(file, "utf8"), file, node);
+  let stamp = "";
+  try {
+    const st = fs.statSync(file);
+    stamp = `${st.size}:${st.mtimeMs}`;
+  } catch {
+    // read below, which throws as it did without a cache
+  }
+  const kept = cache.get(key);
+  // what a run fills (node, bound, loaderCalls) is fresh; the parse, its scopes and facts are shared
+  if (kept && stamp && kept.stamp === stamp) return { ...kept.parsed, node, bound: new Map(), loaderCalls: [] };
+  const parsed = parseScript(fs.readFileSync(file, "utf8"), file, node);
+  // the cache keeps a copy with nothing of this run: the run fills `parsed` (its bindings name
+  // nodes of this tree), and a kept tree outlives the sourcemap that replaced it otherwise
+  if (stamp) cache.set(key, { stamp, parsed: { ...parsed, node: undefined, bound: new Map(), loaderCalls: [] } });
+  return parsed;
 }
 
 export function parseScript(src: string, file: string, node?: TreeNode): ScriptFile {

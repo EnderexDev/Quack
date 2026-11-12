@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { analyzeProject, exportedKeys } from "../analyze/analyze.js";
+import { analyzeProject, exportedKeys, type ParseCache } from "../analyze/analyze.js";
 import { projectRoot, runAnalyze, type LivePlay } from "../analyze/command.js";
 import { parseLuau } from "../analyze/luau/parser.js";
 import { ANALYTICS_OPS } from "../cloud/analytics.js";
@@ -32,7 +32,18 @@ function project(files: Files, sourcemap?: object): string {
   return root;
 }
 
-const run = (root: string, files?: string[]) => analyzeProject(root, { files });
+/**
+ * Every case also runs twice through one parse cache and a tree loaded once (the hub's resident
+ * analysis): a kept parse must give what a fresh read gives, so nothing a run fills leaks into it
+ */
+const run = (root: string, files?: string[]) => {
+  const fresh = analyzeProject(root, { files });
+  const cache: ParseCache = new Map();
+  const loadedTree = loadTree(root, path.join(root, "sync"), path.join(root, "sourcemap.json"));
+  const plain = (r: ReturnType<typeof analyzeProject>) => ({ ...r, stats: { ...r.stats, ms: 0 } });
+  for (let i = 0; i < 2; i++) assert.deepEqual(plain(analyzeProject(root, { files, cache, loadedTree })), plain(fresh), `run ${i + 1} through the cache`);
+  return fresh;
+};
 const brief = (root: string, files?: string[]) => run(root, files).findings.map((f) => `${path.relative(path.join(root, "sync"), f.file).replace(/\\/g, "/")}:${f.line} ${f.rule} ${f.message}`);
 
 const LIBRARY = `local Library = {}

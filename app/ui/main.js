@@ -37,6 +37,7 @@ const side = document.getElementById("side");
 const main = document.getElementById("main");
 const openCode = document.getElementById("openCode");
 const mergeBadge = document.getElementById("mergeBadge");
+const analysisBadge = document.getElementById("analysisBadge");
 
 const compact = (n) => (n === undefined || n === null ? "–" : new Intl.NumberFormat("en", { notation: "compact" }).format(n));
 const state = () => ui.hub.state;
@@ -174,6 +175,10 @@ function renderNav() {
   const place = placeOf(ui.placeId);
   mergeBadge.textContent = place?.conflicts ?? "";
   mergeBadge.classList.toggle("hidden", !place?.conflicts);
+  // The panel's findings and the production errors not yet dismissed
+  const flagged = (place?.findings ?? 0) + (place?.newErrors ?? 0);
+  analysisBadge.textContent = flagged || "";
+  analysisBadge.classList.toggle("hidden", !flagged);
   // Rebuilt only when it changes: the nav renders on every state poll
   const key = place && ui.view !== "settings" && ui.editors.length ? `${place.folder}\n${ui.editors.map((e) => e.id)}\n${getLanguage()}` : "";
   if (key !== openCodeKey) {
@@ -279,6 +284,7 @@ function stats(place) {
 function stopContent() {
   clearInterval(mergesTimer);
   clearInterval(queueTimer);
+  clearInterval(analysisTimer);
   generation++;
 }
 
@@ -450,6 +456,7 @@ function renderContent() {
   if (ui.view === "merges") return renderMerges(target);
   if (ui.view === "folder") return renderFolder(target);
   if (ui.view === "queue") return renderQueue(target);
+  if (ui.view === "analysis") return renderAnalysis(target);
   if (ui.view === "conflict") return renderConflict(target);
 }
 
@@ -510,6 +517,136 @@ async function renderMerges(target) {
   await fill();
   // Left before the first answer came: no timer for a view that is gone
   if (mine === generation) mergesTimer = setInterval(fill, MERGES_POLL_MS);
+}
+
+// ---------- Analysis: the findings panel, the production errors, what runs on its own ----------
+
+const ANALYSIS_POLL_MS = 2000;
+const AUTO_FEATURES = ["review", "panel", "errors", "precommit"];
+
+/**
+ * One row per feature that runs on its own (Settings: for every game; a game's Analysis tab: for
+ * that game, which may differ). A game's own value shows a way back to the global one.
+ */
+function autoRows(view, placeId) {
+  return AUTO_FEATURES.map((f) => {
+    const on = placeId ? !!view.effective?.[placeId]?.[f] : !!view.settings.global[f];
+    const own = placeId ? view.settings.places?.[placeId]?.[f] : undefined;
+    const set = async (value) => {
+      try {
+        await api.post("/api/automation", placeId ? { placeId, values: { [f]: value } } : { global: { [f]: value } });
+        contentKey = "";
+        renderContent();
+      } catch (error) {
+        fail(error);
+      }
+    };
+    const hook = f === "precommit" && placeId ? view.precommitHooks?.[placeId] : undefined;
+    const hookPill = hook && hook !== "installed" && hook !== "not installed" ? h("span", { class: "pill warn", title: hook }, hook) : null;
+    const back = own !== undefined ? h("button", { class: "pill", onclick: () => set(null) }, t("autoFollowGlobal")) : null;
+    return h("div", { class: "field" }, h("span", { class: "grow" }, t(`auto_${f}`), h("span", { class: "hint" }, t(`auto_${f}_hint`))), hookPill, back, toggle(on, () => set(!on)));
+  });
+}
+
+function automationCard(view) {
+  const card = h("div", { class: "card chunk" }, h("span", { class: "label" }, t("autoCard")));
+  if (!view) return card.append(h("p", { class: "note bad" }, t("error", { e: "the hub has no automation" }))), card;
+  card.append(...autoRows(view, null), h("p", { class: "note" }, t("autoNote")));
+  return card;
+}
+
+let analysisTimer;
+async function renderAnalysis(target) {
+  const place = placeOf(ui.placeId);
+  const placeId = place.placeId;
+  const mine = generation;
+  const findings = h("div", { class: "list", style: "max-height:42vh" });
+  const findingsInfo = h("span", { class: "muted", style: "font-size:11.5px" });
+  const rerun = h("button", { class: "btn dark chunk press" }, t("analysisRerun"));
+  const errors = h("div", { class: "list", style: "max-height:30vh" });
+  const errorsInfo = h("span", { class: "muted", style: "font-size:11.5px" });
+  const dismiss = h("button", { class: "btn dark chunk press hidden" }, t("errorsDismiss"));
+  const check = h("button", { class: "btn dark chunk press" }, t("errorsCheck"));
+  const own = h("div", { class: "card chunk" }, h("span", { class: "label" }, t("autoPlace")));
+  target.replaceChildren(h("div", { class: "view" },
+    h("div", { class: "panel chunk", style: "flex:none" },
+      h("div", { class: "panel-top" }, h("span", { class: "label" }, t("analysisFindings")), findingsInfo, h("span", { class: "grow" }), rerun),
+      findings),
+    h("div", { class: "panel chunk", style: "flex:none" },
+      h("div", { class: "panel-top" }, h("span", { class: "label" }, t("errorsTitle")), errorsInfo, h("span", { class: "grow" }), dismiss, check),
+      errors),
+    own));
+  // A finding's file in the editor the app found or the user picked (the row is the button)
+  const open = (where) => {
+    const file = `${place.folder}\\${where.replace(/:\d+$/, "").replace(/\//g, "\\")}`;
+    return invoke("open_path", { path: file, editor: true }).catch(fail);
+  };
+  const row = (where, rule, message, pill) => h("div", { class: "frow" },
+    h("button", { class: "file mono", title: where, onclick: () => open(where) }, where),
+    h("span", { class: `pill ${pill}` }, rule),
+    h("span", { class: "msg", title: message }, message));
+  let pending = false;
+  let lastPanel = "";
+  let lastErrors = "";
+  const fill = async () => {
+    if (pending) return;
+    pending = true;
+    let panel;
+    let prod;
+    try {
+      [panel, prod] = await Promise.all([api.get(`/api/analysis?placeId=${placeId}`), api.get(`/api/production-errors?placeId=${placeId}`)]);
+    } catch (error) {
+      if (mine === generation) fail(error);
+      return;
+    } finally {
+      pending = false;
+    }
+    if (mine !== generation) return;
+    const panelKey = JSON.stringify(panel);
+    if (panelKey !== lastPanel) {
+      lastPanel = panelKey;
+      rerun.disabled = panel.state === "off";
+      findingsInfo.textContent = panel.state === "off" ? t("analysisOff")
+        : panel.state === "error" ? t("error", { e: panel.error })
+        : panel.at === undefined ? t("analysisRunning")
+        : t("analysisInfo", { n: panel.findings.length, scripts: panel.scripts ?? "?", s: ((panel.ms ?? 0) / 1000).toFixed(1), at: hhmm(new Date(panel.at).toISOString()) }) + (panel.state === "running" ? ` · ${t("analysisRunning")}` : "");
+      findings.replaceChildren(...(panel.findings.length
+        ? panel.findings.map((f) => row(`${f.file}:${f.line}`, f.rule, f.message, "warn"))
+        : [h("div", { class: "empty" }, t(panel.state === "off" ? "analysisOffText" : panel.at === undefined ? "analysisRunning" : "analysisNone"))]));
+    }
+    const errorsKey = JSON.stringify(prod);
+    if (errorsKey !== lastErrors) {
+      lastErrors = errorsKey;
+      check.disabled = prod.state === "off";
+      dismiss.classList.toggle("hidden", !prod.fresh.length);
+      errorsInfo.textContent = prod.state === "off" ? t("errorsOff")
+        : prod.state === "problem" ? t("errorsProblemShort")
+        : prod.checkedAt ? t("errorsChecked", { at: hhmm(new Date(prod.checkedAt).toISOString()) }) : t("errorsWaiting");
+      errors.replaceChildren(...(prod.state === "problem" ? [h("p", { class: "note bad", style: "padding:0 6px" }, prod.problem)] : []),
+        ...(prod.fresh.length
+          ? prod.fresh.slice().reverse().map((e) => row(e.at ?? e.hash, e.source ?? "?", `${e.message ?? `hash ${e.hash}`} (${e.count}×)`, e.source === "Server" ? "bad" : "sky"))
+          : [h("div", { class: "empty" }, t(prod.state === "off" ? "errorsOffText" : "errorsNone"))]));
+    }
+  };
+  rerun.addEventListener("click", () => api.post("/api/analysis/run", { placeId }).then(fill).catch(fail));
+  dismiss.addEventListener("click", () => api.post("/api/production-errors/dismiss", { placeId }).then(fill).catch(fail));
+  check.addEventListener("click", async () => {
+    check.disabled = true;
+    try {
+      await api.post("/api/production-errors/check", { placeId });
+      lastErrors = "";
+      await fill();
+    } catch (error) {
+      fail(error);
+    } finally {
+      check.disabled = false;
+    }
+  });
+  const view = await api.get("/api/automation").catch(() => null);
+  if (mine !== generation) return;
+  if (view) own.append(...autoRows(view, placeId), h("p", { class: "note" }, t("autoPlaceNote")));
+  await fill();
+  if (mine === generation) analysisTimer = setInterval(fill, ANALYSIS_POLL_MS);
 }
 
 // ---------- Queue ----------
@@ -841,7 +978,7 @@ function aiCard(ai) {
  * Claude Code, Quack's guard. A folder missing any of them (an older rule, a folder connected
  * before the guard existed) needs connecting again.
  */
-const aiNeeds = (c) => c.installed && (!c.connected || c.guarded === false || c.rule === "outdated" || c.rule === "missing");
+const aiNeeds = (c) => c.installed && (!c.connected || c.guarded === false || c.reviewed === false || c.rule === "outdated" || c.rule === "missing");
 const aiState = (c) => c.problem ? c.problem : t(!c.installed ? "mcpMissing" : !c.connected ? "mcpNo" : aiNeeds(c) ? "mcpUpdate" : "mcpHas");
 
 /**
@@ -1117,13 +1254,14 @@ async function copyText(text) {
 async function renderSettings(target) {
   const s = state();
   const mine = generation;
-  const [autostart, daemon, ai, queueSettings, pluginVersion] = await Promise.all([
+  const [autostart, daemon, ai, queueSettings, pluginVersion, automation] = await Promise.all([
     invoke("get_autostart").catch(() => false),
     invoke("read_daemon_config"),
     api.get(`/api/ai${ui.aiRefresh ? "?refresh=1" : ""}`).catch(() => null),
     api.get("/api/queue/settings").then((r) => r.settings).catch(() => null),
     // The app version that last changed the plugin: not every app update does
     invoke("plugin_version").catch(() => null),
+    api.get("/api/automation").catch(() => null),
   ]);
   ui.aiRefresh = false;
   if (mine !== generation) return;
@@ -1249,6 +1387,7 @@ async function renderSettings(target) {
           h("div", { class: "field" }, h("span", { class: "grow" }, t("pluginVersion"), h("span", { class: "hint" }, t("pluginVersionHint"))),
             h("span", { class: "mono muted" }, pluginVersion ?? t("pluginVersionUnknown")))),
         aiCard(ai),
+        automationCard(automation),
         queueCard(queueSettings),
         mcpCard(),
         cloudCard(),

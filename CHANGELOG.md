@@ -6,6 +6,16 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.31] - 2026-11-12
+
+### Added
+- Quack's analysis runs on its own, in four ways, each turned on or off in Settings > Runs on its own for every game, and in a game's new Analysis tab for that game alone. The settings live in `automation.json` (Dev: `automation-dev.json`) next to the hub's registry, apart from the `config.json` both hubs share.
+  - Review after each AI edit (on by default). Connect to AI adds a hook to Claude Code, Codex and Cursor. After the AI edits a Luau file inside a synced folder, a worktree of one, or a Rojo project, the hook hands it at once the findings in that file, plus the ones the edit added in other files (a caller of a function it renamed). The hook never blocks the edit and says nothing when it finds nothing, the hub is down, or the review is off. Codex asks once, in its `/hooks`, to trust it.
+  - Findings panel (on by default). Each game's Analysis tab lists the findings of the whole game with file, line, rule and message. The list is analyzed again after each change of a script or of the place's tree, from Studio or from the disk. A finding opens its file in the editor. The tab's badge counts the findings.
+  - New production error alert (on by default, read-only). Once an hour, for each game whose experience the saved Open Cloud key can read, Quack checks the live game's errors and sends a notification when one shows up that the game never had, with its message, its side, and the file and line it points at. The first check only learns the errors already there, and an update of Quack does not repeat an alert. A key without `universe.analytics:read` for that experience is reported once.
+  - Pre-commit check (off by default). Turned on, Quack puts a git hook in the game's repository that stops a commit whose Luau files have findings. `git commit --no-verify` skips it once, `-- quack: allow(rule)` silences a finding on purpose, and the project's own pre-commit keeps running first. The hook lets a commit through whenever Quack cannot answer, and it is not installed where the project keeps its own hooks folder (`core.hooksPath`). `quack precommit` runs the same check.
+- The hub keeps the analysis loaded between runs, in its own thread, so it never holds up a Studio's sync. A run after an edit reads only the files that changed: about 1 s for a game of 1,459 scripts, against 2.5 to 3 s for `quack analyze` from a terminal. The thread stops after 10 minutes with no run.
+
 ## [1.0.30] - 2026-11-12
 
 ### Added
@@ -351,7 +361,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.30...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.31...HEAD
+[1.0.31]: https://github.com/EnderexDev/Quack/compare/v1.0.30...v1.0.31
 [1.0.30]: https://github.com/EnderexDev/Quack/compare/v1.0.29...v1.0.30
 [1.0.29]: https://github.com/EnderexDev/Quack/compare/v1.0.28...v1.0.29
 [1.0.28]: https://github.com/EnderexDev/Quack/compare/v1.0.27...v1.0.28
