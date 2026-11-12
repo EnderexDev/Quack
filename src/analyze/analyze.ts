@@ -7,7 +7,7 @@ import { lintChunk, type LintFinding } from "./luau/lint.js";
 import { parseLuau } from "./luau/parser.js";
 import { resolveScopes, valueOf, type Decl, type NameExpr, type Scopes } from "./luau/scope.js";
 import { ROBLOX_CLASSES, ROBLOX_MEMBERS } from "./robloxMembers.js";
-import { childNamed, fileKey, loadTree, type GameTree, type TreeNode } from "./tree.js";
+import { addSyncFile, childNamed, fileKey, loadTree, type GameTree, type TreeNode } from "./tree.js";
 
 /**
  * Quack's own static check of a place's Luau, from what Quack knows that a linter does not: the
@@ -53,6 +53,12 @@ export interface AnalyzeOptions {
    * changed by a run (the tests run every case twice through one cache and compare)
    */
   cache?: ParseCache;
+  /** Texts to read instead of the disk, by fileKey (the pre-commit check: what the commit stages) */
+  texts?: Map<string, string>;
+  /** Files read from `texts` though the disk may not have them (deleted after `git add`) */
+  textFiles?: string[];
+  /** Files on disk left out, by fileKey (the pre-commit check: untracked, not in the commit) */
+  absent?: Set<string>;
 }
 
 /** A file's parse, by fileKey, with the size and time it was read at */
@@ -243,10 +249,20 @@ export function loadProject(root: string, options: AnalyzeOptions = {}): Project
   const syncDir = path.resolve(root, options.syncDir ?? "sync");
   const tree = options.tree ?? options.loadedTree ?? loadTree(root, syncDir, path.resolve(root, options.sourcemap ?? "sourcemap.json"));
   // a project's tree names its scripts (they may sit in several folders: lib, Packages), and a sync folder given adds its own
-  const files = options.tree
+  let files = options.tree
     ? [...new Set([...[...tree.byFile.values()].map((n) => n.file!), ...(options.syncDir ? listScripts(syncDir) : [])].map((f) => path.resolve(f)))].filter((f) => fs.existsSync(f))
     : listScripts(syncDir);
-  const scripts = files.map((file) => readScript(file, tree, options.cache));
+  // the place as a commit holds it: untracked files out, files deleted after `git add` back in
+  const absent = options.absent;
+  if (absent?.size) files = files.filter((f) => !absent.has(fileKey(f)));
+  for (const f of options.textFiles ?? []) {
+    if (files.some((x) => fileKey(x) === fileKey(f))) continue;
+    files.push(path.resolve(f));
+    // a tree read from the sync folder (no sourcemap) lacks it too: back in, so a require finds it
+    // (that tree is read again each run, never kept)
+    addSyncFile(tree, syncDir, f);
+  }
+  const scripts = files.map((file) => readScript(file, tree, options.cache, options.texts));
   if (options.cache) {
     // a file gone from the place leaves the cache with it
     const present = new Set(files.map(fileKey));
@@ -1097,9 +1113,12 @@ function listScripts(dir: string): string[] {
   return out;
 }
 
-function readScript(file: string, tree: GameTree, cache?: ParseCache): ScriptFile {
+function readScript(file: string, tree: GameTree, cache?: ParseCache, texts?: Map<string, string>): ScriptFile {
   const key = fileKey(file);
   const node = tree.byFile.get(key);
+  // a text given for the file (what a commit stages) is read instead of the disk, and never cached
+  const given = texts?.get(key);
+  if (given !== undefined) return parseScript(given, file, node);
   if (!cache) return parseScript(fs.readFileSync(file, "utf8"), file, node);
   let stamp = "";
   try {

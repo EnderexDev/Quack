@@ -22,6 +22,10 @@ export interface ResidentRequest {
   files?: string[];
   /** The registered places' folders, for a worktree's sourcemap */
   placeFolders: string[];
+  /** Texts to read instead of the disk, by absolute path (the pre-commit check: what the commit stages) */
+  texts?: Record<string, string>;
+  /** Files on disk to leave out (the pre-commit check: untracked, not in the commit) */
+  absent?: string[];
 }
 
 export interface ResidentAnswer {
@@ -101,6 +105,9 @@ export class ResidentAnalysis {
     const started = Date.now();
     entry.used = started;
     const syncDir = path.join(root, "sync");
+    const texts = req.texts && Object.keys(req.texts).length ? new Map(Object.entries(req.texts).map(([f, t]) => [fileKey(path.resolve(f)), t])) : undefined;
+    const given = { texts, textFiles: Object.keys(req.texts ?? {}), absent: new Set((req.absent ?? []).map((f) => fileKey(path.resolve(f)))) };
+    const asCommitted = !!texts || given.absent.size > 0;
     let report: AnalyzeReport;
     if (fs.existsSync(syncDir)) {
       let sourcemap: string | undefined = path.join(root, "sourcemap.json");
@@ -120,12 +127,12 @@ export class ResidentAnalysis {
         entry.tree = loadTree(root, syncDir, sourcemap ?? path.join(root, "sourcemap.json"));
         entry.treeStamp = stamp;
       }
-      report = loadProject(root, { sourcemap, loadedTree: entry.tree, cache: entry.cache }).report();
+      report = loadProject(root, { sourcemap, loadedTree: entry.tree, cache: entry.cache, ...given }).report();
     } else {
       // a Rojo project: its tree is its project file and the disk, read again each run
       const tree = await treeFromProject(root);
       if (!tree) throw new Error(`no sync folder or readable project file in ${root}`);
-      report = loadProject(root, { tree, cache: entry.cache }).report();
+      report = loadProject(root, { tree, cache: entry.cache, ...given }).report();
     }
     // the whole place is checked every time (a run costs about the same either way, since the
     // binding is global): what the edit broke in a caller shows up too
@@ -147,7 +154,8 @@ export class ResidentAnalysis {
       const before = entry.baselines.filter((b) => b.at < edited - CLOCK_MARGIN_MS).sort((a, b) => b.at - a.at)[0];
       if (before) elsewhere = report.findings.filter((f) => !wanted.has(fileKey(f.file)) && !before.ids.has(identity(f)));
     }
-    entry.baselines.push({ at: started, ids });
+    // a run over given texts is not the disk: never a later review's baseline
+    if (!asCommitted) entry.baselines.push({ at: started, ids });
     if (entry.baselines.length > BASELINES) entry.baselines.shift();
     return { findings, elsewhere, stats: report.stats };
   }

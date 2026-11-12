@@ -939,7 +939,8 @@ export class QuackHub {
       const chunks: Buffer[] = [];
       // A Studio tool call carries Luau code
       // A cloud call can carry a player's whole save
-      const maxBody = url.pathname === "/api/studio" || url.pathname === "/api/queue/submit" || url.pathname === "/api/cloud" ? STUDIO_BODY_BYTES : MAX_BODY_BYTES;
+      // and the pre-commit check, the staged text of its scripts
+      const maxBody = url.pathname === "/api/studio" || url.pathname === "/api/queue/submit" || url.pathname === "/api/cloud" || url.pathname === "/api/analyze" ? STUDIO_BODY_BYTES : MAX_BODY_BYTES;
       req.on("data", (chunk: Buffer) => {
         size += chunk.length;
         if (size > maxBody) {
@@ -1013,7 +1014,22 @@ export class QuackHub {
             const files: unknown[] = Array.isArray(body.files) ? body.files : [];
             if (!files.length || files.length > 200 || files.some((f) => typeof f !== "string" || !path.isAbsolute(f))) throw new ApiError(400, "files must be absolute paths");
             const feature = body.feature === "precommit" ? "precommit" : "review";
-            this.auto.review(files as string[], feature).then((answer) => send(200, answer), fail);
+            // The pre-commit check sends the place as the commit holds it: the index's text of each
+            // script that differs on disk (the commit's files and their dependencies), and the
+            // untracked scripts, which the commit does not have
+            const script = (f: unknown): f is string => typeof f === "string" && path.isAbsolute(f) && /\.luau?$/i.test(f);
+            let texts: Record<string, string> | undefined;
+            if (body.texts !== undefined) {
+              if (!body.texts || typeof body.texts !== "object" || Array.isArray(body.texts)) throw new ApiError(400, "texts must map a script to its text");
+              texts = {};
+              for (const [f, t] of Object.entries(body.texts as Record<string, unknown>)) {
+                if (typeof t !== "string" || !script(f)) throw new ApiError(400, "texts must map a script's absolute path to its text");
+                texts[f] = t;
+              }
+            }
+            const absent: unknown[] | undefined = body.absent === undefined ? undefined : Array.isArray(body.absent) ? body.absent : [null];
+            if (absent && !absent.every(script)) throw new ApiError(400, "absent must list scripts' absolute paths");
+            this.auto.review(files as string[], feature, texts, absent as string[] | undefined).then((answer) => send(200, answer), fail);
             return;
           }
           if (url.pathname === "/api/automation") {

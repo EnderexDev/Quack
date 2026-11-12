@@ -104,6 +104,33 @@ export function treeFromSyncFolder(syncDir: string): GameTree {
   return { root, complete: false, byFile };
 }
 
+/**
+ * Puts a script the sync folder no longer has back in a tree read from that folder (the
+ * pre-commit check: a script deleted after `git add`, which the commit still holds), with the
+ * folders above it, named as treeFromSyncFolder names them
+ */
+export function addSyncFile(tree: GameTree, syncDir: string, file: string): void {
+  if (tree.complete || tree.byFile.has(fileKey(file))) return;
+  const rel = path.relative(syncDir, file);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return;
+  const parts = rel.split(/[\\/]/);
+  const m = SCRIPT_FILE.exec(parts.pop()!);
+  if (!m) return;
+  let parent = tree.root;
+  for (const name of parts) {
+    let next = parent.children.find((c) => c.name === name && (c.className === "Folder" || isScript(c) || parent === tree.root));
+    if (!next) {
+      next = { name, className: parent === tree.root ? name : "Folder", parent, children: [] };
+      parent.children.push(next);
+    }
+    parent = next;
+  }
+  const className = m[2]?.toLowerCase() === ".server" ? "Script" : m[2]?.toLowerCase() === ".client" ? "LocalScript" : "ModuleScript";
+  const node: TreeNode = { name: m[1], className, parent, children: [], file: path.resolve(file) };
+  parent.children.push(node);
+  tree.byFile.set(fileKey(file), node);
+}
+
 /** The sourcemap when it is there and readable, else the sync folder */
 export function loadTree(root: string, syncDir: string, sourcemap: string): GameTree {
   try {

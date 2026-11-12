@@ -309,7 +309,13 @@ test("pre-commit: the hook goes in and out with the setting, keeps the project's
   // the project reached through a junction (or a short 8.3 name, as on the CI runner): git names the real folder
   const link = `${repo}-link`;
   fs.symlinkSync(repo, link, "junction");
-  assert.equal(await runPrecommit({ ...ctx, cwd: link }), FINDINGS_EXIT);
+  try {
+    assert.equal(await runPrecommit({ ...ctx, cwd: link }), FINDINGS_EXIT);
+  } finally {
+    // the link alone, never what it points at
+    fs.unlinkSync(link);
+  }
+  assert.ok(fs.existsSync(path.join(repo, "sync", "Bad.luau")), "the project is still there");
   assert.match(out.join("\n"), /sync\/Bad\.luau:1:7 {2}undefined-variable/);
   assert.equal(await runPrecommit({ ...ctx, ask: async () => ({ disabled: true, findings: [] }) }), 0, "off in the app");
   // hub down: the setting from its file (off by default), then one analysis here
@@ -535,4 +541,118 @@ test("council review, round 3: a hook that would not come out of a moved place's
   await next.hooksSettled();
   assert.deepEqual([...installed], [newFolder]);
   next.stop();
+});
+
+test("pre-commit (council review): what the commit stages is checked, not the disk: a staged error fixed only on disk still stops it, a clean stage with an error only on disk goes through", { timeout: 60000 }, async () => {
+  const { execFileSync } = await import("node:child_process");
+  const { runPrecommit, FINDINGS_EXIT } = await import("../auto/precommit.js");
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "quack-staged-"));
+  const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { windowsHide: true, stdio: "ignore" });
+  git("init", "-q");
+  project(repo, { "ServerScriptService/Main.server.luau": "print(1)\n" });
+  const registry = path.join(repo, "..", `hub-dev-${path.basename(repo)}.json`);
+  saveRegistry(registry, { places: { "555": { folder: repo } } });
+  writeAutoSettings(autoSettingsPath(registry), { global: { precommit: true } });
+  const main = path.join(repo, "sync", "ServerScriptService", "Main.server.luau");
+  // the hub down: one analysis in this process, over the staged texts
+  const ctx = { cwd: repo, out: () => {}, registry, ask: async () => null };
+  fs.writeFileSync(main, "print(stagedUndefined)\n");
+  git("add", "-A");
+  fs.writeFileSync(main, "print(1)\n");
+  assert.equal(await runPrecommit(ctx), FINDINGS_EXIT, "the staged text has the error");
+  fs.writeFileSync(main, "print(2)\n");
+  git("add", "-A");
+  fs.writeFileSync(main, "print(diskOnlyUndefined)\n");
+  assert.equal(await runPrecommit(ctx), 0, "only the disk has it");
+  // through the hub: the texts travel with the files
+  let sent: Record<string, string> | undefined;
+  await runPrecommit({ ...ctx, ask: async (_files: string[], texts?: Record<string, string>) => ((sent = texts), { findings: [] }) });
+  assert.deepEqual(Object.values(sent ?? {}), ["print(2)\n"]);
+
+  const port = await freePort();
+  const hub = new QuackHub({ port, registryFile: registry, daemonCli, log: () => {}, auto: { debounceMs: 100 } });
+  await hub.start();
+  try {
+    const answer = (await call(port, "POST", "/api/analyze", { files: [main], feature: "precommit", texts: { [main]: "print(hubStagedUndefined)\n" } })).body;
+    assert.deepEqual(answer.findings.map((f: any) => f.message.match(/`(\w+)`/)?.[1]), ["hubStagedUndefined"], JSON.stringify(answer));
+    assert.equal((await call(port, "POST", "/api/analyze", { files: [main], texts: { "relative.luau": "x" } })).status, 400, "a text only for a script's absolute path");
+    assert.equal((await call(port, "POST", "/api/analyze", { files: [main], texts: { [path.join(repo, "notes.txt")]: "x" } })).status, 400);
+    assert.equal((await call(port, "POST", "/api/analyze", { files: [main], absent: [42] })).status, 400);
+    // a review of the disk right after is the disk's, not the staged text's (never cached)
+    assert.deepEqual((await call(port, "POST", "/api/analyze", { files: [main], feature: "precommit" })).body.findings.map((f: any) => f.message.match(/`(\w+)`/)?.[1]), ["diskOnlyUndefined"]);
+  } finally {
+    await hub.stop();
+  }
+});
+
+test("pre-commit (council review, round 2): the dependencies are read as the commit holds them too, and a staged file deleted from the disk is still checked", { timeout: 60000 }, async () => {
+  const { execFileSync } = await import("node:child_process");
+  const { runPrecommit, FINDINGS_EXIT } = await import("../auto/precommit.js");
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "quack-deps-"));
+  const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { windowsHide: true, stdio: "ignore" });
+  git("init", "-q");
+  git("config", "user.email", "t@t");
+  git("config", "user.name", "t");
+  project(repo, { "ReplicatedStorage/Config.luau": CONFIG, "ServerScriptService/User.server.luau": USER });
+  git("add", "-A");
+  git("commit", "-q", "-m", "a");
+  const registry = path.join(repo, "..", `hub-dev-${path.basename(repo)}.json`);
+  saveRegistry(registry, { places: {} });
+  writeAutoSettings(autoSettingsPath(registry), { global: { precommit: true } });
+  const ctx = { cwd: repo, out: () => {}, registry, ask: async () => null };
+  const config = path.join(repo, "sync", "ReplicatedStorage", "Config.luau");
+  const user = path.join(repo, "sync", "ServerScriptService", "User.server.luau");
+
+  // the module renamed on disk only: the commit keeps getSpeed, so a commit of the caller is valid
+  fs.writeFileSync(config, CONFIG.replace("getSpeed", "getWalkSpeed"));
+  fs.writeFileSync(user, `${USER}-- touched\n`);
+  git("add", "--", user);
+  assert.equal(await runPrecommit(ctx), 0, "a dependency changed only on disk does not stop a valid commit");
+
+  // the rename staged, the disk put back: the commit's caller is wrong
+  git("add", "--", config);
+  fs.writeFileSync(config, CONFIG);
+  fs.writeFileSync(user, `${USER}-- touched again\n`);
+  git("add", "--", user);
+  assert.equal(await runPrecommit(ctx), FINDINGS_EXIT, "a dependency changed in the index does not hide the wrong call");
+  git("reset", "-q", "--", config);
+  git("commit", "-q", "-m", "b");
+
+  // a staged script deleted from the disk afterwards: the commit still has it
+  const bad = path.join(repo, "sync", "ServerScriptService", "Bad.server.luau");
+  fs.writeFileSync(bad, "print(deletedButStagedUndefined)\n");
+  git("add", "--", bad);
+  fs.rmSync(bad);
+  let sent: string[] = [];
+  assert.equal(await runPrecommit({ ...ctx, ask: async (files: string[]) => ((sent = files), null) }), FINDINGS_EXIT);
+  assert.deepEqual(sent.map((f) => path.basename(f)), ["Bad.server.luau"]);
+});
+
+test("pre-commit (council review, round 3): run from a subfolder, an untracked script there is still left out; a dependency deleted from the disk is found by its require with no sourcemap", { timeout: 60000 }, async () => {
+  const { execFileSync } = await import("node:child_process");
+  const { runPrecommit, FINDINGS_EXIT } = await import("../auto/precommit.js");
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "quack-subdir-"));
+  const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { windowsHide: true, stdio: "ignore" });
+  git("init", "-q");
+  git("config", "user.email", "t@t");
+  git("config", "user.name", "t");
+  const NO_SPEED = "local M = {}\nfunction M.getWalkSpeed() return 16 end\nreturn M\n";
+  project(repo, { "ReplicatedStorage/Config.luau": NO_SPEED, "ServerScriptService/User.server.luau": "print(1)\n" });
+  git("add", "-A");
+  git("commit", "-q", "-m", "a");
+  const registry = path.join(repo, "..", `hub-dev-${path.basename(repo)}.json`);
+  saveRegistry(registry, { places: {} });
+  writeAutoSettings(autoSettingsPath(registry), { global: { precommit: true } });
+  const sss = path.join(repo, "sync", "ServerScriptService");
+  // an untracked script beside the caller adds the key the module lacks: the commit does not have it
+  fs.writeFileSync(path.join(sss, "Patch.server.luau"), 'local Config = require(game:GetService("ReplicatedStorage").Config)\nConfig.getSpeed = function() return 1 end\n');
+  fs.writeFileSync(path.join(sss, "User.server.luau"), USER);
+  git("add", "--", path.join(sss, "User.server.luau"));
+  const ctx = { cwd: sss, out: () => {}, registry, ask: async () => null };
+  assert.equal(await runPrecommit(ctx), FINDINGS_EXIT, "from the subfolder, the untracked Patch is not in the commit");
+
+  // the module deleted from the disk only: the commit keeps it, its require still finds it
+  fs.rmSync(path.join(sss, "Patch.server.luau"));
+  fs.rmSync(path.join(repo, "sync", "ReplicatedStorage", "Config.luau"));
+  assert.equal(await runPrecommit({ ...ctx, cwd: repo }), FINDINGS_EXIT, "Config (index) has no getSpeed");
 });

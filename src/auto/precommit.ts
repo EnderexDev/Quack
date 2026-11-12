@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { projectRoot } from "../analyze/command.js";
+import { fileKey } from "../analyze/tree.js";
 import { loadRegistry } from "../hub/registry.js";
 import { ResidentAnalysis } from "./resident.js";
 import { autoEnabled, flavorFile, readAutoSettings } from "./settings.js";
@@ -115,7 +116,8 @@ export interface PrecommitContext {
   cwd: string;
   out: (line: string) => void;
   /** The hub's answer for these files, or null when no hub answers */
-  ask: (files: string[]) => Promise<{ disabled?: boolean; findings: Finding[]; elsewhere?: Finding[] } | null>;
+  /** texts: the staged text of a file that differs on disk */
+  ask: (files: string[], texts?: Record<string, string>, absent?: string[]) => Promise<{ disabled?: boolean; findings: Finding[]; elsewhere?: Finding[] } | null>;
   /** This flavor's registry file (the setting and the place, when the hub is down) */
   registry: string;
 }
@@ -126,6 +128,17 @@ interface Finding {
   column: number;
   rule: string;
   message: string;
+}
+
+/** A file's text as the index holds it (what the commit will have); the path is git's, from the top */
+async function stagedText(cwd: string, rel: string): Promise<string> {
+  const { stdout } = await run("git", ["-C", cwd, "show", `:${rel}`], { windowsHide: true, timeout: 15_000, maxBuffer: 64 * 1024 * 1024 });
+  return stdout;
+}
+
+/** A file's real path, also when it is gone from the disk (its folder resolved, its name kept) */
+function realFile(p: string): string {
+  return fs.existsSync(p) ? real(p) : path.join(real(path.dirname(p)), path.basename(p));
 }
 
 /** A path with its junctions and short names resolved (itself when it does not exist) */
@@ -146,14 +159,34 @@ export async function runPrecommit(ctx: PrecommitContext): Promise<number> {
     if (!found) return 0;
     const root = real(found);
     const top = await git(ctx.cwd, ["rev-parse", "--show-toplevel"]);
-    const staged = (await git(ctx.cwd, ["diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"])).split("\0").filter(Boolean);
-    const files = staged.map((f) => real(path.resolve(top, f))).filter((f) => {
-      const own = /\.luau?$/i.test(f) && fs.existsSync(f) ? projectRoot(f) : null;
-      return !!own && real(own).toLowerCase() === root.toLowerCase();
-    });
-    if (!files.length) return 0;
-    let answer = await ctx.ask(files).catch(() => null);
-    if (!answer) answer = await offline(root, files, ctx.registry);
+    const staged = (await git(top, ["diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"])).split("\0").filter(Boolean);
+    // a script of this project, as git names it (from the top): its real path, or null
+    const ofProject = (rel: string): string | null => {
+      const file = realFile(path.resolve(top, rel));
+      if (!/\.luau?$/i.test(file)) return null;
+      const own = projectRoot(file);
+      return own && fileKey(real(own)) === fileKey(root) ? file : null;
+    };
+    const mine = staged.map((rel) => ({ rel, file: ofProject(rel) })).filter((m): m is { rel: string; file: string } => !!m.file);
+    if (!mine.length) return 0;
+    const files = mine.map((m) => m.file);
+    // The place as the commit holds it, not as the disk does: every tracked script that differs
+    // on disk (edited again after `git add`, staged in part with `git add -p`, or deleted after
+    // it; the commit's own files and the ones they depend on) is read from the index, and the
+    // untracked scripts, which the commit does not have, are left out
+    let texts: Record<string, string> | undefined;
+    // both from the top: git names every path from there, and from a subfolder ls-files would list only that folder
+    for (const rel of (await git(top, ["diff", "--name-only", "-z"])).split("\0").filter(Boolean)) {
+      const file = ofProject(rel);
+      if (!file) continue;
+      const text = await stagedText(top, rel).catch(() => undefined);
+      if (text === undefined) continue;
+      texts ??= {};
+      texts[file] = text;
+    }
+    const absent = (await git(top, ["ls-files", "--others", "--exclude-standard", "-z"])).split("\0").filter(Boolean).map(ofProject).filter((f): f is string => !!f);
+    let answer = await ctx.ask(files, texts, absent.length ? absent : undefined).catch(() => null);
+    if (!answer) answer = await offline(root, files, ctx.registry, texts, absent);
     if (!answer || answer.disabled || !answer.findings.length) return 0;
     ctx.out(`Quack's pre-commit check found ${answer.findings.length} in the Luau files of this commit:`);
     for (const f of answer.findings) ctx.out(`  ${f.file}:${f.line}:${f.column}  ${f.rule}  ${f.message}`);
@@ -167,10 +200,10 @@ export async function runPrecommit(ctx: PrecommitContext): Promise<number> {
 }
 
 /** With no hub: the setting from its file, and one analysis in this process */
-async function offline(root: string, files: string[], registryFile: string) {
+async function offline(root: string, files: string[], registryFile: string, texts?: Record<string, string>, absent: string[] = []) {
   const places = loadRegistry(registryFile).places;
-  const placeId = Object.entries(places).find(([, p]) => real(p.folder).toLowerCase() === real(root).toLowerCase())?.[0];
+  const placeId = Object.entries(places).find(([, p]) => fileKey(real(p.folder)) === fileKey(real(root)))?.[0];
   if (!autoEnabled(readAutoSettings(flavorFile(registryFile, "automation")), "precommit", placeId)) return { disabled: true, findings: [] };
-  const answer = await new ResidentAnalysis().run({ root, files, placeFolders: Object.values(places).map((p) => p.folder) });
+  const answer = await new ResidentAnalysis().run({ root, files, placeFolders: Object.values(places).map((p) => p.folder), ...(texts ? { texts } : {}), ...(absent.length ? { absent } : {}) });
   return { findings: answer.findings.map((f) => ({ ...f, file: path.relative(root, f.file).replace(/\\/g, "/") })) };
 }

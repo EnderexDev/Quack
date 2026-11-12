@@ -1179,7 +1179,7 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
         cwd: ctx.cwd,
         out: ctx.err,
         registry: ctx.info.registry,
-        ask: (files) => client.post("/api/analyze", { files, feature: "precommit" }, 60_000).catch(() => null),
+        ask: (files, texts, absent) => client.post("/api/analyze", { files, feature: "precommit", ...(texts ? { texts } : {}), ...(absent ? { absent } : {}) }, 60_000).catch(() => null),
       });
     case "analyze":
       return runAnalyze({

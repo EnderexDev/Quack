@@ -6,6 +6,11 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.32] - 2026-11-12
+
+### Fixed
+- The pre-commit check reads the game as the commit holds it: a script edited again after `git add`, staged in part (`git add -p`) or deleted after it is checked as staged, the scripts it depends on are read the same way, and untracked scripts are left out. Before, the check read the disk, so a staged error fixed only on disk went through, and an error only on disk (or a module renamed on disk only) stopped a clean commit.
+
 ## [1.0.31] - 2026-11-12
 
 ### Added
@@ -361,7 +366,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.31...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.32...HEAD
+[1.0.32]: https://github.com/EnderexDev/Quack/compare/v1.0.31...v1.0.32
 [1.0.31]: https://github.com/EnderexDev/Quack/compare/v1.0.30...v1.0.31
 [1.0.30]: https://github.com/EnderexDev/Quack/compare/v1.0.29...v1.0.30
 [1.0.29]: https://github.com/EnderexDev/Quack/compare/v1.0.28...v1.0.29

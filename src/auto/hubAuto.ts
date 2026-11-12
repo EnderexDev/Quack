@@ -152,8 +152,10 @@ export class HubAutomation {
   private readonly worktreePlaces = new Map<string, { placeId: string | undefined; at: number }>();
 
   /** The review an AI client's hook (or the pre-commit check) asks for, on files of one project */
-  async review(files: string[], feature: "review" | "precommit"): Promise<ReviewAnswer> {
-    const scripts = files.map((f) => path.resolve(f)).filter((f) => /\.luau?$/i.test(f) && fs.existsSync(f));
+  async review(files: string[], feature: "review" | "precommit", texts?: Record<string, string>, absent?: string[]): Promise<ReviewAnswer> {
+    // a file given with its text (the commit's copy) counts even when the disk no longer has it
+    const given = new Set(Object.keys(texts ?? {}).map((f) => fileKey(f)));
+    const scripts = files.map((f) => path.resolve(f)).filter((f) => /\.luau?$/i.test(f) && (fs.existsSync(f) || given.has(fileKey(f))));
     // one edit may touch several projects (a patch over two games): each is reviewed on its own
     const byRoot = new Map<string, string[]>();
     for (const f of scripts) {
@@ -170,7 +172,17 @@ export class HubAutomation {
       if (!out.root) Object.assign(out, { root, ...(placeId ? { placeId } : {}) });
       if (!this.enabled(feature, placeId)) continue;
       ran = true;
-      const answer = await this.options.service.run({ root, files: mine, placeFolders: Object.values(this.options.places()).map((p) => p.folder) });
+      // this project's texts and absent files (a dependency the commit holds otherwise than the disk)
+      const inRoot = (f: string) => fileKey(projectRoot(f) ?? "") === fileKey(root);
+      const ownTexts = texts ? Object.fromEntries(Object.entries(texts).filter(([f]) => inRoot(f))) : undefined;
+      const ownAbsent = absent?.filter(inRoot);
+      const answer = await this.options.service.run({
+        root,
+        files: mine,
+        placeFolders: Object.values(this.options.places()).map((p) => p.folder),
+        ...(ownTexts ? { texts: ownTexts } : {}),
+        ...(ownAbsent?.length ? { absent: ownAbsent } : {}),
+      });
       // from its own project; with several, the whole path says which project
       const rel = (f: Finding) => (several ? { ...this.relative(root, f), file: f.file.replace(/\\/g, "/") } : this.relative(root, f));
       out.findings.push(...answer.findings.map(rel));
