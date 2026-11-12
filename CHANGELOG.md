@@ -6,6 +6,11 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.33] - 2026-11-12
+
+### Fixed
+- The app no longer uses CPU while it sits in the tray. Its window, hidden or without focus, kept using about 0.7 of a CPU core (measured 12/11/26): the green dot pulsed with an animation that redrew the page every frame, and the log, merges, analysis and queue views kept asking the hub every one or two seconds. The dot's pulse is now cheap to draw and stops while the window has no focus, and those views stop asking while the window is hidden or minimized, then refresh once when it shows again.
+
 ## [1.0.32] - 2026-11-12
 
 ### Fixed
@@ -366,7 +371,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.32...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.33...HEAD
+[1.0.33]: https://github.com/EnderexDev/Quack/compare/v1.0.32...v1.0.33
 [1.0.32]: https://github.com/EnderexDev/Quack/compare/v1.0.31...v1.0.32
 [1.0.31]: https://github.com/EnderexDev/Quack/compare/v1.0.30...v1.0.31
 [1.0.30]: https://github.com/EnderexDev/Quack/compare/v1.0.29...v1.0.30

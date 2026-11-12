@@ -2,6 +2,7 @@
 // on the right, plus the conflict view and settings.
 import { api, h, invoke, listen, nameOf, shortPath, start, toast } from "./common.js";
 import { applyStatic, duration, getLanguage, t, tn } from "./i18n.js";
+import { every } from "./idle.js";
 
 const LOG_LINES_KEPT = 3000;
 const LOG_POLL_MS = 1000;
@@ -124,9 +125,9 @@ function appendLog(lines, reset) {
   if (atBottom || reset) box.scrollTop = box.scrollHeight;
 }
 
-setInterval(() => {
+every(LOG_POLL_MS, () => {
   if (ui.hub.online && ui.placeId && (ui.view === "output" || ui.view === "playtest")) readLog(ui.placeId);
-}, LOG_POLL_MS);
+});
 
 // ---------- Sidebar and header ----------
 
@@ -282,9 +283,9 @@ function stats(place) {
 
 /** Stops what the current content view runs in the background, and outdates its pending work */
 function stopContent() {
-  clearInterval(mergesTimer);
-  clearInterval(queueTimer);
-  clearInterval(analysisTimer);
+  mergesTimer?.stop();
+  queueTimer?.stop();
+  analysisTimer?.stop();
   generation++;
 }
 
@@ -516,7 +517,7 @@ async function renderMerges(target) {
   };
   await fill();
   // Left before the first answer came: no timer for a view that is gone
-  if (mine === generation) mergesTimer = setInterval(fill, MERGES_POLL_MS);
+  if (mine === generation) mergesTimer = every(MERGES_POLL_MS, fill);
 }
 
 // ---------- Analysis: the findings panel, the production errors, what runs on its own ----------
@@ -646,7 +647,7 @@ async function renderAnalysis(target) {
   if (mine !== generation) return;
   if (view) own.append(...autoRows(view, placeId), h("p", { class: "note" }, t("autoPlaceNote")));
   await fill();
-  if (mine === generation) analysisTimer = setInterval(fill, ANALYSIS_POLL_MS);
+  if (mine === generation) analysisTimer = every(ANALYSIS_POLL_MS, fill);
 }
 
 // ---------- Queue ----------
@@ -762,7 +763,7 @@ async function renderQueue(target) {
     body.replaceChildren(h("div", { class: "cards" }, h("div", { style: "display:flex;flex-direction:column;gap:16px" }, studio, waiting), h("div", { style: "display:flex;flex-direction:column;gap:16px" }, jobs, today)));
   };
   await fill();
-  if (mine === generation) queueTimer = setInterval(fill, QUEUE_POLL_MS);
+  if (mine === generation) queueTimer = every(QUEUE_POLL_MS, fill);
 }
 
 function renderFolder(target) {

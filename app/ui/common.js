@@ -1,9 +1,33 @@
 // What both windows share: the calls to the app (which relays to the hub), the hub state
 // stream, settings, and small DOM helpers.
 import { setLanguage } from "./i18n.js";
+import { onIdleChange, setWindowState } from "./idle.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
+
+// The window's focus and visibility drive idle.js: body.idle pauses the CSS animations, and the
+// pollers sleep while the window is hidden or minimized. A window covered by another stays
+// "visible" to the page (visibilitychange never fires), so this reads the window itself.
+const win = window.__TAURI__.window.getCurrentWindow();
+async function readWindow(focused) {
+  try {
+    const [f, visible, minimized] = await Promise.all([focused ?? win.isFocused(), win.isVisible(), win.isMinimized()]);
+    setWindowState({ focused: f, shown: visible && !minimized });
+  } catch {
+    // the window is closing
+  }
+}
+onIdleChange((idle) => document.body.classList.toggle("idle", idle));
+document.body.classList.add("idle");
+await win.onFocusChanged(({ payload }) => {
+  readWindow(payload);
+  // A hide or minimize right after the blur may not show yet in the first read
+  setTimeout(() => readWindow(), 400);
+});
+// Minimized without a focus change (Win+D over another app) arrives as a resize
+await win.onResized(() => readWindow());
+await readWindow();
 
 export const api = {
   get: (path) => invoke("hub_get", { path }),

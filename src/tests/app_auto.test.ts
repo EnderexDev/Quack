@@ -32,7 +32,7 @@ test("app: each game has an Analysis tab with the findings panel, the new produc
   assert.match(main, /automationCard\(automation\)/);
   assert.match(main, /autoRows\(view, placeId\)/);
   // its poll stops with the view
-  assert.match(main.slice(main.indexOf("function stopContent()"), main.indexOf("function stopContent()") + 200), /clearInterval\(analysisTimer\)/);
+  assert.match(main.slice(main.indexOf("function stopContent()"), main.indexOf("function stopContent()") + 200), /analysisTimer\?\.stop\(\)/);
   // a folder connected before the review hook existed needs connecting again
   assert.match(main, /c\.reviewed === false/);
 });
