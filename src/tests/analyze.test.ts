@@ -10,7 +10,8 @@ import { projectRoot, runAnalyze, type LivePlay } from "../analyze/command.js";
 import { parseLuau } from "../analyze/luau/parser.js";
 import { ANALYTICS_OPS } from "../cloud/analytics.js";
 import { buttonsCode, errorPlace, installCode, nodeForPath, probeErrorLine, probeErrors, readCode, removeCode, requireCode, signature, type CollectedError } from "../analyze/probe.js";
-import { loadTree } from "../analyze/tree.js";
+import { fileKey, loadTree, treeFromSourcemap } from "../analyze/tree.js";
+import { sourcemapFromProject, treeFromProject } from "../analyze/project.js";
 import { ROBLOX_MEMBERS } from "../analyze/robloxMembers.js";
 
 // The bugs these come from are real ones of Anime Astral (the council's set C, 10/11/26): a
@@ -746,6 +747,90 @@ test("errors: the live game's top error hashes come with their counts, messages 
   assert.match(details[0], /universe-performance-raqi\/v1\/events\/logging\/universe\/42\/log-details\?messageHashIds=1000&messageHashIds=1001/);
   assert.match(details[0], /startTime=2026-11-08T00:00:00Z&endTime=2026-11-11T12:00:00Z/);
   await assert.rejects(ANALYTICS_OPS["errors.list"].run({ env, approve: async () => true } as any, { universeId: "42", days: 31 }), /days must be/);
+});
+
+test("analyze: a Rojo project's tree comes from its project file: a child its folders lack is reported; a $path not on disk, a node Rojo may fill, a binary model, a package's own project and a Version.txt are not", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "quack-rojo-"));
+  const write = (rel: string, text: string) => {
+    fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+    fs.writeFileSync(path.join(root, rel), text);
+  };
+  write("default.project.json", JSON.stringify({
+    name: "Game",
+    tree: {
+      $className: "DataModel",
+      ReplicatedStorage: { Shared: { $path: "src/shared" }, Packages: { $path: "Packages" }, Lib: { $path: "lib" } },
+      ServerScriptService: { $path: "src/server" },
+      Workspace: { Map: { $path: "assets/Map.rbxm" } },
+    },
+  }));
+  write("src/shared/Config/Fall.luau", "return {}\n");
+  write("src/shared/Version.txt", "1.0\n");
+  // a package's own project: its folder is src's contents
+  write("lib/default.project.json", JSON.stringify({ name: "lib", tree: { $path: "src" } }));
+  write("lib/src/init.luau", "local Util = require(script.Util)\nreturn Util\n");
+  write("lib/src/Util.luau", "return {}\n");
+  write("assets/Map.rbxm", "binary");
+  write("src/server/Main.server.luau", `local RS = game:GetService("ReplicatedStorage")
+local Fall = require(RS.Shared.Config.Fall)
+local Typo = require(RS.Shared.Config.Fal)
+local Version = RS.Shared.Version.Value
+local Signal = require(RS.Packages.Signal)
+local Lib = require(RS.Lib)
+local Spawn = workspace.Map.Spawn
+local Made = RS:WaitForChild("MadeByAPackage")
+local parent = script.parent.Main
+`);
+  const tree = await treeFromProject(root);
+  assert.ok(tree, "the project file gives a tree");
+  assert.equal(tree!.byFile.get(fileKey(path.join(root, "src/server/Main.server.luau")))?.name, "Main", "scripts carry their files");
+  const r = analyzeProject(root, { tree: tree! });
+  assert.deepEqual(r.findings.filter((f) => f.rule === "missing-child" || f.rule === "invalid-member").map((f) => `${f.line} ${f.rule} ${f.message}`), [
+    `3 missing-child ReplicatedStorage.Shared.Config has no child "Fal": .Fal errors`,
+  ]);
+  // the written sourcemap carries the open marks, and code not on disk read back from it
+  const map = await sourcemapFromProject(path.join(root, "default.project.json"));
+  assert.equal(map!._quack?.codeMissing, true);
+  assert.equal(treeFromSourcemap(map!, root).codeMissing, true, "read back from the written file");
+  const rs = map!.children!.find((c) => c.name === "ReplicatedStorage")!;
+  assert.equal(rs.children!.find((c) => c.name === "Packages")?._quack?.open, true);
+  assert.equal(rs.children!.find((c) => c.name === "Shared")?._quack?.open, undefined);
+  // the package's init script is the package node, with its file (not a Folder before it)
+  const lib = rs.children!.find((c) => c.name === "Lib")!;
+  assert.equal(lib.className, "ModuleScript");
+  assert.deepEqual(lib.filePaths, ["lib/src/init.luau"]);
+  // a project file given relative to the cwd
+  const cwd = process.cwd();
+  process.chdir(path.dirname(root));
+  try {
+    assert.ok(await sourcemapFromProject(path.join(path.basename(root), "default.project.json")));
+  } finally {
+    process.chdir(cwd);
+  }
+  // a sync folder given with the tree adds its scripts, it does not replace the tree's (lib's are read)
+  const both = analyzeProject(root, { tree: tree!, syncDir: "src" });
+  assert.ok(both.stats.scripts >= 4, `${both.stats.scripts} scripts read`);
+  // with a package not installed, a remote fired with no listener on disk may be heard there
+  write("src/server/Fire.server.luau", `local RS = game:GetService("ReplicatedStorage")\nRS.Shared.Ping:FireServer()\n`);
+  write("src/shared/Ping.model.json", JSON.stringify({ className: "RemoteEvent" }));
+  const missing = analyzeProject(root, { tree: (await treeFromProject(root))! });
+  assert.deepEqual(missing.findings.filter((f) => f.rule.startsWith("remote-")), []);
+  // the Map.rbxm may hold the listener too: only with no binary model is the dead send reported
+  fs.mkdirSync(path.join(root, "Packages"));
+  const withModel = await treeFromProject(root);
+  assert.equal(withModel!.codeMissing, true, "a binary model is code the reader does not see");
+  assert.deepEqual(analyzeProject(root, { tree: withModel! }).findings.filter((f) => f.rule.startsWith("remote-")), []);
+  fs.rmSync(path.join(root, "assets"), { recursive: true });
+  // a script whose source sits inside a .model.json has no file the analyzer reads
+  write("src/shared/Embedded.model.json", JSON.stringify({ className: "ModuleScript", properties: { Source: "return {}" } }));
+  assert.equal((await treeFromProject(root))!.codeMissing, true);
+  fs.rmSync(path.join(root, "src/shared/Embedded.model.json"));
+  write("default.project.json", JSON.stringify({
+    name: "Game",
+    tree: { $className: "DataModel", ReplicatedStorage: { Shared: { $path: "src/shared" }, Packages: { $path: "Packages" }, Lib: { $path: "lib" } }, ServerScriptService: { $path: "src/server" } },
+  }));
+  const installed = analyzeProject(root, { tree: (await treeFromProject(root))! });
+  assert.deepEqual(installed.findings.filter((f) => f.rule.startsWith("remote-")).map((f) => f.rule), ["remote-no-listener"]);
 });
 
 test("analyze: a path that climbs into a Starter container, a type, or a vendored package is not reported", () => {

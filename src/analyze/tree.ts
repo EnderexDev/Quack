@@ -14,6 +14,8 @@ export interface TreeNode {
   children: TreeNode[];
   /** Absolute path of the script's file */
   file?: string;
+  /** Its children are not all known (a project node Rojo lets keep unknown instances, a $path not on disk, a binary model) */
+  open?: boolean;
 }
 
 export interface GameTree {
@@ -24,6 +26,8 @@ export interface GameTree {
   byFile: Map<string, TreeNode>;
   /** The sourcemap read, when there was one */
   sourcemap?: string;
+  /** Code the project names is not on disk (a package not installed): what fires or listens there is unseen */
+  codeMissing?: boolean;
 }
 
 /** Windows paths compare without case */
@@ -38,17 +42,20 @@ export function childNamed(node: TreeNode, name: string): TreeNode | undefined {
 
 export const isScript = (node: TreeNode) => node.className === "ModuleScript" || node.className === "Script" || node.className === "LocalScript";
 
-interface SourcemapNode {
+export interface SourcemapNode {
   name: string;
   className: string;
   filePaths?: string[];
   children?: SourcemapNode[];
+  /** Quack's mark on a node whose children are not all known (a sourcemap built from a project file) */
+  _quack?: { open?: boolean; codeMissing?: boolean };
 }
 
 export function treeFromSourcemap(json: SourcemapNode, root: string): GameTree {
   const byFile = new Map<string, TreeNode>();
   const build = (n: SourcemapNode, parent?: TreeNode): TreeNode => {
     const node: TreeNode = { name: n.name, className: n.className, parent, children: [] };
+    if (n._quack?.open === true) node.open = true;
     const script = n.filePaths?.find((f) => /\.luau?$/i.test(f));
     if (script) {
       node.file = path.resolve(root, script);
@@ -57,7 +64,8 @@ export function treeFromSourcemap(json: SourcemapNode, root: string): GameTree {
     for (const c of n.children ?? []) node.children.push(build(c, node));
     return node;
   };
-  return { root: build(json), complete: true, byFile };
+  // `quack sourcemap` marks a project whose code is not all on disk (a package not installed, a binary model)
+  return { root: build(json), complete: true, byFile, ...(json._quack?.codeMissing === true ? { codeMissing: true } : {}) };
 }
 
 const SCRIPT_FILE = /^(.*?)(\.server|\.client)?\.luau?$/i;

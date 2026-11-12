@@ -18,6 +18,8 @@ import { BADGE_COST } from "../cloud/economy.js";
 import { lintTranslations, LOC_TABLE_MAX } from "../cloud/localization.js";
 import { ANALYTICS_KINDS, defaultAnalyticsBody } from "../cloud/analytics.js";
 import { projectRoot, runAnalyze } from "../analyze/command.js";
+import { projectFileOf, sourcemapFromProject } from "../analyze/project.js";
+import type { SourcemapNode } from "../analyze/tree.js";
 import { buttonsCode, errorPlace, installCode, nodeForPath, probeErrorLine, probeErrors, readCode, removeCode, requireCode, signature, type CollectedError } from "../analyze/probe.js";
 import { loadTree } from "../analyze/tree.js";
 
@@ -617,9 +619,18 @@ See
                             wrong argument count...), and what only Quack knows (the tree, which
                             module each require reaches): a module member that is not there
                             (X:Removed()), a child the tree lacks (:WaitForChild("Typo")).
-                            "-- quack: allow(rule)" silences one. Reads only the disk: no hub,
-                            no Studio. Files: only those reported (the whole place is still
-                            read). Exit 1 when it finds something
+                            "-- quack: allow(rule)" silences one. Needs no Studio: it reads the
+                            disk, a worktree borrows its checkout's sourcemap through the hub,
+                            and a play already running (never one it starts) gives the keys of
+                            modules the text cannot tell. Files: only those reported (the whole
+                            place is still read). Exit 1 when it finds something. In a Rojo
+                            project (a project file, no sync folder) the tree comes from the
+                            project file
+  sourcemap [folder] [--out <file>]   A Rojo project's sourcemap.json from its project file, by
+                            Quack's own reader (no rojo binary): the scripts' files, and the
+                            nodes whose children the disk does not say all marked _quack.open
+                            (a $path not there, a binary model, a node Rojo lets keep unknown
+                            instances). A folder Quack syncs already has one: Studio's tree
 
 Wait
   wait [place]              Until Studio is connected and nothing has synced for a while
@@ -1155,6 +1166,8 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
       return mouse(ctx, options, args);
     case "verify":
       return verifySync(ctx, options, args[0]);
+    case "sourcemap":
+      return sourcemapCommand(ctx, options, args[0]);
     case "analyze":
       return runAnalyze({
         cwd: ctx.cwd,
@@ -2978,6 +2991,43 @@ async function analyticsCommand(ctx: ControlContext, options: Options, args: str
     ctx.out(`${kind} of universe ${universeId}${body === undefined ? ` (default: ${(defaultAnalyticsBody(Date.now()) as any).metric}, the last 3 days)` : ""}:`);
     ctx.out(JSON.stringify(r.result, null, 2));
   }
+  return EXIT.ok;
+}
+
+/** sourcemap: a Rojo project's tree written as sourcemap.json, from its project file */
+async function sourcemapCommand(ctx: ControlContext, options: Options, folder: string | undefined): Promise<number> {
+  const root = path.resolve(ctx.cwd, folder ?? ".");
+  const file = projectFileOf(root);
+  if (!file) throw new UsageError(`no default.project.json (or single *.project.json) in ${root}`);
+  // a sourcemap.json Quack (or Azul) wrote is Studio's tree, every instance included: never written over
+  // without --out. Rojo's own, or one this command wrote, is the project file's tree and is made again
+  const existing = path.join(root, "sourcemap.json");
+  if (options.out === undefined && fs.existsSync(existing)) {
+    let studios = true;
+    try {
+      const json = JSON.parse(fs.readFileSync(existing, "utf8"));
+      studios = !!(json?._quack?.placeId ?? json?._azul?.placeId) || fs.existsSync(path.join(root, "sync"));
+    } catch {
+      // unreadable: not ours to throw away
+    }
+    if (studios) throw new UsageError(`${existing} is Studio's tree (written by Quack's daemon), or one this command cannot read. Give --out to write the project file's tree elsewhere`);
+  }
+  const map = await sourcemapFromProject(file);
+  if (!map) throw new Error(`${path.basename(file)} has no DataModel at its root, or does not parse`);
+  const out = path.resolve(ctx.cwd, options.out ?? path.join(root, "sourcemap.json"));
+  fs.writeFileSync(out, JSON.stringify(map));
+  let nodes = 0;
+  let scripts = 0;
+  let open = 0;
+  const count = (n: SourcemapNode) => {
+    nodes++;
+    if (n.filePaths?.length) scripts++;
+    if (n._quack?.open) open++;
+    n.children?.forEach(count);
+  };
+  count(map);
+  if (options.json) ctx.out(JSON.stringify({ file: out, project: file, nodes, scripts, open }));
+  else ctx.out(`Wrote ${out}: ${nodes} instances, ${scripts} scripts, ${open} with children the disk does not say all, from ${path.basename(file)}.`);
   return EXIT.ok;
 }
 

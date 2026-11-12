@@ -43,6 +43,8 @@ export interface AnalyzeOptions {
   files?: string[];
   syncDir?: string;
   sourcemap?: string;
+  /** The place's tree already built (from a project file: project.ts); its scripts are the ones read when no syncDir is given */
+  tree?: GameTree;
 }
 
 export interface AnalyzeReport {
@@ -228,8 +230,11 @@ const SERVER_REQUIRABLE = new Set(["ReplicatedStorage", "ReplicatedFirst", "Serv
 export function loadProject(root: string, options: AnalyzeOptions = {}): Project {
   const t0 = Date.now();
   const syncDir = path.resolve(root, options.syncDir ?? "sync");
-  const tree = loadTree(root, syncDir, path.resolve(root, options.sourcemap ?? "sourcemap.json"));
-  const files = listScripts(syncDir);
+  const tree = options.tree ?? loadTree(root, syncDir, path.resolve(root, options.sourcemap ?? "sourcemap.json"));
+  // a project's tree names its scripts (they may sit in several folders: lib, Packages), and a sync folder given adds its own
+  const files = options.tree
+    ? [...new Set([...[...tree.byFile.values()].map((n) => n.file!), ...(options.syncDir ? listScripts(syncDir) : [])].map((f) => path.resolve(f)))].filter((f) => fs.existsSync(f))
+    : listScripts(syncDir);
   const scripts = files.map((file) => readScript(file, tree));
   const byFile = new Map(scripts.map((s) => [fileKey(s.file), s]));
 
@@ -812,8 +817,10 @@ export function loadProject(root: string, options: AnalyzeOptions = {}): Project
       for (const b of s.bound.values()) if (b?.module) keysOf(b.module);
       memberUses += checkMembers(s, keysNow, writtenFrom, add);
       loaderCalls += checkLoaderNames(s, isLoader, folderOf, add);
-      for (const f of remotes.findings.get(s) ?? []) add(f.at, f.rule, f.message);
-      for (const f of channels.findings.get(s) ?? []) add(f.at, f.rule, f.message);
+      // code the project names is not on disk (a package not installed): a sender or listener may be there
+      const unseen = (f: { rule: string }) => tree.codeMissing && (f.rule === "remote-no-listener" || f.rule === "remote-no-sender");
+      for (const f of remotes.findings.get(s) ?? []) if (!unseen(f)) add(f.at, f.rule, f.message);
+      for (const f of channels.findings.get(s) ?? []) if (!unseen(f)) add(f.at, f.rule, f.message);
       for (const f of playerData.findings.get(s) ?? []) add(f.at, f.rule, f.message);
       if (tree.complete && !VENDORED.test(s.file)) instancePaths += checkPaths(s, tree, madeNames, add);
       for (const f of lintChunk(s.chunk!, { globals: TEST_FILE.test(s.file) ? TESTEZ_GLOBALS : undefined })) add(f.at, f.rule, f.message);
@@ -1578,14 +1585,16 @@ function uniquePath(node: TreeNode): boolean {
 
 /** The members of the node's class, when the class is known and the node is surely the one the path reaches */
 function membersOf(node: TreeNode): Set<string> | null {
-  return uniquePath(node) ? classMembers(node.className) : null;
+  // a node whose class the project only guessed (a binary model, a folder Rojo may fill) is checked by nothing
+  return uniquePath(node) && !node.open ? classMembers(node.className) : null;
 }
 
 /** Follows the segments through the tree: the node reached, or the first child that is not there */
 function walk(start: TreeNode, segs: Segment[]): Walked {
   let node = start;
   for (const seg of segs) {
-    if (seg.kind === "dot" && seg.name === "Parent") {
+    // `parent` is the engine's old name for Parent, and still runs
+    if (seg.kind === "dot" && (seg.name === "Parent" || seg.name === "parent")) {
       const up = node.parent;
       if (!up || up.className === "DataModel" || STARTERS.has(up.className) || STARTERS.has(up.name)) return {};
       // a Script or LocalScript where it does not run is a template cloned elsewhere: its parent then is another
@@ -1601,6 +1610,8 @@ function walk(start: TreeNode, segs: Segment[]): Walked {
     }
     if (seg.kind === "find") return {};
     if (seg.kind === "wait" && seg.timeout) return {};
+    // its children are not all known (a project node Rojo lets keep unknown instances, Packages not installed)
+    if (node.open) return {};
     if (seg.kind === "dot" || seg.kind === "index") {
       // `part.Size`: a property, an event or a method of its class; what follows is no instance of the tree
       const members = membersOf(node);
@@ -1688,7 +1699,7 @@ function reach(start: TreeNode, segs: Segment[]): { node: TreeNode; used: number
   let node = start;
   for (let i = 0; i < segs.length; i++) {
     const seg = segs[i];
-    if (seg.kind === "dot" && seg.name === "Parent") {
+    if (seg.kind === "dot" && (seg.name === "Parent" || seg.name === "parent")) {
       const up = node.parent;
       if (!up || up.className === "DataModel" || STARTERS.has(up.className) || STARTERS.has(up.name)) return null;
       if ((node.className === "Script" || node.className === "LocalScript") && !runsWhereItIs(node)) return null;

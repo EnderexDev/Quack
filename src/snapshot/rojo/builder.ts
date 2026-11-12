@@ -46,6 +46,12 @@ export interface RojoSnapshotOptions {
   projectFile?: string;
   cwd?: string;
   destPrefix?: string[];
+  /**
+   * Read the place's tree, not instances to send: remember each script's file, and mark the
+   * nodes whose children the disk does not say all (a `$path` that is not there, a binary model
+   * the builder does not read, a node Rojo lets keep unknown instances) instead of failing
+   */
+  tree?: boolean;
 }
 
 export interface LooseBuildOptions {
@@ -71,6 +77,13 @@ export class RojoSnapshotBuilder {
   private declaredIds: Map<string, Set<string>> = new Map();
   private destPrefix: string[];
   private ignoreMatchers: RegExp[] = [];
+  private treeMode: boolean;
+  /** Tree mode: the file each script instance was read from */
+  public readonly files = new Map<InstanceData, string>();
+  /** Tree mode: the paths (joined by "/") of nodes whose children the disk does not say all */
+  public readonly openPaths = new Set<string>();
+  /** Tree mode: `$path` targets not on disk (packages not installed) and binary models not read: code the reader never sees */
+  public missingTargets = 0;
 
   constructor(options: RojoSnapshotOptions = {}) {
     this.cwd = path.resolve(options.cwd ?? process.cwd());
@@ -79,6 +92,15 @@ export class RojoSnapshotBuilder {
       options.projectFile ?? "default.project.json",
     );
     this.destPrefix = options.destPrefix ?? [];
+    this.treeMode = options.tree === true;
+  }
+
+  private noteFile(instance: InstanceData, absPath: string): void {
+    if (this.treeMode) this.files.set(instance, absPath);
+  }
+
+  private noteOpen(pathSegments: string[]): void {
+    if (this.treeMode) this.openPaths.add(pathSegments.join("/"));
   }
 
   /**
@@ -198,13 +220,15 @@ export class RojoSnapshotBuilder {
 
         this.ensureFolder(destPath.slice(0, -1), results);
         this.moduleContainers.add(destPath.join("/"));
-        results.push({
+        const rootScript: InstanceData = {
           guid: this.makeGuid(),
           className,
           name: destPath[destPath.length - 1],
           path: destPath,
           source,
-        });
+        };
+        this.noteFile(rootScript, absRoot);
+        results.push(rootScript);
       } else {
         await this.walkDirectory(
           absRoot,
@@ -243,9 +267,11 @@ export class RojoSnapshotBuilder {
       log.debug(`- ${instance.path.join("/")} (${instance.className})`);
     }
 
-    log.success(
-      `Rojo compatibility build produced ${results.length} instances`,
-    );
+    if (!this.treeMode) {
+      log.success(
+        `Rojo compatibility build produced ${results.length} instances`,
+      );
+    }
     return results;
   }
 
@@ -375,14 +401,18 @@ export class RojoSnapshotBuilder {
     this.recordDeclaredId(node, currentPath);
 
     const pathHint = node.$path || node.path;
+    // tree mode: a target not on disk, or a file kind not read, leaves this node with unknown contents
+    let unread = false;
     if (typeof pathHint === "string") {
       const absPath = path.resolve(baseDir, pathHint);
       const exists = await this.exists(absPath);
       if (!exists) {
-        throw new Error(`$path target ${absPath} does not exist.`);
+        if (!this.treeMode) throw new Error(`$path target ${absPath} does not exist.`);
+        unread = true;
+        this.missingTargets++;
       }
 
-      const kind = await this.pathKind(absPath);
+      const kind = unread ? null : await this.pathKind(absPath);
       if (kind === "file") {
         const fileName = path.basename(absPath);
         if (isInstanceJsonName(fileName)) {
@@ -395,28 +425,35 @@ export class RojoSnapshotBuilder {
         } else if (this.isJsonModuleFile(fileName)) {
           const source = await this.readJsonModuleSource(absPath);
           this.moduleContainers.add(currentPath.join("/"));
-          results.push({
+          const module: InstanceData = {
             guid: this.makeGuid(),
             className: "ModuleScript",
             name,
             path: [...currentPath],
             source,
-          });
+          };
+          this.noteFile(module, absPath);
+          results.push(module);
           return;
         } else if (isScriptFileName(fileName)) {
           const { className } = classifyScriptFileName(fileName);
           const source = await fs.readFile(absPath, "utf-8");
           this.moduleContainers.add(currentPath.join("/"));
-          results.push({
+          const script: InstanceData = {
             guid: this.makeGuid(),
             className,
             name,
             path: [...currentPath],
             source,
-          });
+          };
+          this.noteFile(script, absPath);
+          results.push(script);
           return;
-        } else {
+        } else if (!this.treeMode) {
           throw new Error(`Unsupported $path file type: ${absPath}`);
+        } else {
+          unread = true;
+          this.missingTargets++;
         }
       } else if (kind === "dir") {
         await this.walkDirectory(absPath, currentPath, results, new Set());
@@ -470,6 +507,7 @@ export class RojoSnapshotBuilder {
 
     this.moduleContainers.add(currentPath.join("/"));
     results.push(instance);
+    if (unread) this.noteOpen(currentPath);
 
     const rawChildren = node.Children || node.children || node.$children;
     if (Array.isArray(rawChildren)) {
@@ -528,15 +566,24 @@ export class RojoSnapshotBuilder {
       fileName: string;
       source: string;
       className?: ScriptClassName;
+      /** The file it was read from */
+      file?: string;
     } | null = null;
     let initModelFile: string | null = null;
+
+    // Rojo keeps instances it does not know under a node with no $path (ignoreUnknownInstances
+    // defaults to true there, false under a $path), and a $path not on disk says nothing of its contents
+    const ignoreUnknown = typeof node.$ignoreUnknownInstances === "boolean" ? node.$ignoreUnknownInstances : !absPath;
+    if (ignoreUnknown || (absPath && pathKind === null)) this.noteOpen(pathSegments);
+    if (absPath && pathKind === null) this.missingTargets++;
 
     if (absPath && pathKind === "dir") {
       const modelPath = path.join(absPath, "init.model.json");
       if (await this.exists(modelPath)) {
         initModelFile = modelPath;
       }
-      initScript = await this.findInit(absPath);
+      const found = await this.findInit(absPath);
+      initScript = found ? { ...found, file: path.join(absPath, found.fileName) } : null;
     } else if (absPath && pathKind === "file") {
       const fileName = path.basename(absPath);
       if (isInstanceJsonName(fileName)) {
@@ -592,13 +639,16 @@ export class RojoSnapshotBuilder {
         return;
       } else if (this.isJsonModuleFile(fileName)) {
         const source = await this.readJsonModuleSource(absPath);
-        initScript = { fileName, source, className: "ModuleScript" };
+        initScript = { fileName, source, className: "ModuleScript", file: absPath };
+      } else if (!isScriptFileName(fileName)) {
+        // a binary model (.rbxm), in tree mode: an instance whose contents are not read
+        if (!this.treeMode) throw new Error(`$path target ${absPath} is not a .lua/.luau file.`);
+        this.noteOpen(pathSegments);
+        // a binary model may hold scripts the reader does not see
+        this.missingTargets++;
       } else {
-        if (!isScriptFileName(fileName)) {
-          throw new Error(`$path target ${absPath} is not a .lua/.luau file.`);
-        }
         const source = await fs.readFile(absPath, "utf-8");
-        initScript = { fileName, source };
+        initScript = { fileName, source, file: absPath };
       }
     }
 
@@ -650,6 +700,7 @@ export class RojoSnapshotBuilder {
             classifyScriptFileName(initScript.fileName).className;
           rootInstance.className = scriptClass;
           rootInstance.source = initScript.source;
+          if (initScript.file) this.noteFile(rootInstance, initScript.file);
         }
 
         results.push(...modelInstances);
@@ -671,6 +722,7 @@ export class RojoSnapshotBuilder {
         source: initScript.source,
       };
       this.applyNodeOverrides(node, instance);
+      if (initScript.file) this.noteFile(instance, initScript.file);
       results.push(instance);
     }
     // If no special file (model or script) was found, emit a standard instance.
@@ -765,6 +817,7 @@ export class RojoSnapshotBuilder {
             );
             rootInstance.className = scriptClass;
             rootInstance.source = source;
+            this.noteFile(rootInstance, path.join(dirPath, initEntry.name));
           }
           results.push(...modelInstances);
         }
@@ -779,13 +832,15 @@ export class RojoSnapshotBuilder {
           path.join(dirPath, initEntry.name),
           "utf-8",
         );
-        results.push({
+        const initInstance: InstanceData = {
           guid: this.makeGuid(),
           className: scriptClass,
           name: destPath[destPath.length - 1] ?? path.basename(dirPath),
           path: [...destPath],
           source,
-        });
+        };
+        this.noteFile(initInstance, path.join(dirPath, initEntry.name));
+        results.push(initInstance);
       }
     } else {
       this.ensureFolder(destPath, results);
@@ -800,7 +855,21 @@ export class RojoSnapshotBuilder {
 
       const subProject = await this.loadProjectFrom(subProjectPath);
       this.prepareIgnoreMatchers(subProject);
-      await this.walkTree(subProject.tree ?? {}, destPath, dirPath, results);
+      // a package's own project (`"tree": { "$path": "src" }`, every Wally package): this folder is that path's contents
+      const subTree = subProject.tree ?? {};
+      const subRoot = typeof subTree.$path === "string" ? path.resolve(dirPath, subTree.$path) : null;
+      if (subRoot && (await this.pathKind(subRoot)) === "dir") {
+        // the Folder this directory got above stands for the path's contents now (an init script there is the instance)
+        const folderAt = results.findIndex((i) => i.className === "Folder" && i.path.join("/") === key);
+        if (folderAt >= 0) {
+          results.splice(folderAt, 1);
+          this.emittedFolders.delete(key);
+        }
+        await this.walkDirectory(subRoot, destPath, results, new Set(Object.keys(subTree).filter((k) => !k.startsWith("$"))));
+      } else if (subRoot) {
+        this.noteOpen(destPath);
+      }
+      await this.walkTree(subTree, destPath, dirPath, results);
 
       this.projectFile = previousProjectFile;
       this.ignoreMatchers = previousIgnore;
@@ -856,6 +925,7 @@ export class RojoSnapshotBuilder {
             );
             rootInstance.className = scriptClass;
             rootInstance.source = source;
+            this.noteFile(rootInstance, path.join(dirPath, companionScript.name));
           }
           results.push(...modelInstances);
         }
@@ -898,13 +968,38 @@ export class RojoSnapshotBuilder {
         const source = await this.readJsonModuleSource(fullPath);
         this.moduleContainers.add([...destPath, baseName].join("/"));
         this.ensureFolder(destPath, results);
-        results.push({
+        const jsonModule: InstanceData = {
           guid: this.makeGuid(),
           className: "ModuleScript",
           name: baseName,
           path: [...destPath, baseName],
           source,
-        });
+        };
+        this.noteFile(jsonModule, fullPath);
+        results.push(jsonModule);
+        continue;
+      }
+
+      // tree mode: what Rojo makes of a text or table file (`Version.txt` is a StringValue)
+      if (this.treeMode && entry.isFile() && /\.(txt|csv)$/i.test(entry.name)) {
+        const baseName = entry.name.replace(/\.(txt|csv)$/i, "");
+        if (definedChildren.has(baseName) || this.isOccupied([...destPath, baseName])) continue;
+        this.ensureFolder(destPath, results);
+        this.moduleContainers.add([...destPath, baseName].join("/"));
+        results.push({ guid: this.makeGuid(), className: /\.txt$/i.test(entry.name) ? "StringValue" : "LocalizationTable", name: baseName, path: [...destPath, baseName] });
+        continue;
+      }
+
+      // tree mode: a binary model in the folder is an instance whose contents are not read
+      if (this.treeMode && entry.isFile() && /\.rbxmx?$/i.test(entry.name)) {
+        const baseName = entry.name.replace(/\.rbxmx?$/i, "");
+        if (definedChildren.has(baseName) || this.isOccupied([...destPath, baseName])) continue;
+        this.ensureFolder(destPath, results);
+        this.moduleContainers.add([...destPath, baseName].join("/"));
+        results.push({ guid: this.makeGuid(), className: "Model", name: baseName, path: [...destPath, baseName] });
+        this.noteOpen([...destPath, baseName]);
+        // a binary model may hold scripts the reader does not see
+        this.missingTargets++;
         continue;
       }
 
@@ -933,13 +1028,15 @@ export class RojoSnapshotBuilder {
         const source = await fs.readFile(fullPath, "utf-8");
         this.moduleContainers.add([...destPath, scriptName].join("/"));
         this.ensureFolder(destPath, results);
-        results.push({
+        const script: InstanceData = {
           guid: this.makeGuid(),
           className,
           name: scriptName,
           path: [...destPath, scriptName],
           source,
-        });
+        };
+        this.noteFile(script, fullPath);
+        results.push(script);
       }
     }
   }

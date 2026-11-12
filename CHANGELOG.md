@@ -6,6 +6,15 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.30] - 2026-11-12
+
+### Added
+- `quack sourcemap [folder] [--out <file>]` writes a Rojo project's `sourcemap.json` from its project file with Quack's own reader, no rojo binary needed. Each script carries its file, and a node whose children the disk does not say all (a `$path` that is not there, such as `Packages` before `wally install`; a binary model; a node Rojo lets keep unknown instances) is marked `_quack.open`.
+- `quack analyze` works in a Rojo project (a project file, no sync folder): it reads the place's tree from the project file, so a `:WaitForChild("Typo")` under a folder of the project is reported and a lookup under a node the disk does not fully say is not.
+
+### Fixed
+- `quack build` and `quack push` in Rojo mode read a package's own project file whose root is a `$path` (every Wally package has one): the package's folder now holds its source, with its `init` script as the package itself, instead of an empty folder.
+
 ## [1.0.29] - 2026-11-11
 
 ### Changed
@@ -342,7 +351,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.29...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.30...HEAD
+[1.0.30]: https://github.com/EnderexDev/Quack/compare/v1.0.29...v1.0.30
 [1.0.29]: https://github.com/EnderexDev/Quack/compare/v1.0.28...v1.0.29
 [1.0.28]: https://github.com/EnderexDev/Quack/compare/v1.0.27...v1.0.28
 [1.0.27]: https://github.com/EnderexDev/Quack/compare/v1.0.26...v1.0.27

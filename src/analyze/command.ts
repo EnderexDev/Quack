@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { loadProject, type AnalyzeReport, type LiveCandidate, type LiveKeys } from "./analyze.js";
 import { liveKeysCode, parseLiveAnswer } from "./live.js";
+import { projectFileOf, treeFromProject } from "./project.js";
 import { fileKey } from "./tree.js";
 
 /**
@@ -34,7 +35,7 @@ export interface LivePlay {
   evalServer(placeId: string, code: string, timeoutMs: number): Promise<{ ok: boolean; values?: string[]; error?: string }>;
 }
 
-/** The folder holding sync/, walking up from `from` */
+/** The folder holding sync/, or a Rojo project file, walking up from `from` */
 export function projectRoot(from: string): string | null {
   let dir = path.resolve(from);
   try {
@@ -44,6 +45,7 @@ export function projectRoot(from: string): string | null {
   }
   for (;;) {
     if (fs.existsSync(path.join(dir, "sync")) && fs.statSync(path.join(dir, "sync")).isDirectory()) return dir;
+    if (projectFileOf(dir)) return dir;
     const up = path.dirname(dir);
     if (up === dir) return null;
     dir = up;
@@ -68,8 +70,12 @@ function resolveFile(file: string, root: string, cwd: string): string {
 export async function runAnalyze(req: AnalyzeRequest): Promise<number> {
   const start = req.root ? path.resolve(req.cwd, req.root) : req.files[0] ? path.resolve(req.cwd, req.files[0]) : req.cwd;
   const root = req.root ? path.resolve(req.cwd, req.root) : projectRoot(start);
-  if (!root || !fs.existsSync(path.join(root, "sync"))) {
-    const message = `No sync folder at or above ${start}: run it inside a synced project, or pass --path <project folder>.`;
+  const synced = !!root && fs.existsSync(path.join(root, "sync"));
+  // a Rojo project with no sync folder: its tree and its scripts come from its project file (a
+  // sourcemap.json there is Rojo's, which does not mark the nodes whose children it does not know)
+  const projectTree = root && !synced ? await treeFromProject(root) : null;
+  if (!root || (!synced && !projectTree)) {
+    const message = `No sync folder or readable project file at or above ${start}: run it inside a synced project or a Rojo project, or pass --path <project folder>.`;
     req.out(req.json ? JSON.stringify({ error: message }) : message);
     return 1;
   }
@@ -94,7 +100,7 @@ export async function runAnalyze(req: AnalyzeRequest): Promise<number> {
   if (!fs.existsSync(path.join(root, "sourcemap.json")) && req.placeFolders) {
     sourcemap = await borrowedSourcemap(root, req.placeFolders).catch(() => undefined);
   }
-  const project = loadProject(root, { files, sourcemap });
+  const project = loadProject(root, { files, sourcemap, ...(projectTree ? { tree: projectTree } : {}) });
   const live = req.live ? await liveKeys(root, project.liveCandidates(), req.live).catch((error: Error) => ({ note: `keys not read in a play: ${error.message}` })) : undefined;
   const report = project.report(live && "keys" in live ? live : undefined);
   if (live && !("keys" in live)) report.stats.live = { modules: 0, note: live.note };

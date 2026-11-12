@@ -54,6 +54,26 @@ test("RojoSnapshotBuilder builds instances from default.project.json and files",
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
+test("RojoSnapshotBuilder reads a package's own project whose root is a $path (every Wally package): the folder is that path's contents", async () => {
+  const tmp = makeTempDir();
+  const pkg = path.join(tmp, "Packages", "_Index", "signal", "signal");
+  fs.mkdirSync(path.join(pkg, "src"), { recursive: true });
+  fs.writeFileSync(path.join(pkg, "default.project.json"), JSON.stringify({ name: "signal", tree: { $path: "src" } }), "utf8");
+  fs.writeFileSync(path.join(pkg, "src", "init.luau"), "return 'signal'", "utf8");
+  fs.writeFileSync(path.join(pkg, "src", "Connection.luau"), "return {}", "utf8");
+  fs.writeFileSync(
+    path.join(tmp, "default.project.json"),
+    JSON.stringify({ name: "Game", tree: { $className: "DataModel", ReplicatedStorage: { Packages: { $path: "Packages" } } } }),
+    "utf8",
+  );
+  const instances = await new RojoSnapshotBuilder({ cwd: tmp, projectFile: "default.project.json" }).build();
+  const at = (p: string) => instances.find((i) => i.path.join("/") === `ReplicatedStorage/Packages/_Index/signal/signal${p}`);
+  assert.strictEqual(at("")?.className, "ModuleScript", "the package folder is its init script");
+  assert.strictEqual(at("")?.source, "return 'signal'");
+  assert.strictEqual(at("/Connection")?.className, "ModuleScript");
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
 test("RojoSnapshotBuilder handles init.luau in a folder as an init script", async () => {
   const tmp = makeTempDir();
   const dir = path.join(tmp, "modules", "MyModule");
