@@ -921,6 +921,7 @@ Change${info.flavor === "official" ? " (each asks first; --yes to skip, required
   resolve <id> --disk|--keep [place]   Put the saved disk version back, or keep what is there
   choose <id> continue|cancel          Answer a waiting connection
   ai [on|off|claude|codex]  The AI merge (no argument: show it; --refresh checks the CLIs again)
+  ai model [<name>|default] The merge model of the AI in use (no name: list them)
   open <place> [--wait]     Open the place in Studio; --wait until it connects
   restart-hub [--daemons]   Restart the hub (Studios stay connected); --daemons restarts the daemons too
 
@@ -967,7 +968,7 @@ export async function runControl(argv: string[], ctx: ControlContext): Promise<n
   NOTES.set(ctx, notes);
   if (options.player !== undefined) PLAYER.set(ctx, options.player);
   try {
-    const mutates = MUTATING.has(command) || (command === "ai" && args.length > 0);
+    const mutates = MUTATING.has(command) || (command === "ai" && args.length > 0 && !(args[0] === "model" && args.length === 1));
     if (mutates && ctx.info.flavor === "official") await confirmOfficial(ctx, options, `${command} ${args.join(" ")}`.trim());
     const code = await dispatch(command, args, options, ctx);
     // After the command's own answer; --json carries them in its body instead
@@ -1114,7 +1115,7 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
       return EXIT.ok;
     }
     case "ai":
-      return ai(ctx, options, args[0]);
+      return ai(ctx, options, args[0], args[1]);
     case "open":
       return options.file !== undefined ? openFile(ctx, options) : open(ctx, options, need(args[0], "open <place> | open --file <file.rbxl>"));
     case "wait":
@@ -1412,15 +1413,40 @@ async function log(ctx: ControlContext, options: Options, query: string | undefi
   }
 }
 
-async function ai(ctx: ControlContext, options: Options, choice: string | undefined): Promise<number> {
+async function ai(ctx: ControlContext, options: Options, choice: string | undefined, name: string | undefined): Promise<number> {
   let status;
   if (choice === undefined) status = await ctx.client.get("/api/ai", { refresh: options.refresh ? 1 : undefined });
   else if (choice === "on" || choice === "off") status = await ctx.client.post("/api/ai", { ai: choice === "on" });
   else if (choice === "claude" || choice === "codex") status = await ctx.client.post("/api/ai", { ai: true, provider: choice });
-  else throw new UsageError("ai [on|off|claude|codex]");
+  else if (choice === "model") return aiModel(ctx, options, name);
+  else throw new UsageError("ai [on|off|claude|codex|model [<name>|default]]");
   const detected = Object.entries(status.detected as Record<string, any>).map(([name, d]) =>
     `  ${name}: ${!d.installed ? "not installed" : !d.loggedIn ? "not logged in" : `ready${d.model ? `, ${d.model}` : ""}`}${d.problem ? ` (${d.problem})` : ""}`);
   ctx.out(options.json ? JSON.stringify(status, null, 2) : [`AI merge: ${aiText(status.effective)}`, ...detected, `Settings: ${status.file}`].join("\n"));
+  return EXIT.ok;
+}
+
+/**
+ * `ai model`: the models of the AI in use, the saved one starred; `ai model <name>` picks one
+ * ("default": Sonnet for Claude Code, Codex's own default for Codex)
+ */
+async function aiModel(ctx: ControlContext, options: Options, name: string | undefined): Promise<number> {
+  const status = await ctx.client.get("/api/ai");
+  const provider = status.effective?.provider as "claude" | "codex" | null;
+  if (!provider) throw new UsageError(`no AI in use (${aiText(status.effective)}): pick one with \`ai claude\` or \`ai codex\` first`);
+  const field = provider === "claude" ? "model" : "codexModel";
+  if (name === undefined) {
+    const current = status.settings?.[field] ?? "";
+    const models: string[] = [...(provider === "codex" ? [""] : []), ...(status.detected?.[provider]?.models ?? [])];
+    const list = models.map((m) => `${m === current ? "*" : ""}${m || "default"}`).join(" ");
+    ctx.out(options.json ? JSON.stringify({ provider, current, models }) : `${provider}: ${list}`);
+    return EXIT.ok;
+  }
+  const value = name === "default" ? (provider === "claude" ? "sonnet" : "") : name;
+  const saved = await ctx.client.post("/api/ai", { [field]: value });
+  // A hub from before the model choice answers 200 and saves nothing
+  if (saved.settings?.[field] !== value) throw new Error(`the hub did not save the model: it is older than this command (restart the hub from ${ctx.info.appName})`);
+  ctx.out(options.json ? JSON.stringify(saved, null, 2) : `AI merge model (${provider}): ${saved.settings?.[field] || "default"}`);
   return EXIT.ok;
 }
 

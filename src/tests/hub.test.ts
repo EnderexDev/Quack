@@ -838,3 +838,39 @@ test("the AI merge in the app: off with nothing here, on by itself with one, a c
     assert.equal((await post({ provider: "gpt" })).status, 400);
   }, { detectAi });
 });
+
+test("the AI merge model: the status lists the choices, a pick is saved, a bad one is refused and changes nothing", { timeout: 30000 }, async () => {
+  const detectAi = async () => ({ claude: { installed: true, loggedIn: true }, codex: { installed: true, loggedIn: true } });
+  const codexModels = () => ["gpt-5.5-codex", "gpt-5.5"];
+  await withHub({}, async ({ port, tmp }) => {
+    const file = path.join(tmp, "config.json");
+    fs.writeFileSync(file, JSON.stringify({ port: 3825, merge: { enabled: true, ai: true, provider: "claude", model: "sonnet" } }));
+    const get = async () => (await (await fetch(`http://127.0.0.1:${port}/api/ai?refresh=1`)).json()) as any;
+    const post = (body: unknown) => fetch(`http://127.0.0.1:${port}/api/ai`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const saved = () => JSON.parse(fs.readFileSync(file, "utf8")).merge;
+
+    const status = await get();
+    assert.deepEqual(status.detected.claude.models, ["sonnet", "opus", "haiku"]);
+    assert.deepEqual(status.detected.codex.models, ["gpt-5.5-codex", "gpt-5.5"]);
+    assert.equal(status.settings.model, "sonnet");
+    assert.equal(status.settings.codexModel, "", "the app tells Codex's default from a pick");
+
+    const picked = (await (await post({ model: "opus" })).json()) as any;
+    assert.equal(picked.settings.model, "opus");
+    assert.equal(saved().model, "opus");
+    assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).port, 3825);
+
+    // The file's own reader turns a bad name into "sonnet" without a word: the API refuses it first
+    for (const bad of [{ model: "" }, { model: "opus; rm -rf" }, { model: 5 }, { codexModel: "a b" }, { codexModel: null }, { mode: "opus" }, {}]) {
+      assert.equal((await post(bad)).status, 400, JSON.stringify(bad));
+    }
+    assert.equal(saved().model, "opus");
+
+    await post({ codexModel: "gpt-5.5" });
+    assert.equal(saved().codexModel, "gpt-5.5");
+    assert.equal(saved().model, "opus");
+    const back = (await (await post({ codexModel: "" })).json()) as any;
+    assert.equal(back.settings.codexModel, "", "empty is Codex's own default");
+    assert.equal(saved().codexModel, "");
+  }, { detectAi, codexModels });
+});

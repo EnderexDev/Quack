@@ -3,6 +3,7 @@
 import { api, h, invoke, listen, nameOf, shortPath, start, toast } from "./common.js";
 import { applyStatic, duration, getLanguage, t, tn } from "./i18n.js";
 import { every } from "./idle.js";
+import { modelChoice, modelLabel, modelPill } from "./aiview.js";
 import { jobWait, knownFields, recentOf, stuckOf, todayOf } from "./queueview.js";
 
 const LOG_LINES_KEPT = 3000;
@@ -221,14 +222,35 @@ function editorButtons(path, look) {
 }
 
 function editorMenu(anchor, path) {
-  const open = document.querySelector(".menu");
-  open?.remove();
-  if (open?.dataset.path === path) return; // a second click on ▾ closes it
+  const pick = (editor) => async () => {
+    try {
+      await invoke("set_settings", { editor: editor.id });
+      await invoke("open_path", { path, editor: true });
+    } catch (error) {
+      fail(error);
+    }
+  };
+  popMenu(anchor, `editor:${path}`, t("openWith"), ui.editors.map((editor, i) => ({ label: editor.name, on: i === 0, pick: pick(editor) })));
+}
+
+/**
+ * A small menu under `anchor`, right-aligned to it: a title and one button per item. A second
+ * click on the same anchor (same key) closes it; so do a click outside and Escape. Whatever
+ * closes it also drops its window listeners (closeMenu), not only its element.
+ */
+let closeMenu = null;
+function popMenu(anchor, key, title, items) {
+  const openKey = document.querySelector(".menu")?.dataset.key;
+  closeMenu?.();
+  document.querySelector(".menu")?.remove();
+  if (openKey === key) return;
   const close = () => {
     menu.remove();
     removeEventListener("pointerdown", outside, true);
     removeEventListener("keydown", escape, true);
+    if (closeMenu === close) closeMenu = null;
   };
+  closeMenu = close;
   const outside = (event) => {
     if (!menu.contains(event.target) && !anchor.contains(event.target)) close();
   };
@@ -238,25 +260,17 @@ function editorMenu(anchor, path) {
       anchor.focus();
     }
   };
-  const pick = (editor) => async () => {
-    close();
-    try {
-      await invoke("set_settings", { editor: editor.id });
-      await invoke("open_path", { path, editor: true });
-    } catch (error) {
-      fail(error);
-    }
-  };
-  const menu = h("div", { class: "menu chunk", role: "menu", dataset: { path } },
-    h("span", { class: "label" }, t("openWith")),
-    ui.editors.map((editor, i) => h("button", { role: "menuitem", class: i === 0 ? "on" : "", onclick: pick(editor) }, editor.name)));
+  const menu = h("div", { class: "menu chunk", role: "menu", dataset: { key } },
+    h("span", { class: "label" }, title),
+    items.map((item) => h("button", { role: "menuitem", class: item.on ? "on" : "", onclick: () => { close(); item.pick(); } }, item.label)));
   const at = anchor.getBoundingClientRect();
   menu.style.top = `${at.bottom + 12}px`;
   menu.style.right = `${Math.max(8, innerWidth - at.right)}px`;
   document.body.append(menu);
   addEventListener("pointerdown", outside, true);
   addEventListener("keydown", escape, true);
-  menu.querySelector("button")?.focus();
+  // The saved pick takes the focus, so focus and pick never show as two marked items
+  (menu.querySelector("button.on") ?? menu.querySelector("button"))?.focus();
 }
 
 function header(place) {
@@ -1023,10 +1037,24 @@ function aiCard(ai) {
   const set = (body) => api.post("/api/ai", body).then(redraw).catch(fail);
   const none = usable.length === 0;
   const on = !none && settings.ai;
-  const model = effective.provider ? detected[effective.provider].model : null;
+  // The model of the AI in use: a menu of its models, or read-only from a hub without the lists
+  const model = modelPill(ai) || (effective.provider === "codex" ? t("aiModelDefault") : "");
+  const choice = modelChoice(ai);
+  let pill = null;
+  if (choice) {
+    pill = h("button", { class: "pill brand", title: t("aiModelPick"), "aria-haspopup": "menu" }, model, " ▾");
+    const items = choice.options.map((o) => ({
+      label: o.value ? modelLabel(o.value) : t("aiModelDefault"),
+      on: o.on,
+      pick: () => set({ [choice.field]: o.value }),
+    }));
+    pill.addEventListener("click", () => popMenu(pill, "ai-model", t("aiModel", { name: AI_NAMES[choice.provider] }), items));
+  } else if (model) {
+    pill = h("span", { class: "pill brand" }, model);
+  }
   card.append(h("div", { class: "field" },
     h("span", { class: "grow" }, t("aiMerge")),
-    model ? h("span", { class: "pill brand" }, model) : null,
+    pill,
     toggle(on, () => set({ ai: !on }), none)));
   if (usable.length === 2 && settings.ai) {
     const pick = (provider) => h("button", { class: settings.provider === provider || effective.provider === provider ? "on" : "", onclick: () => set({ provider }) }, AI_NAMES[provider]);

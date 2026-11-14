@@ -6,8 +6,8 @@ import net from "node:net";
 import path from "node:path";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import { BUNDLED_BUILD } from "../bundled.js";
-import { getUserConfigPath, readMergeSettings, writeMergeSettings } from "../config.js";
-import { detectAiCached, resolveAi, usable, type Detected, type Effective } from "../merge/ai.js";
+import { getUserConfigPath, isModelName, readMergeSettings, writeMergeSettings } from "../config.js";
+import { CLAUDE_MODELS, codexModels, detectAiCached, resolveAi, usable, type Detected, type Effective } from "../merge/ai.js";
 import { ApiError, readConflict, readLogChunk, readMerges, resolveConflict } from "./api.js";
 import { findStampedFolders, folderNameFor } from "./candidates.js";
 import type { DaemonStatus } from "../hubLink.js";
@@ -63,6 +63,8 @@ export interface HubOptions {
   /** Overrides for tests */
   configFile?: string;
   detectAi?: (settings: ReturnType<typeof readMergeSettings>, force: boolean) => Promise<Detected>;
+  /** The models Codex lists (tests: never this machine's ~/.codex) */
+  codexModels?: () => string[];
   handshakeDeadlineMs?: number;
   daemonStartTimeoutMs?: number;
   /** The Studio queue's own timings and clock (tests) */
@@ -797,7 +799,13 @@ export class QuackHub {
     const effective = resolveAi(settings, detected);
     this.aiSummary = effective;
     this.aiLastUsable = usable(detected);
-    return { detected, usable: usable(detected), settings: { ai: settings.ai, provider: settings.provider }, effective, file };
+    // The models the app offers for each; codexModel "" is Codex's own default
+    const withModels = {
+      claude: { ...detected.claude, models: [...CLAUDE_MODELS] },
+      codex: { ...detected.codex, models: (this.options.codexModels ?? codexModels)() },
+    };
+    const shown = { ai: settings.ai, provider: settings.provider, model: settings.model, codexModel: settings.codexModel };
+    return { detected: withModels, usable: usable(detected), settings: shown, effective, file };
   }
 
   /** Paused: every daemon stops and every Studio is turned away until resumed */
@@ -1098,13 +1106,26 @@ export class QuackHub {
   }
 
   /**
-   * Turns the AI merge on or off and picks Claude or Codex. Only what this machine can run:
-   * turning it on with nothing installed, or picking a CLI that is not here, is refused.
-   * The file is shared by every game and both hubs, so every daemon follows at its next merge.
+   * Turns the AI merge on or off, picks Claude or Codex, and the model of each. Only what this
+   * machine can run: turning it on with nothing installed, or picking a CLI that is not here, is
+   * refused. The file is shared by every game and both hubs, so every daemon follows at its next
+   * merge.
    */
   private setAi(body: Record<string, unknown>): void {
     const file = this.options.configFile ?? getUserConfigPath();
-    const patch: { ai?: boolean; provider?: "claude" | "codex" } = {};
+    const known = ["ai", "provider", "model", "codexModel"];
+    const keys = Object.keys(body);
+    if (!keys.length || keys.some((k) => !known.includes(k))) throw new ApiError(400, `send one or more of ${known.join(", ")}`);
+    const patch: { ai?: boolean; provider?: "claude" | "codex"; model?: string; codexModel?: string } = {};
+    // Checked here: the file's reader turns a bad name into the default without a word
+    if (body.model !== undefined) {
+      if (!isModelName(body.model)) throw new ApiError(400, "model must be a model name (letters, digits, . : _ -)");
+      patch.model = body.model;
+    }
+    if (body.codexModel !== undefined) {
+      if (body.codexModel !== "" && !isModelName(body.codexModel)) throw new ApiError(400, "codexModel must be a model name, or empty for Codex's default");
+      patch.codexModel = body.codexModel;
+    }
     if (body.ai !== undefined) {
       if (typeof body.ai !== "boolean") throw new ApiError(400, "ai must be true or false");
       patch.ai = body.ai;
@@ -1117,7 +1138,8 @@ export class QuackHub {
     if (patch.ai === true && last && last.length === 0) throw new ApiError(409, "no AI here: install Claude Code or Codex and log in");
     if (patch.provider && last && !last.includes(patch.provider)) throw new ApiError(409, `${patch.provider} is not installed or not logged in here`);
     writeMergeSettings(patch, file);
-    this.log(`AI merge: ${patch.ai === undefined ? "" : patch.ai ? "on" : "off"}${patch.provider ? ` ${patch.provider}` : ""}`.trim());
+    const models = [patch.model !== undefined ? `model ${patch.model}` : "", patch.codexModel !== undefined ? `codex model ${patch.codexModel || "default"}` : ""];
+    this.log(`AI merge: ${[patch.ai === undefined ? "" : patch.ai ? "on" : "off", patch.provider ?? "", ...models].filter(Boolean).join(" ")}`);
   }
 
   /** The automation settings and what each registered place gets from them */

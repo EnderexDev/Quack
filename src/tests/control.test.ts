@@ -100,7 +100,7 @@ function control(port: number, options: { flavor?: Flavor; cwd?: string; interac
   };
 }
 
-async function withHub(body: (ctx: { port: number; tmp: string; folders: Record<string, string> }) => Promise<void>): Promise<void> {
+async function withHub(body: (ctx: { port: number; tmp: string; folders: Record<string, string> }) => Promise<void>, detectAi?: ConstructorParameters<typeof QuackHub>[0]["detectAi"]): Promise<void> {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "quack-control-"));
   const folders: Record<string, string> = { "111": path.join(tmp, "Alpha Game"), "222": path.join(tmp, "Beta Game") };
   for (const folder of Object.values(folders)) fs.mkdirSync(folder);
@@ -108,7 +108,7 @@ async function withHub(body: (ctx: { port: number; tmp: string; folders: Record<
   saveRegistry(registryFile, { places: { "111": { folder: folders["111"], name: "Alpha Game" }, "222": { folder: folders["222"], name: "Beta Game" } } });
   const port = await freePort();
   const noAi = async () => ({ claude: { installed: false, loggedIn: false }, codex: { installed: false, loggedIn: false } });
-  const hub = new QuackHub({ port, registryFile, daemonCli, log: () => {}, configFile: path.join(tmp, "config.json"), detectAi: noAi });
+  const hub = new QuackHub({ port, registryFile, daemonCli, log: () => {}, configFile: path.join(tmp, "config.json"), detectAi: detectAi ?? noAi, codexModels: () => ["gpt-5.5"] });
   await hub.start();
   try {
     await body({ port, tmp, folders });
@@ -118,6 +118,40 @@ async function withHub(body: (ctx: { port: number; tmp: string; folders: Record<
     await removeDir(tmp);
   }
 }
+
+test("ai model: picks the merge model of the AI in use, and says so when none is in use", { timeout: 30000 }, async () => {
+  await withHub(async ({ port }) => {
+    const none = await control(port)("ai", "model", "opus");
+    assert.equal(none.code, 1);
+    assert.match(none.err, /no AI in use/);
+  });
+  const claudeOnly = async () => ({ claude: { installed: true, loggedIn: true }, codex: { installed: false, loggedIn: false } });
+  await withHub(async ({ port, tmp }) => {
+    const run = control(port);
+    const file = path.join(tmp, "config.json");
+    fs.writeFileSync(file, JSON.stringify({ merge: { ai: true, model: "sonnet" } }));
+    const list = await run("ai", "model");
+    assert.equal(list.code, 0);
+    assert.match(list.out, /claude: \*sonnet opus haiku/);
+    assert.equal((await run("ai", "model", "opus")).code, 0);
+    assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).merge.model, "opus");
+    assert.equal((await run("ai", "model", "default")).code, 0);
+    assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).merge.model, "sonnet", "default is Sonnet for Claude Code");
+    assert.notEqual((await run("ai", "model", "bad name")).code, 0);
+  }, claudeOnly);
+  // A hub from before the choice answers 200 to { model } and saves nothing: said, not "done"
+  const port = await freePort();
+  const old = { effective: { state: "ready", provider: "claude" }, settings: { ai: true, provider: "claude" }, detected: { claude: { installed: true, loggedIn: true, model: "sonnet" } } };
+  const server = http.createServer((_req, res) => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(old)));
+  await new Promise<void>((r) => server.listen(port, "127.0.0.1", r));
+  try {
+    const stale = await control(port)("ai", "model", "opus");
+    assert.equal(stale.code, 1);
+    assert.match(stale.err, /older than this command/);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
 
 test("status, places and log name a place by id, by part of its name or by the folder you are in", { timeout: 60000 }, async () => {
   await withHub(async ({ port, folders }) => {

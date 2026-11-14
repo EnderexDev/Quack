@@ -105,20 +105,30 @@ export async function detectAi(settings: MergeSettings): Promise<Detected> {
   return { claude, codex };
 }
 
+/** The Claude Code models the app offers for a merge: aliases `claude --model` takes, default first */
+export const CLAUDE_MODELS: readonly string[] = ["sonnet", "opus", "haiku"];
+
+const codexHome = () => process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
+
 /**
- * The model Codex picks when given none, for display only: the first listed one of its model
- * cache. Codex itself decides at run time; a fresh install has no cache.
+ * The models Codex lists in its model cache (the visible ones, in its order), for the app's
+ * choice. A fresh install has no cache: none, and the app offers only Codex's default.
  */
-export function codexDefaultModel(home = process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex")): string | null {
+export function codexModels(home = codexHome()): string[] {
   try {
     const cache = JSON.parse(fs.readFileSync(path.join(home, "models_cache.json"), "utf8"));
-    const listed = (cache.models as Array<{ slug?: string; visibility?: string; priority?: number }>)
+    return (cache.models as Array<{ slug?: string; visibility?: string; priority?: number }>)
       .filter((m) => m.visibility === "list" && typeof m.slug === "string")
-      .sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99));
-    return listed[0]?.slug ?? null;
+      .sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99))
+      .map((m) => m.slug as string);
   } catch {
-    return null;
+    return [];
   }
+}
+
+/** The model Codex picks when given none, for display only; Codex itself decides at run time */
+export function codexDefaultModel(home = codexHome()): string | null {
+  return codexModels(home)[0] ?? null;
 }
 
 /** Detection spawns two CLIs (about a second): kept for a minute */

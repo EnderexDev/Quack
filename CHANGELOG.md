@@ -6,6 +6,14 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.37] - 2026-11-14
+
+### Added
+- Settings > AI merge picks the model that merges: click the model pill for Sonnet, Opus or Haiku with Claude Code, or for Codex its default or any model Codex lists. It is one setting for every game, in Quack and Quack Dev; `POST /api/ai` takes `model` / `codexModel`, and `quack ai model [<name>|default]` lists or picks from the terminal.
+
+### Fixed
+- While a play Quack did not start keeps the Studio queue waiting (a Local Server test started from Studio), the queue now checks whether it is still up without taking the Studio lock, so a 10-minute test no longer writes a lock hold to the queue's history every few seconds (about 130 on 14/11/26), and a session asking for Studio meanwhile gets it at once. A test answered as infra after Studio refused plays now says how many refusals it waited through itself, not the whole streak's count.
+
 ## [1.0.36] - 2026-11-14
 
 ### Fixed
@@ -392,7 +400,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.36...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.37...HEAD
+[1.0.37]: https://github.com/EnderexDev/Quack/compare/v1.0.36...v1.0.37
 [1.0.36]: https://github.com/EnderexDev/Quack/compare/v1.0.35...v1.0.36
 [1.0.35]: https://github.com/EnderexDev/Quack/compare/v1.0.34...v1.0.35
 [1.0.34]: https://github.com/EnderexDev/Quack/compare/v1.0.33...v1.0.34

@@ -1890,6 +1890,93 @@ test("queue stuck: a play Quack did not start (Local Server test) shows as stuck
   }
 });
 
+// Dev end-to-end test of 14/11/26: a 10-minute Local Server test left ~130 runner grant rows (one
+// claim, look and release every 4.5 s), and a job that came mid-streak was answered with the
+// streak's refusal count.
+
+function historyRows(folder: string): Record<string, any>[] {
+  const dir = path.join(queueDir(folder, "1"), "history");
+  if (!fs.existsSync(dir)) return [];
+  return fs
+    .readdirSync(dir)
+    .flatMap((f) => fs.readFileSync(path.join(dir, f), "utf8").split("\n"))
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+}
+
+test("queue stuck: a foreign play is watched without the lock: no grant row per look, a session gets Studio, its end is seen at once", { timeout: 30_000 }, async () => {
+  const { tmp, folder, wt } = makeGame(true);
+  const { s, port } = fakeStudio(folder);
+  const { queue } = makeQueue(folder, port, { stuckRetrySec: 0.1, stuckGiveUpMin: 5 });
+  try {
+    s.phantom = true;
+    s.phantomPeer = true;
+    const j = queue.submit(me, job("waits on a Local Server test", wt.wtA));
+    await until(() => queue.status().stuck?.kind === "foreign-play", 5000, () => queue.status().phase);
+    const looks = queue.status().stuck!.tries;
+    // 1.5 s at lockRetryMs 20 ms: dozens of looks
+    await wait(1500);
+    const st = queue.status();
+    assert.equal(st.stuck?.kind, "foreign-play");
+    assert.ok(st.stuck!.tries >= looks + 10, `the runner kept looking: ${looks} then ${st.stuck!.tries} looks`);
+    const runnerGrants = historyRows(folder).filter((r) => r.kind === "grant" && r.runner);
+    assert.ok(runnerGrants.length <= 1, `${runnerGrants.length} runner grant rows over ${st.stuck!.tries} looks at the foreign play`);
+    assert.equal(historyRows(folder).filter((r) => r.kind === "stuck" && r.as === "foreign-play" && !r.ended).length, 1, "the foreign play is recorded once");
+    // A session asking for Studio meanwhile gets it, whenever it asks
+    for (let i = 0; i < 10; i++) {
+      assert.equal(queue.lock.claim({ id: "session", pid: process.pid }, "solo_playtest").ok, true, `refused on ask ${i}: held by ${queue.lock.state.holder?.client.id}`);
+      queue.lock.release("session");
+      await wait(17);
+    }
+    // The test ends: the queue sees it within a few looks and runs the job
+    s.phantom = false;
+    s.phantomPeer = false;
+    const v = await verdictOf(queue, j.id, 3000);
+    assert.equal(v.pass, true, JSON.stringify(v.reason));
+    assert.equal(queue.status().stuck, null);
+    assert.equal(queue.stats().grants, 10, "the session's holds, no more");
+  } finally {
+    queue.stop();
+    await queue.idle();
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+test("queue stuck: a job given up says the refusals it waited through, not the whole streak's", { timeout: 30_000 }, async () => {
+  const { tmp, folder, wt } = makeGame(true);
+  const { s, port } = fakeStudio(folder);
+  // 1.2 s of refusals give up; one start every 0.1 s
+  const { queue } = makeQueue(folder, port, { stuckRetrySec: 0.1, stuckGiveUpMin: 0.02 });
+  try {
+    s.phantom = true;
+    const a = queue.submit(me, job("A from the start", wt.wtA));
+    await until(() => queue.status().stuck?.kind === "refused", 5000, () => queue.status().phase);
+    await wait(800);
+    const b = queue.submit(other, job("B late", wt.wtA));
+    const atB = s.attempts.length;
+    const va = await verdictOf(queue, a.id);
+    const vb = await verdictOf(queue, b.id);
+    const after = s.attempts.length - atB;
+    assert.ok(atB >= 4, `refusals before B came: ${atB}`);
+    const triesOf = (v: Verdict) => Number(/ \((\d+) tr(?:y|ies)\): /.exec(v.reason ?? "")?.[1]);
+    const ta = triesOf(va);
+    const tb = triesOf(vb);
+    // A waited from the first refusal: its count is the streak's when it was answered
+    assert.ok(ta >= atB, `A waited through ${atB}+ refusals and says ${ta}: ${va.reason}`);
+    // B counts only the refusals since it came (one start may have been on its way when it did)
+    assert.ok(tb >= 1 && tb <= after + 1, `B says ${tb} tries, ${after} starts were refused after it came (streak: ${s.attempts.length}): ${vb.reason}`);
+    // The queue's own count stays the streak's, for the banner and the history
+    const gaveUp = historyRows(folder).filter((r) => r.kind === "stuck" && r.gaveUp);
+    assert.ok(gaveUp.at(-1)!.tries > tb + 2, `the streak's count ${gaveUp.at(-1)!.tries} against B's ${tb}`);
+  } finally {
+    queue.stop();
+    await queue.idle();
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
 test("queue: a job dropped while its play starts gets no second verdict, and is not counted as not run", { timeout: 30_000 }, async () => {
   const { tmp, folder, wt } = makeGame(true);
   const { s, port } = fakeStudio(folder);

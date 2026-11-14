@@ -37,7 +37,8 @@ import { effectiveSettings, readGameConfig, type QueueSettings } from "./setting
  *    `stuckRetrySec` for the whole queue, and a job is answered as infra only once it has itself
  *    waited `stuckGiveUpMin` under refusals in a row (a play seen up, no job waiting, or a gap of
  *    more than two retries ends the streak). A play nobody's tool started (a Local Server test
- *    started in Studio) is waited on and shown the same way, and never answers a job. The app's
+ *    started in Studio) is waited on and shown the same way, and never answers a job; after the
+ *    first look the runner watches it without holding the Studio lock. The app's
  *    "unstick" button (never the queue on its own: it may be a session's play) asks the play's
  *    server to end the test.
  * 7. The play stays up `lingerSec` for a late job, then stops; the runner gives the lock back.
@@ -110,8 +111,12 @@ export interface Job extends JobInput {
   submittedAt: number;
   state: "pending" | "running";
   infra?: InfraTries;
-  /** Studio refused to start a play while this job waited: since when (this job's own give-up clock, within the current streak), and its last refusal (no try spent) */
-  stuck?: { since: number; last: string };
+  /**
+   * Studio refused to start a play while this job waited: since when (this job's own give-up
+   * clock, within the current streak), its last refusal (no try spent), and how many refusals it
+   * waited through itself (none yet for a job that arrived between two tries)
+   */
+  stuck?: { since: number; last: string; tries?: number };
   /** Failed in a shared play: runs again alone, and this is the first run */
   soloRetry?: { with: string[]; pass: false; play: string; reason: string; ms: number };
 }
@@ -755,6 +760,19 @@ export class PlaceQueue {
         continue;
       }
 
+      // Waiting on a play Quack did not start: whether it is still up is asked without the lock
+      // (a playtest status claims nothing in Studio), so a Local Server test of ten minutes is
+      // not a grant row every few seconds, and a session asking for Studio meanwhile gets it.
+      // The play gone (or one a tool started, the runner's to stop) goes on to the claim below
+      if (!this.playing && this.stuck?.kind === "foreign-play" && !this.lock.state.holder && (await this.foreignStillUp())) {
+        this.foreignPlayUp();
+        this.noteWait("foreign play", "a play the queue did not start is running", jobs.length);
+        this.liftStaleCap();
+        this.setPhase("waiting: a play the queue did not start is running");
+        await this.sleep(this.t.lockRetryMs);
+        continue;
+      }
+
       if (!this.playing) {
         this.setPhase("collecting jobs");
         await this.sleep(this.t.windowMs);
@@ -855,6 +873,20 @@ export class PlaceQueue {
     }
     this.save();
     this.log("queue: the play the previous hub left is gone or not the queue's: not adopted");
+  }
+
+  /**
+   * A foreign play still up, asked with no lock held: a play up that no tool started. Any doubt
+   * (no answer, Studio not connected, a play a tool started) is false, and the runner takes the
+   * lock and looks again in its batch, which decides as before
+   */
+  private async foreignStillUp(): Promise<boolean> {
+    try {
+      const status = await this.studio("playtest", { action: "status" }, 10_000);
+      return status?.playing === true && typeof status.startedBy !== "string";
+    } catch {
+      return false;
+    }
   }
 
   private giveLockBack(): void {
@@ -1071,23 +1103,27 @@ export class PlaceQueue {
     const held = new Set<Job>(this.stillQueued(queued));
     for (const job of this.jobs.values()) if (job.state === "pending") held.add(job);
     const giveUpMs = settings.stuckGiveUpMin * 60_000;
-    const answered: { job: Job; waited: number }[] = [];
+    const answered: { job: Job; waited: number; tries: number }[] = [];
     for (const job of held) {
-      // Never older than the streak: a clock from before it (a restart, a state file) does not count
+      // Never older than the streak: a clock from before it (a restart, a state file) does not count,
+      // nor do its refusals
+      const own = job.stuck && job.stuck.since >= stuck.since ? (Number(job.stuck.tries) || 0) : 0;
       const since = Math.max(job.stuck?.since ?? now, stuck.since);
-      if (now - since >= giveUpMs) answered.push({ job, waited: now - since });
+      const tries = own + 1;
+      if (now - since >= giveUpMs) answered.push({ job, waited: now - since, tries });
       else {
         job.state = "pending";
-        job.stuck = { since, last };
+        job.stuck = { since, last, tries };
       }
     }
     const streakMs = now - stuck.since;
     if (answered.length) {
       this.history({ kind: "stuck", gaveUp: answered.length, ms: streakMs, tries: stuck.tries, error: last });
       this.log(`queue: Studio refused to start a play for ${shortAgo(streakMs)} (${stuck.tries} tries): ${answered.length} job(s) that waited ${settings.stuckGiveUpMin} min on it are answered as infra`);
-      for (const { job, waited } of answered) {
+      for (const { job, waited, tries } of answered) {
         job.stuck = undefined;
-        this.infra(job, `Studio refused to start a play for ${shortAgo(waited)} (${stuck.tries} tries): ${last} Unstick in the app, Stop in Studio or reopening the place ends the test it thinks is running`, { retry: false });
+        // The job's own refusals: one that arrived mid-streak waited through fewer than the queue's count
+        this.infra(job, `Studio refused to start a play for ${shortAgo(waited)} (${tries} ${tries === 1 ? "try" : "tries"}): ${last} Unstick in the app, Stop in Studio or reopening the place ends the test it thinks is running`, { retry: false });
       }
     }
     this.save();

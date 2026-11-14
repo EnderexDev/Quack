@@ -274,6 +274,11 @@ export type AiProvider = "claude" | "codex";
 /** A model name reaches a command line (codex runs through cmd.exe): names only */
 const MODEL_NAME = /^[\w.:-]+$/;
 
+/** A name the merge settings keep as a model (the file's reader turns any other into the default) */
+export function isModelName(value: unknown): value is string {
+  return isNonEmptyString(value) && MODEL_NAME.test(value);
+}
+
 function sanitizeMerge(m: Record<string, unknown>): QuackConfig["merge"] {
   const merge = { ...defaultConfig.merge };
   if (typeof m.enabled === "boolean") merge.enabled = m.enabled;
