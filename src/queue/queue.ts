@@ -213,6 +213,8 @@ export class PlaceQueue {
   private carryOver = new Set<string>();
   private lastSourcemap: Sourcemap | null = null;
   private jobsInPlay = 0;
+  /** A job's phase timed out in this play and may still run there: no other job runs in it */
+  private playTainted = false;
   private hold: { client: string; root: string; until: number; jobsAt: number; name: string } | null = null;
   private cursor: string | null = null;
   private multiPlay = true;
@@ -239,6 +241,7 @@ export class PlaceQueue {
       settings: () => this.settings(),
       pending: () => this.pendingSummary(),
       onGrantEnd: (record) => this.history({ ...record }),
+      runnerActive: () => this.looping !== null && !this.stopped,
       onChange: (clockOnly) => this.scheduleSave(clockOnly),
     });
     this.publishes = new PublishLine({
@@ -778,6 +781,7 @@ export class PlaceQueue {
 
   private forgetPlay(): void {
     this.playing = false;
+    this.playTainted = false;
     this.playToken = null;
     this.playRoots = [];
     this.playId = null;
@@ -957,6 +961,11 @@ export class PlaceQueue {
 
   private async runJob(job: Job, how: string, extra: Extra, sourcemap: Sourcemap): Promise<void> {
     const started = this.now();
+    // A phase that timed out earlier may still run in this play: this job waits for a play of its own
+    if (this.playTainted) {
+      job.state = "pending";
+      return;
+    }
     // The lock is confirmed (and its idle clock refreshed) before anything runs
     const lock = this.lock.claim(RUNNER, "queue");
     if (!lock.ok) {
@@ -1007,6 +1016,11 @@ export class PlaceQueue {
       });
       return;
     }
+    // A phase past its time may still run in Studio (an eval is never cancelled): no later job joins this play
+    if (failed.some(([, p]) => TIMED_OUT.test(String(p.error ?? "")))) {
+      this.snapshots.clear();
+      this.playTainted = true;
+    }
     const others = this.playRoots.filter((f) => !samePath(f, job.root));
     const retryAll = this.settings().sharedRetry !== "foreign";
     if (!pass && others.length && !job.soloRetry && (retryAll || notYours)) {
@@ -1045,6 +1059,7 @@ export class PlaceQueue {
   /** A play just started is the runner's: its folders, and the token a later hub adopts it by */
   private async ownPlay(folders: string[], kind: string, startMs: number): Promise<void> {
     this.playing = true;
+    this.playTainted = false;
     this.playRoots = [...folders];
     this.playToken = `${process.pid}-${this.now()}-${randomBytes(3).toString("hex")}`;
     this.playId = randomBytes(4).toString("hex");
@@ -1345,10 +1360,22 @@ return HttpService:JSONEncode(out)`;
       for (const job of jobs) this.infra(job, `no readable sourcemap.json in ${this.folder}: is the place synced?`, { retry: false });
       return;
     }
-    // A play nobody here started (someone's hands) is never stopped: the lock goes back and the runner comes round again
+    // A play started in Studio by hand is never stopped: the lock goes back and the runner comes round again.
+    // A play Quack's tools started (`startedBy`) belongs to whoever held Studio; the runner holds it
+    // now, so that client's turn is over (released, idle, capped, gone or freed by hand): it stops it.
     if (!this.playing) {
-      const status = await this.studio("playtest", { action: "status" }, 10_000);
+      let status = await this.studio("playtest", { action: "status" }, 10_000);
       if (status?.editConnected === false) throw new Error("Studio is not connected to this place: open it in Studio");
+      if (status?.playing && typeof status.startedBy === "string") {
+        this.log(`queue: stopping the play left up by ${status.startedBy}: whoever started it no longer holds Studio`);
+        this.history({ kind: "orphan-stop", startedBy: status.startedBy });
+        try {
+          await this.studio("playtest", { action: "stop", timeoutMs: 30_000 }, 30_000);
+        } catch (error) {
+          if (!/no play is running/.test((error as Error).message)) throw error;
+        }
+        status = await this.studio("playtest", { action: "status" }, 10_000);
+      }
       if (status?.playing) return "foreign play";
     }
     this.endWait();

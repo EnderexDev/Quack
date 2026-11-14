@@ -366,6 +366,56 @@ test("playtest start returns once the play's peers said hello; stop once they le
   }
 });
 
+// 13/11/26: a session's play left up after its turn blocked the Studio queue for good; the queue
+// stops a play Quack's tools started (startedBy), never one started in Studio by hand
+test("playtest status names who started the play through Quack's tools; a play started by hand has no startedBy", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    let editMode = true;
+    const peers: WebSocket[] = [];
+    const startPeers = async () => {
+      peers.push(await playPeer(d.url, "server", (tool) => {
+        if (tool !== "stop") return {};
+        setTimeout(() => peers.splice(0).forEach((p) => p.close()), 50);
+        setTimeout(() => (editMode = true), 200);
+        return { stopping: true };
+      }));
+      peers.push(await playPeer(d.url, "client", () => ({})));
+    };
+    const edit = await editStudio(d.url, (tool) => {
+      if (tool === "playState") return { editModeActive: editMode };
+      if (tool === "playStart") {
+        editMode = false;
+        setTimeout(() => void startPeers(), 50);
+        return { mode: "play" };
+      }
+      throw new Error(`unexpected ${tool}`);
+    });
+    await d.tools.call("playtest", { action: "start", caller: "mcp-42" });
+    assert.equal(((await d.tools.call("playtest", { action: "status" })) as any).startedBy, "mcp-42");
+    await d.tools.call("playtest", { action: "stop" });
+    assert.equal(((await d.tools.call("playtest", { action: "status" })) as any).startedBy, undefined, "stopped: nobody's");
+    // Studio's own Play button: the play comes up with no tool asking
+    editMode = false;
+    await startPeers();
+    await waitFor(() => d.ipc.playSockets() === 2);
+    const byHand: any = await d.tools.call("playtest", { action: "status" });
+    assert.equal(byHand.playing, true);
+    assert.equal(byHand.startedBy, undefined);
+    await d.tools.call("playtest", { action: "stop" });
+    // A worktree play (quack play) is the daemon's own
+    d.tools.expectPlay("play");
+    editMode = false;
+    await startPeers();
+    await waitFor(() => d.ipc.playSockets() === 2);
+    assert.equal(((await d.tools.call("playtest", { action: "status" })) as any).startedBy, "play");
+    await d.tools.call("playtest", { action: "stop" });
+    edit.close();
+  } finally {
+    await d.close();
+  }
+});
+
 test("a screenshot: the play client captures, edit mode reads the pixels, the PNG is saved", { timeout: 20000 }, async () => {
   const d = await daemon();
   try {

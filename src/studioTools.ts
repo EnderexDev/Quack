@@ -201,8 +201,17 @@ export class StudioTools {
   public peersChanged(): void {
     const peers = this.link.playPeers();
     const serverReady = peers.server === "ready";
-    if (serverReady && !this.serverWasReady) this.push({ source: "quack", type: "MessageInfo", message: "--- play started ---", timestamp: this.now() });
-    if (!serverReady && this.serverWasReady) this.push({ source: "quack", type: "MessageInfo", message: "--- play stopped ---", timestamp: this.now() });
+    if (serverReady && !this.serverWasReady) {
+      this.push({ source: "quack", type: "MessageInfo", message: "--- play started ---", timestamp: this.now() });
+      // A play Quack's tools asked for; any other is Studio's own Play button
+      const expected = this.expectedStarter;
+      this.playStarter = expected && this.now() <= expected.until ? expected.by : undefined;
+      this.expectedStarter = undefined;
+    }
+    if (!serverReady && this.serverWasReady) {
+      this.push({ source: "quack", type: "MessageInfo", message: "--- play stopped ---", timestamp: this.now() });
+      this.playStarter = undefined;
+    }
     this.serverWasReady = serverReady;
     if (!serverReady) this.multiplayer = undefined;
     for (const [id, waiting] of this.pending) {
@@ -300,6 +309,24 @@ export class StudioTools {
     const { listed: newErrors, repeated } = this.errorsSince(caller);
     if (!result || typeof result !== "object" || Array.isArray(result) || (!newErrors.length && !repeated)) return result;
     return { ...result, ...(newErrors.length ? { newErrors } : {}), ...(repeated ? { repeatedErrors: repeated } : {}) };
+  }
+
+  /**
+   * Who started the play now up through Quack's tools (the `caller` of solo_playtest start, "play"
+   * for a worktree play); undefined for a play started in Studio by hand. The Studio queue stops
+   * a play of Quack's tools once nobody holds Studio, never one started by hand.
+   */
+  private playStarter: string | undefined;
+  private expectedStarter: { by: string; until: number } | undefined;
+
+  /** The next play to come up within `ms` was asked for by `by` */
+  public expectPlay(by: string, ms = 120_000): void {
+    this.expectedStarter = { by, until: this.now() + ms };
+  }
+
+  /** A start that failed: the next play to come up is not its */
+  public forgetExpectedPlay(): void {
+    this.expectedStarter = undefined;
   }
 
   private place: PlaceView | undefined;
@@ -639,7 +666,8 @@ export class StudioTools {
     if (action === "status") {
       if (!this.link.editConnected()) return { editConnected: false, ...this.peerState() };
       const state = await this.request("edit", "playState", {}, 5000);
-      return { editConnected: true, playing: state.editModeActive === false, ...this.peerState() };
+      const playing = state.editModeActive === false;
+      return { editConnected: true, playing, ...(playing && this.playStarter ? { startedBy: this.playStarter } : {}), ...this.peerState() };
     }
     if (action === "start") {
       const mode = args.mode === "run" ? "run" : "play";
@@ -647,7 +675,13 @@ export class StudioTools {
       const players = args.players === undefined || args.players === null ? undefined : Number(args.players);
       if (players !== undefined && (!Number.isInteger(players) || players < 1 || players > 8)) throw new ToolError("players must be a whole number from 1 to 8");
       if (players !== undefined && mode === "run") throw new ToolError("a multiplayer test has clients: leave out mode run");
-      await this.request("edit", "playStart", { mode, ...(players !== undefined ? { players } : {}) }, 10_000);
+      this.expectPlay(typeof args.caller === "string" && args.caller ? args.caller.slice(0, 80) : "cli");
+      try {
+        await this.request("edit", "playStart", { mode, ...(players !== undefined ? { players } : {}) }, 10_000);
+      } catch (error) {
+        this.forgetExpectedPlay();
+        throw error;
+      }
       const timeoutMs = StudioTools.timeout(args, players ? 120_000 : 60_000);
       const peers = () => this.link.playPeers();
       const ready = () => peers().server === "ready" && (mode === "run" || peers().client === "ready") && (players === undefined || (peers().players?.length ?? 0) >= players);

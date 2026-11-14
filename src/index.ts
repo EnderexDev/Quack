@@ -2305,6 +2305,8 @@ export class SyncDaemon {
       records.push({ branch: p.source.replace(/\r\n/g, "\n"), until: Number.POSITIVE_INFINITY, play: id });
       this.playEcho.set(p.guid, records);
     }
+    // The play this swap starts is Quack's, not a play started in Studio by hand (the Studio queue may stop it)
+    this.studioTools?.expectPlay("play");
     const result = await new Promise<PlayOverlayResultMessage>((resolve) => {
       const timer = setTimeout(
         () => resolve({ type: "playOverlayResult", id, ok: false, error: "Studio did not answer in 40 s (a plugin without play support, or the place closed)" }),
@@ -2345,6 +2347,8 @@ export class SyncDaemon {
       ...(Array.isArray(result.failed) ? { failed: result.failed.slice(0, 50).map(String) } : {}),
       ...(Array.isArray(result.closedTabs) && result.closedTabs.length ? { closedTabs: result.closedTabs.slice(0, 50).map(String) } : {}),
     };
+    // No play came up: a later play started by hand is not this swap's
+    if (!state.result.ok) this.studioTools?.forgetExpectedPlay();
     // Which worktree's scripts Studio refused: the others can play without it
     if (!state.result.ok && Array.isArray(result.failed) && result.failed.length) {
       const split = splitSwapFailures(parts, result.failed.map(String));

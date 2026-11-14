@@ -6,6 +6,14 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.35] - 2026-11-14
+
+### Fixed
+- The Studio queue no longer stays stuck behind a play nobody uses. A session that started a play with Quack's tools and lost Studio without stopping it (its turn ended, it sat idle while others waited, it closed, or the app's "free the lock" button) left that play up, and the queue waited for it for good; only stopping it by hand in Studio let the test jobs run. The queue now stops a play Quack's tools started once nobody holds Studio. A play started with Studio's own Play button is still never touched.
+- A test job whose step ran out of time no longer leaves the next job in the same play, where that step may still be running: the next job gets a play of its own.
+- The queue's hold of Studio no longer ends in the middle of a long job when the idle limit in Settings is shorter than one of its steps, which let another session take Studio and stop the play under the job.
+- `release-all` takes `keepPlaceInLine`: a client whose turn ended gives Studio back but keeps its place in line while its wait still runs.
+
 ## [1.0.34] - 2026-11-12
 
 ### Changed
@@ -377,7 +385,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.34...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.35...HEAD
+[1.0.35]: https://github.com/EnderexDev/Quack/compare/v1.0.34...v1.0.35
 [1.0.34]: https://github.com/EnderexDev/Quack/compare/v1.0.33...v1.0.34
 [1.0.33]: https://github.com/EnderexDev/Quack/compare/v1.0.32...v1.0.33
 [1.0.32]: https://github.com/EnderexDev/Quack/compare/v1.0.31...v1.0.32

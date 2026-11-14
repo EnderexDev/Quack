@@ -16,7 +16,8 @@ import { PublishError, type PublishGit } from "./publish.js";
  * POST /api/queue/settings {..}        change them (the app's Settings)
  * POST /api/queue/submit  { placeId, client, job: { name?, files?, fresh?, root, source } }
  * POST /api/queue/lock    { placeId, op, client, ... } op: claim | touch | release | join | leave
- * POST /api/queue/release-all { client: { id }, placeId? }   the client is done: every lock and place in line it has
+ * POST /api/queue/release-all { client: { id }, placeId?, keepPlaceInLine? }   the client is done: every lock and place
+ *      in line it has; keepPlaceInLine (a turn that ended, its wait still running): only the locks
  * POST /api/queue/force-release { placeId }   the app's one button: frees the lock whoever holds it
  * POST /api/queue/publish { placeId, op, ... }  publishing the place (publish.ts):
  *      join { client, commit?, task?, level?, rush? }  a ticket, or the publish that already shipped the commit
@@ -237,7 +238,10 @@ export class HubQueues {
         let released = 0;
         for (const placeId of places) {
           const queue = this.queues.get(placeId);
-          if (queue?.lock.releaseAll(id)) released++;
+          if (queue?.lock.releaseAll(id, body.keepPlaceInLine === true)) {
+            released++;
+            queue.kick();
+          }
         }
         return { released };
       }

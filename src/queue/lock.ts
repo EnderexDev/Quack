@@ -99,6 +99,8 @@ export interface LockDeps {
   /** Jobs waiting in the place's queue, and when the oldest was submitted */
   pending: () => { count: number; oldest: number | null };
   onGrantEnd?: (record: GrantRecord) => void;
+  /** The runner's loop is running: its hold never idles out mid-job (a crashed runner's still does) */
+  runnerActive?: () => boolean;
   /** `clockOnly`: only the holder's last-call time and tool moved (saved lazily) */
   onChange?: (clockOnly?: boolean) => void;
 }
@@ -228,10 +230,14 @@ export class StudioLock {
     return holder;
   }
 
-  /** The client is done (its turn ended, it closed): its lock and its place in line go */
-  releaseAll(clientId: string): boolean {
+  /**
+   * The client is done: its lock goes, and its place in line unless `keepPlaceInLine` (a turn that
+   * ended while its wait still runs in the background; that wait leaves the line when its process ends)
+   */
+  releaseAll(clientId: string, keepPlaceInLine = false): boolean {
     const held = this.state.holder?.client.id === clientId;
     if (held) this.end("release");
+    if (keepPlaceInLine) return held;
     const before = this.state.waiters.length;
     this.state.waiters = this.state.waiters.filter((w) => w.client.id !== clientId);
     if (before !== this.state.waiters.length) this.changed();
@@ -306,6 +312,8 @@ export class StudioLock {
       this.end("gone");
       return "gone";
     }
+    // A job's phase may run minutes with no call that refreshes the hold: a working runner keeps it
+    if (holder.runner && this.deps.runnerActive?.()) return null;
     const settings = this.deps.settings();
     const idle = now - holder.lastUsed;
     if (idle > settings.lockIdleMin * 60_000) {
