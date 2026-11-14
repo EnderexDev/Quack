@@ -24,6 +24,10 @@ export interface QueueSettings {
   infraWaitSec: number[];
   /** Tries before such a job is answered as infra */
   infraTries: number;
+  /** Studio refuses to start a play (it thinks a test is still in progress): the queue tries again this often, the jobs waiting without spending a try */
+  stuckRetrySec: number;
+  /** A job that has waited this long itself under refusals in a row is answered as infra (a play seen up, an empty queue or a long pause starts the count over) */
+  stuckGiveUpMin: number;
   /** A play with no jobs left stays up this long for a late job */
   lingerSec: number;
   /** A job that failed in a play shared with other worktrees runs again alone: on every failure, or only one whose error names someone else's module */
@@ -41,6 +45,8 @@ export const DEFAULT_SETTINGS: QueueSettings = {
   readySec: 30,
   infraWaitSec: [15, 30],
   infraTries: 3,
+  stuckRetrySec: 30,
+  stuckGiveUpMin: 10,
   lingerSec: 60,
   sharedRetry: "all",
   agingMin: 10,
@@ -54,6 +60,9 @@ const LIMITS: Record<Exclude<keyof QueueSettings, "sharedRetry" | "infraWaitSec"
   holdSec: [0, 3600],
   readySec: [0, 600],
   infraTries: [1, 20],
+  // At least a second between tries: Studio is never asked for a play in a tight loop
+  stuckRetrySec: [1, 3600],
+  stuckGiveUpMin: [0.5, 24 * 60],
   lingerSec: [0, 3600],
   agingMin: [0.05, 24 * 60],
 };

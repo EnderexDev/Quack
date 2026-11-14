@@ -3,6 +3,7 @@
 import { api, h, invoke, listen, nameOf, shortPath, start, toast } from "./common.js";
 import { applyStatic, duration, getLanguage, t, tn } from "./i18n.js";
 import { every } from "./idle.js";
+import { jobWait, knownFields, recentOf, stuckOf, todayOf } from "./queueview.js";
 
 const LOG_LINES_KEPT = 3000;
 const LOG_POLL_MS = 1000;
@@ -669,6 +670,9 @@ async function renderQueue(target) {
   const mine = generation;
   let pending = false;
   let armed = false;
+  let unstickArmed = false;
+  let unsticking = false;
+  let lastStuck = null;
   const fill = async () => {
     if (pending) return;
     pending = true;
@@ -697,6 +701,47 @@ async function renderQueue(target) {
       await api.post("/api/queue/force-release", { placeId }).then(() => toast(t("queueReleased"))).catch(fail);
       fill();
     });
+    // Studio refusing every play start (decision 24), or a play Quack did not start up in Studio
+    // (a Local Server test): the jobs wait instead of failing, and the button stops the play left
+    // up in Studio (armed by a first click, as Free the lock is)
+    // While the stop runs (9 to 13 s) the hub may already report no stuck state: the row stays,
+    // saying it works, so the click is not followed by a row that just vanishes
+    const stuck = stuckOf(q, Date.now()) ?? (unsticking ? lastStuck : null);
+    if (stuck) lastStuck = stuck;
+    let stuckRow = null;
+    if (stuck) {
+      // The poll redraws the card while the POST is out: the flag keeps the new button disabled
+      const unstick = h("button", { class: "btn dark chunk press danger", disabled: unsticking }, unsticking ? t("queueUnsticking") : unstickArmed ? t("queueUnstickSure") : t("queueUnstick"));
+      unstick.addEventListener("click", async () => {
+        if (unsticking) return;
+        if (!unstickArmed) {
+          unstickArmed = true;
+          unstick.textContent = t("queueUnstickSure");
+          setTimeout(() => {
+            unstickArmed = false;
+          }, 3000);
+          return;
+        }
+        unstickArmed = false;
+        unsticking = true;
+        unstick.disabled = true;
+        unstick.textContent = t("queueUnsticking");
+        // Success in his language (the hub's message is English and the toast was easy to miss);
+        // a refusal keeps the hub's reason, which says what to do in Studio
+        await api.post("/api/queue/unstick", { placeId })
+          .then((r) => (r?.ok === false ? toast(r?.message || t("queueUnstickFailed"), true) : toast(t("queueUnstuck"), false, 6000)))
+          .catch(fail)
+          .finally(() => {
+            unsticking = false;
+          });
+        fill();
+      });
+      const foreign = stuck.kind === "foreign-play";
+      stuckRow = h("div", { class: "field" },
+        h("span", { class: "grow bad" }, stuck.kind === "foreign-play" ? t("queueForeignPlay", { d: span(stuck.forMs) }) : t("queueStuck", { d: span(stuck.forMs) }),
+          h("span", { class: "hint", title: stuck.error }, foreign ? t("queueForeignPlayHint") : [t("queueStuckTries", { n: stuck.tries }), stuck.error].filter(Boolean).join(" · "))),
+        unstick);
+    }
     const holder = q.holder;
     const studio = h("div", { class: "card chunk" },
       h("span", { class: "label" }, t("queueStudio")),
@@ -705,6 +750,7 @@ async function renderQueue(target) {
           holder ? (holder.runner ? t("queueHeldByQueue", { d: span(holder.heldMs) }) : t("queueHeldBy", { who: who(holder.client), d: span(holder.heldMs) })) : t("queueFree"),
           holder && h("span", { class: "hint" }, [holder.requestedMin ? t("queueAsked", { n: holder.requestedMin }) : null, t("queueLastCall", { d: span(holder.idleMs), tool: holder.tool })].filter(Boolean).join(" · "))),
         holder ? release : h("span", { class: "pill live" }, t("queueFree"))),
+      stuckRow,
       q.cap?.active ? h("p", { class: "note" }, t("queueCapped", { who: q.cap.clientId })) : null,
       q.publish?.current ? h("div", { class: "field" },
         h("span", { class: "grow" }, t("queuePublishing", { who: who(q.publish.current.client), d: span(q.publish.current.ms) }),
@@ -731,10 +777,12 @@ async function renderQueue(target) {
     if (!q.jobs.length) jobs.append(h("p", { class: "note" }, t("queueNoJobs")));
     for (const j of q.jobs) {
       const running = q.running?.id === j.id;
+      const wait = jobWait(j);
       jobs.append(h("div", { class: "field" },
         h("span", { class: "grow" }, j.name, h("span", { class: "hint mono" }, `${who(j.client)} · ${shortPath(j.root)}`)),
         running ? h("span", { class: "pill live" }, t("queueRunning")) : null,
-        j.infra ? h("span", { class: "pill warn", title: j.infra.last }, t("queueInfraTry", { n: j.infra.tries, d: span(j.infra.retryInMs) })) : null,
+        wait === "stuck" ? h("span", { class: "pill bad", title: j.stuck.last ?? "" }, t("queueStuckJob")) : null,
+        wait === "infra" ? h("span", { class: "pill warn", title: j.infra.last }, t("queueInfraTry", { n: j.infra.tries, d: span(j.infra.retryInMs) })) : null,
         j.alone ? h("span", { class: "pill sky" }, t("queueAlone")) : null,
         h("span", { class: "mono muted" }, span(running ? q.running.ms : j.waitedMs))));
     }
@@ -745,22 +793,49 @@ async function renderQueue(target) {
         h("span", { class: "mono muted" }, span(Date.now() - q.play.since))));
     }
 
+    // The day's answers (decision 25): a job that never ran is red and says so, never a result
+    const recent = recentOf(q);
+    const answers = recent.length ? h("div", { class: "card chunk" }, h("span", { class: "label" }, t("queueRecent"))) : null;
+    for (const r of recent) {
+      const notRun = r.verdict === "infra";
+      const hint = [who(r.client), notRun ? r.reason : null].filter(Boolean).join(" · ");
+      answers.append(h("div", { class: "field", title: r.reason ?? "" },
+        h("span", { class: notRun ? "grow bad" : "grow" }, r.name, h("span", { class: "hint mono" }, hint)),
+        r.verdict === "pass" ? h("span", { class: "pill live" }, t("queueRecentPass"))
+          : r.verdict === "fail" ? h("span", { class: "pill warn", title: r.reason ?? "" }, t("queueRecentFail"))
+            : h("span", { class: "pill bad", title: r.reason ?? "" }, t("queueRecentNotRun")),
+        notRun ? null : h("span", { class: "mono muted" }, span(r.ms)),
+        h("span", { class: "mono muted", title: new Date(r.at).toLocaleTimeString() }, t("queueAgo", { d: span(Date.now() - r.at) }))));
+    }
+
     const d = q.today;
-    const stat = (value, label) => h("div", { class: "stat chunk" }, h("span", { class: "v" }, value), h("span", { class: "label" }, label));
-    const failures = Object.entries(d.failures ?? {});
-    const today = h("div", { class: "card chunk" },
-      h("span", { class: "label" }, t("queueToday")),
-      h("div", { class: "stats", style: "margin-top:8px" },
+    const stat = (value, label, kind = "") => h("div", { class: `stat chunk${kind ? ` ${kind}` : ""}` }, h("span", { class: "v" }, value), h("span", { class: "label" }, label));
+    const { notRun, failures } = todayOf(d);
+    // A hub that counts the not-run jobs apart gets their own tile; p50 and p90 share one so the
+    // grid keeps its two rows of three
+    const stats = notRun === null
+      ? [
         stat(String(d.jobs), t("queueJobsDone")),
         stat(String(d.passed), t("queuePassed")),
         stat(`${d.plays}`, `${t("queuePlays")} (${d.sharedPlays} ${t("queueShared")})`),
         stat(d.jobsPerPlay == null ? "–" : String(d.jobsPerPlay), t("queuePerPlay")),
         stat(span(d.queueP50Ms), t("queueP50")),
-        stat(span(d.queueP90Ms), t("queueP90"))),
+        stat(span(d.queueP90Ms), t("queueP90"))]
+      : [
+        stat(String(d.jobs), t("queueJobsDone")),
+        stat(String(d.passed), t("queuePassed")),
+        stat(String(notRun), t("queueNotRun"), notRun > 0 ? "bad" : ""),
+        stat(`${d.plays}`, `${t("queuePlays")} (${d.sharedPlays} ${t("queueShared")})`),
+        stat(d.jobsPerPlay == null ? "–" : String(d.jobsPerPlay), t("queuePerPlay")),
+        stat(span(d.queueP50Ms), `${t("queueP50")} (p90 ${span(d.queueP90Ms)})`)];
+    const today = h("div", { class: "card chunk" },
+      h("span", { class: "label" }, t("queueToday")),
+      h("div", { class: "stats", style: "margin-top:8px" }, ...stats),
       failures.length ? h("div", { class: "field" }, h("span", { class: "grow" }, t("queueFailures")), ...failures.map(([k, n]) => h("span", { class: "pill warn" }, `${k} ${n}`))) : null,
+      notRun ? h("p", { class: "note" }, t("queueNotRunNote", { n: notRun })) : null,
       h("p", { class: "note" }, `${d.grants} ${t("queueHolds", { n: d.grantsCapped })}`));
 
-    body.replaceChildren(h("div", { class: "cards" }, h("div", { style: "display:flex;flex-direction:column;gap:16px" }, studio, waiting), h("div", { style: "display:flex;flex-direction:column;gap:16px" }, jobs, today)));
+    body.replaceChildren(h("div", { class: "cards" }, h("div", { style: "display:flex;flex-direction:column;gap:16px" }, studio, waiting), h("div", { style: "display:flex;flex-direction:column;gap:16px" }, jobs, answers, today)));
   };
   await fill();
   if (mine === generation) queueTimer = every(QUEUE_POLL_MS, fill);
@@ -1418,6 +1493,8 @@ const QUEUE_FIELDS = [
   ["infraTries", "qsInfraTries"],
   ["lingerSec", "qsLingerSec"],
   ["agingMin", "qsAgingMin"],
+  ["stuckRetrySec", "qsStuckRetrySec"],
+  ["stuckGiveUpMin", "qsStuckGiveUpMin"],
 ];
 
 function queueCard(settings) {
@@ -1432,7 +1509,7 @@ function queueCard(settings) {
       contentKey = "";
       renderContent();
     }).catch(fail);
-  for (const [key, label] of QUEUE_FIELDS) {
+  for (const [key, label] of knownFields(QUEUE_FIELDS, settings)) {
     const list = key === "infraWaitSec";
     const input = h("input", { class: "field-input mono", style: "width:96px;text-align:right", value: list ? settings[key].join(", ") : String(settings[key]), inputmode: "decimal", "aria-label": t(label) });
     input.addEventListener("change", () => {

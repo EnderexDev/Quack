@@ -58,12 +58,12 @@ export function h(tag, props = {}, ...children) {
 }
 
 let toastTimer;
-export function toast(text, bad = false) {
+export function toast(text, bad = false, ms = bad ? 5000 : 2200) {
   document.querySelector(".toast")?.remove();
   const node = h("div", { class: `toast chunk${bad ? " bad" : ""}` }, text);
   document.body.append(node);
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => node.remove(), bad ? 5000 : 2200);
+  toastTimer = setTimeout(() => node.remove(), ms);
 }
 
 /** Settings first (for the language), then every hub-state the app polls */

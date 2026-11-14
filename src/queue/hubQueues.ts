@@ -10,7 +10,10 @@ import { PublishError, type PublishGit } from "./publish.js";
  * The hub's side of the Studio queue: one PlaceQueue per registered place, the clock that ticks
  * their locks, and the API (/api/queue/...) the app, the CLI and outside clients use.
  *
- * GET  /api/queue?placeId=             status: lock, waiting list, jobs, the play, the day's speed
+ * GET  /api/queue?placeId=             status: lock, waiting list, jobs, the play, the day's speed,
+ *      `stuck` ({ kind, since, error, tries } while something holds every job back, else null: kind
+ *      "refused", Studio refuses every play start; "foreign-play", a play Quack did not start is up) and
+ *      `recent` (the day's last 15 answered jobs, newest first: { id, name, client, verdict, reason?, at, ms })
  * GET  /api/queue/job?placeId=&id=     a job's state, or its verdict
  * GET  /api/queue/settings             the hub's timings
  * POST /api/queue/settings {..}        change them (the app's Settings)
@@ -18,7 +21,9 @@ import { PublishError, type PublishGit } from "./publish.js";
  * POST /api/queue/lock    { placeId, op, client, ... } op: claim | touch | release | join | leave
  * POST /api/queue/release-all { client: { id }, placeId?, keepPlaceInLine? }   the client is done: every lock and place
  *      in line it has; keepPlaceInLine (a turn that ended, its wait still running): only the locks
- * POST /api/queue/force-release { placeId }   the app's one button: frees the lock whoever holds it
+ * POST /api/queue/force-release { placeId }   the app's button: frees the lock whoever holds it
+ * POST /api/queue/unstick { placeId }   the app's Unstick: the play's server ends the test Studio thinks
+ *      is running, or the play Quack did not start (never done by the queue on its own); { ok, stopped, message }, a failure too
  * POST /api/queue/publish { placeId, op, ... }  publishing the place (publish.ts):
  *      join { client, commit?, task?, level?, rush? }  a ticket, or the publish that already shipped the commit
  *      claim { ticket }   the ticket's turn ("yours": publish now), "waiting", or the publish that covered it
@@ -250,6 +255,13 @@ export class HubQueues {
         const was = queue.lock.release(null, true);
         if (was) this.options.log(`${queue.name ?? queue.placeId}: Studio lock freed by hand (was ${was.client.name ?? was.client.id})`);
         return { released: Boolean(was), was };
+      }
+      case "/api/queue/unstick": {
+        const queue = this.queueOf(body.placeId);
+        return queue.unstick().then((answer) => {
+          this.options.log(`${queue.name ?? queue.placeId}: unstick asked by hand: ${answer.message}`);
+          return answer;
+        });
       }
     }
     throw new QueueError(404, "not found");

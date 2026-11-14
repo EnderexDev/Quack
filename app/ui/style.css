@@ -149,6 +149,7 @@ html.dev .brand .mark { background-image: url(logo-dev.svg); }
 .stat:hover { background: var(--ink-700); }
 .stat .v { font-family: var(--display); font-size: 26px; line-height: 1; color: var(--brand-400); letter-spacing: -0.04em; }
 .stat.warn .v { color: var(--idle); }
+.stat.bad .v { color: #ff8b84; }
 .br { position: absolute; width: 14px; height: 14px; border-color: var(--ink-600); transition: transform .28s var(--ease), border-color .2s; }
 .br.tl { top: 8px; left: 8px; border-top: 3px solid; border-left: 3px solid; border-top-left-radius: 7px; }
 .br.brr { right: 8px; bottom: 8px; border-right: 3px solid; border-bottom: 3px solid; border-bottom-right-radius: 7px; }
@@ -193,6 +194,7 @@ html.dev .brand .mark { background-image: url(logo-dev.svg); }
 .field { display: flex; align-items: center; gap: 12px; padding: 9px 0; border-top: 3px solid var(--ink-700); color: var(--ink-200); font-weight: 600; font-size: 12.5px; }
 .card > .field:first-of-type { border-top: 0; }
 .field .hint { display: block; font-weight: 500; color: var(--ink-500); font-size: 11px; margin-top: 2px; }
+.field .grow.bad { color: #ff8b84; }
 .place { display: flex; align-items: center; gap: 10px; background: var(--ink-900); border-radius: 12px; padding: 9px 12px; margin-bottom: 8px; }
 .place b { color: var(--ink-200); font-size: 12.5px; display: block; }
 .place .mono { color: var(--ink-400); font-size: 10.5px; overflow-wrap: anywhere; }

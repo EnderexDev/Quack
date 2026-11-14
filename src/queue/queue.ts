@@ -32,7 +32,14 @@ import { effectiveSettings, readGameConfig, type QueueSettings } from "./setting
  *    the job's files).
  * 5. A job that failed in its own code keeps its play `holdSec` for its client's fixed resubmit.
  * 6. Infrastructure failures go back to the queue after a wait, `infraTries` times, and only then
- *    are answered, as infra.
+ *    are answered, as infra. Studio refusing to start a play because it thinks a test is still in
+ *    progress spends no try: the queue is stuck, every job waits, one start is tried every
+ *    `stuckRetrySec` for the whole queue, and a job is answered as infra only once it has itself
+ *    waited `stuckGiveUpMin` under refusals in a row (a play seen up, no job waiting, or a gap of
+ *    more than two retries ends the streak). A play nobody's tool started (a Local Server test
+ *    started in Studio) is waited on and shown the same way, and never answers a job. The app's
+ *    "unstick" button (never the queue on its own: it may be a session's play) asks the play's
+ *    server to end the test.
  * 7. The play stays up `lingerSec` for a late job, then stops; the runner gives the lock back.
  * 8. A client that asks for Studio live (an exclusive waiter) gets it once the batch ends.
  *
@@ -61,6 +68,11 @@ export interface Timings {
   phaseTimeoutMs: number;
   /** How long a play left up by the previous hub is asked about while Studio does not answer */
   adoptMs: number;
+  /**
+   * Refusals in a row: a start tried more than 2 x stuckRetrySec + this after the last refusal
+   * (plus the window and the sync check that come before a start) begins a new streak
+   */
+  stuckSlackMs: number;
 }
 
 export const DEFAULT_TIMINGS: Timings = {
@@ -74,6 +86,7 @@ export const DEFAULT_TIMINGS: Timings = {
   capPlayMs: 2 * 60_000,
   phaseTimeoutMs: 120_000,
   adoptMs: 60_000,
+  stuckSlackMs: 10_000,
 };
 
 export interface JobInput {
@@ -97,6 +110,8 @@ export interface Job extends JobInput {
   submittedAt: number;
   state: "pending" | "running";
   infra?: InfraTries;
+  /** Studio refused to start a play while this job waited: since when (this job's own give-up clock, within the current streak), and its last refusal (no try spent) */
+  stuck?: { since: number; last: string };
   /** Failed in a shared play: runs again alone, and this is the first run */
   soloRetry?: { with: string[]; pass: false; play: string; reason: string; ms: number };
 }
@@ -142,8 +157,37 @@ export interface QueueOptions {
 const LAZY_SAVE_MS = 5000;
 const INFRA_PHASE = /^a phase call failed|^the cleanup call failed|^unreadable phase result/;
 const TIMED_OUT = /did not answer in \d+ s/;
+/**
+ * Studio refuses the start because it thinks a test is still in progress, while edit mode says no
+ * play is up (incident of 14/11/26 in the Astral): waiting, or ending that test, fixes it; the job
+ * has nothing to do with it. Other start errors ("already running", "transition") mean a play is
+ * up or leaving, and keep their own paths.
+ */
+const STUDIO_REFUSES = /previous one is still in progress/i;
+
+/**
+ * What holds every job back, for the app's banner and Unstick:
+ * - "refused": Studio refused every play start since `since` (`tries` refusals, the last at `last`,
+ *   the next start at `retryAt`). Refusals in a row: one older than the gap starts a new streak.
+ * - "foreign-play": a play nobody's tool started is up (a Local Server test started in Studio), so
+ *   the queue waits for it (`tries` looks, the last at `last`). It never answers a job.
+ */
+interface StuckState {
+  kind: "refused" | "foreign-play";
+  since: number;
+  error: string;
+  tries: number;
+  last: number;
+  retryAt: number;
+}
+
+const FOREIGN_PLAY = "a play Quack did not start is up, e.g. a Local Server test started from Studio: the queue waits for it to end";
+
+const shortAgo = (ms: number) => (ms < 60_000 ? `${Math.max(0, Math.round(ms / 1000))} s` : `${Math.round(ms / 60_000)} min`);
 const LEVEL_CODE: Record<string, string> = { MessageError: "ERR", MessageWarning: "WARN", MessageInfo: "INFO", MessageOutput: "OUT" };
 const ORDER: Level[] = ["critical", "blocking", "update", "normal", "low"];
+/** Answered jobs the status lists */
+const RECENT = 15;
 
 /** Where a place's queue keeps its state, verdicts and history */
 export function queueDir(folder: string, placeId: string): string {
@@ -221,6 +265,10 @@ export class PlaceQueue {
   private phase = "idle";
   private runningJob: { id: string; name: string; client: Client; since: number } | null = null;
   private waiting: { key: string; reason: string; queue: number; since: number } | null = null;
+  /** Studio refuses to start a play (the jobs wait, one start a `stuckRetrySec` for the whole queue), or a foreign play is up */
+  private stuck: StuckState | null = null;
+  /** When the runner last asked Studio for a play: a start in progress keeps a refusal streak shown */
+  private attemptAt = 0;
 
   constructor(options: QueueOptions) {
     this.placeId = options.placeId;
@@ -283,6 +331,15 @@ export class PlaceQueue {
     }
     this.lock.restore(saved?.lock);
     this.publishes.restore(saved?.publish);
+    const st = saved?.stuck;
+    // A refusal streak with jobs still waiting goes on (the next start is tried at once, and a
+    // refusal past the gap starts it over: a long downtime is no refusal). A foreign play is
+    // looked at again, and a job's refusal clock lives only inside its streak
+    if (st && (st.kind ?? "refused") === "refused" && typeof st.since === "number" && typeof st.error === "string" && this.jobs.size > 0) {
+      this.stuck = { kind: "refused", since: st.since, error: st.error, tries: Number(st.tries) || 1, last: Number(st.last) || st.since, retryAt: 0 };
+    } else {
+      for (const job of this.jobs.values()) job.stuck = undefined;
+    }
     if (saved?.play && typeof saved.play.token === "string" && Array.isArray(saved.play.roots)) {
       this.adoptable = { token: saved.play.token, roots: saved.play.roots.map(String) };
     }
@@ -321,6 +378,7 @@ export class PlaceQueue {
       lock: this.lock.serialize(),
       publish: this.publishes.serialize(),
       play: this.playing && this.playToken ? { token: this.playToken, roots: this.playRoots } : (this.adoptable ?? null),
+      stuck: this.stuck,
     };
     try {
       fs.mkdirSync(this.dir, { recursive: true });
@@ -408,6 +466,7 @@ export class PlaceQueue {
       fresh: input.fresh === true,
       root: path.resolve(input.root),
       source: input.source,
+      ...(this.refusing() ? { stuck: { since: this.now(), last: this.stuck!.error } } : {}),
     };
     this.jobs.set(id, job);
     this.save();
@@ -462,6 +521,7 @@ export class PlaceQueue {
       this.writeVerdict({ id: job.id, name: job.name, client: job.client, pass: false, dropped: "its client's process ended before it ran", ms: 0, queuedMs: this.now() - job.submittedAt, finishedAt: this.now() });
       this.log(`queue: ${job.name} dropped, its client ${job.client.name ?? job.client.id} is gone`);
     }
+    if (this.stuck && this.pendingSummary().count === 0) this.endStuck("no job waits");
     if (this.hasWork()) this.kick();
   }
 
@@ -474,12 +534,23 @@ export class PlaceQueue {
     const holder = this.lock.state.holder;
     const ranked = this.lock.ranked();
     const cap = this.lock.state.cap;
+    const { recent, ...today } = this.stats(now);
+    const stuck = this.stuckNow();
+    const refusing = stuck?.kind === "refused";
     return {
       placeId: this.placeId,
       name: this.name,
       folder: this.folder,
       settings,
-      phase: this.phase,
+      phase:
+        refusing && !this.playing
+          ? `Studio refuses to start a play: a previous test is still in progress (for ${shortAgo(now - stuck.since)}; ${stuck.tries} ${stuck.tries === 1 ? "try" : "tries"}, the next in ${shortAgo(Math.max(0, stuck.retryAt - now))})`
+          : this.phase,
+      /**
+       * What holds every job back (null: nothing): "refused", Studio refused every play start since
+       * `since`; "foreign-play", a play Quack did not start is up since `since`. Unstick ends either
+       */
+      stuck: stuck ? { kind: stuck.kind, since: stuck.since, error: stuck.error, tries: stuck.tries } : null,
       holder: holder && { ...holder, heldMs: now - holder.acquiredAt, idleMs: now - holder.lastUsed },
       waiters: ranked.map((w) => ({ ...w, waitedMs: now - w.since, effectiveLevel: this.effectiveLevel(w.level, w.since) })),
       cap: cap && { ...cap, active: this.lock.activeCap(cap.clientId) !== null },
@@ -492,14 +563,21 @@ export class PlaceQueue {
         state: j.state,
         waitedMs: now - j.submittedAt,
         fresh: j.fresh,
-        ...(j.infra ? { infra: { tries: j.infra.n, retryInMs: Math.max(0, j.infra.retryAt - now), last: j.infra.last } } : {}),
+        // A job Studio's refusal holds shows that, never an infra try (it spends none)
+        ...((j.stuck && refusing && j.state === "pending"
+          ? { stuck: { since: j.stuck.since, last: j.stuck.last } }
+          : j.infra
+            ? { infra: { tries: j.infra.n, retryInMs: Math.max(0, j.infra.retryAt - now), last: j.infra.last } }
+            : {}) as { stuck?: { since: number; last: string }; infra?: { tries: number; retryInMs: number; last: string } }),
         ...(j.soloRetry ? { alone: true } : {}),
       })),
       play: this.playing
         ? { roots: this.playRoots, since: this.playStartedAt, jobs: this.jobsInPlay, held: this.holdActive() ? { client: this.hold!.client, leftMs: this.hold!.until - now } : null }
         : null,
       publish: this.publishes.status(),
-      today: this.stats(now),
+      today,
+      /** The day's last answered jobs, newest first; an infra one did not run */
+      recent,
     };
   }
 
@@ -539,7 +617,10 @@ export class PlaceQueue {
     } catch {
       // nothing today
     }
-    const jobs = lines.filter((l) => l.kind === "job");
+    const answered = lines.filter((l) => l.kind === "job");
+    // A job answered as infra did not run (decision 25): no pass and no fail, and no wait in the queue's numbers
+    const notRun = answered.filter((j) => j.failure === "infra");
+    const jobs = answered.filter((j) => j.failure !== "infra");
     const plays = lines.filter((l) => l.kind === "play");
     const inPlays = jobs.filter((j) => j.playId);
     const failures: Record<string, number> = {};
@@ -557,6 +638,19 @@ export class PlaceQueue {
       failures,
       grants: grants.length,
       grantsCapped: grants.filter((g) => g.endedBy === "cap").length,
+      notRun: notRun.length,
+      recent: answered
+        .slice(-RECENT)
+        .reverse()
+        .map((j) => ({
+          id: String(j.id),
+          name: String(j.name),
+          client: j.client,
+          verdict: (j.pass ? "pass" : j.failure === "infra" ? "infra" : "fail") as "pass" | "fail" | "infra",
+          ...(typeof j.reason === "string" && j.reason ? { reason: j.reason } : {}),
+          at: Number(j.at),
+          ms: Number(j.ms) || 0,
+        })),
     };
   }
 
@@ -602,6 +696,8 @@ export class PlaceQueue {
 
   private readyJobs(): Job[] {
     const now = this.now();
+    // Studio refuses plays: nothing is ready until the queue's next try, whatever arrived meanwhile
+    if (this.stuckWaits()) return [];
     return [...this.jobs.values()].filter((j) => j.state === "pending" && !(j.infra && j.infra.retryAt > now));
   }
 
@@ -650,9 +746,11 @@ export class PlaceQueue {
         const idle = this.now() - idleSince;
         if (this.playing && idle > settings.lingerSec * 1000 && !this.holdActive()) await this.standDown(false);
         if (!this.playing && this.runnerHolds()) this.giveLockBack();
+        // No job waits: nothing is held back by Studio any more
+        if (this.stuck && this.pendingSummary().count === 0) this.endStuck("no job waits");
         // Nothing queued, no play, no lock: the runner ends; the next submit starts it again
         if (!this.playing && !this.runnerHolds() && this.pendingSummary().count === 0) break;
-        this.setPhase(this.playing ? "idle, play kept up for late jobs" : "waiting out an infra retry");
+        this.setPhase(this.playing ? "idle, play kept up for late jobs" : this.stuck?.kind === "refused" ? "waiting: Studio refuses to start a play" : "waiting out an infra retry");
         await this.sleep(this.t.tickMs);
         continue;
       }
@@ -677,6 +775,7 @@ export class PlaceQueue {
       try {
         const outcome = await this.batch(jobs);
         if (outcome === "foreign play") {
+          this.foreignPlayUp();
           this.noteWait("foreign play", "a play the queue did not start is running", jobs.length);
           this.liftStaleCap();
           this.giveLockBack();
@@ -700,7 +799,9 @@ export class PlaceQueue {
         for (const job of jobs) {
           const live = this.jobs.get(job.id);
           if (!live) continue;
-          if (lost) live.state = "pending";
+          // Held by a refusal this batch recorded: it waits for the queue's next try, no try spent.
+          // Any other failure (Studio gone, the daemon down) spends its tries as usual
+          if (lost || (this.stuckWaits() && live.stuck && live.state === "pending")) live.state = "pending";
           else this.infra(live, `the queue failed: ${(error as Error).message}`);
         }
         if (!lost) {
@@ -882,6 +983,8 @@ export class PlaceQueue {
 
   /** Infra: back to the queue after a wait, answered as infra only after `infraTries` (or at once when waiting cannot fix it) */
   private infra(job: Job, reason: string, { retry = true, result = {} as Partial<Verdict> } = {}): void {
+    // Dropped meanwhile (its client is gone, tick() answered it): one verdict per job
+    if (this.jobs.get(job.id) !== job) return;
     const settings = this.settings();
     const tries: InfraTries = job.infra ? { ...job.infra } : { n: 0, retryAt: 0, last: "" };
     tries.n++;
@@ -897,6 +1000,170 @@ export class PlaceQueue {
     job.state = "pending";
     this.save();
     this.log(`queue: ${job.name}: infra, try ${tries.n} of ${settings.infraTries}, again in ${Math.round((tries.retryAt - this.now()) / 1000)} s: ${tries.last}`);
+  }
+
+  /** The jobs still waiting: a give-up earlier in the batch may have answered the rest */
+  private stillQueued(jobs: Job[]): Job[] {
+    return jobs.filter((j) => this.jobs.get(j.id) === j && j.state === "pending");
+  }
+
+  /**
+   * Refusals in a row: two retries, plus what comes before a start (the window, the sync check)
+   * and a slack. A start tried longer than this after the last refusal (a session held Studio, the
+   * hub was down) begins a new streak, and the banner over a queue that stopped trying goes away
+   */
+  private stuckGapMs(): number {
+    return 2 * this.settings().stuckRetrySec * 1000 + this.t.windowMs + this.t.syncWaitMs + this.t.stuckSlackMs;
+  }
+
+  /** What holds the jobs back now, as the status shows it: nothing with no job waiting, nor a streak the queue stopped trying */
+  private stuckNow(): StuckState | null {
+    const s = this.stuck;
+    if (!s || this.pendingSummary().count === 0) return null;
+    // A start in progress (a big place takes seconds to refuse) keeps the streak shown
+    const seen = Math.max(s.last, s.kind === "refused" ? this.attemptAt : 0);
+    return this.now() - seen <= this.stuckGapMs() ? s : null;
+  }
+
+  /** Studio is refusing plays now: a job that arrives waits on that from its arrival */
+  private refusing(): boolean {
+    return this.stuckNow()?.kind === "refused";
+  }
+
+  /** Studio refused plays and its next try is not due: every job waits */
+  private stuckWaits(): boolean {
+    return this.stuck?.kind === "refused" && this.now() < this.stuck.retryAt;
+  }
+
+  /** At the top of each play cycle: while the queue waits out a refusal, its jobs stay queued and Studio is not asked */
+  private stuckHolds(jobs: Job[]): boolean {
+    if (!this.stuckWaits()) return false;
+    for (const job of jobs) {
+      job.state = "pending";
+      job.stuck ??= { since: this.now(), last: this.stuck!.error };
+    }
+    return true;
+  }
+
+  /**
+   * Studio refused the play start (decision 23): no try spent, every job waiting stays queued with
+   * the reason, and the queue tries one start again in `stuckRetrySec`. A job is answered as infra,
+   * once, only when this fresh refusal finds it has itself waited `stuckGiveUpMin` under refusals
+   * in a row. `attemptAt`: when the refused start was asked (the gap to the last refusal is
+   * measured to it, so a slow refusal does not break the streak).
+   */
+  private refused(queued: Job[], error: string, attemptAt: number): void {
+    const now = this.now();
+    const settings = this.settings();
+    const last = String(error).slice(0, 300);
+    const prev = this.stuck?.kind === "refused" ? this.stuck : null;
+    const streak = prev !== null && attemptAt - prev.last <= this.stuckGapMs();
+    if (!streak) {
+      // A new streak: the old one's clocks (the queue's and each job's) count for nothing
+      if (this.stuck) this.endStuck(prev ? `no refusal for ${shortAgo(attemptAt - prev.last)}, a new streak begins` : "Studio refuses to start a play");
+      this.stuck = { kind: "refused", since: now, error: last, tries: 1, last: now, retryAt: 0 };
+      this.history({ kind: "stuck", error: last });
+    } else {
+      this.stuck = { ...prev, error: last, tries: prev.tries + 1, last: now };
+    }
+    const stuck = this.stuck;
+    stuck.retryAt = now + settings.stuckRetrySec * 1000;
+    const held = new Set<Job>(this.stillQueued(queued));
+    for (const job of this.jobs.values()) if (job.state === "pending") held.add(job);
+    const giveUpMs = settings.stuckGiveUpMin * 60_000;
+    const answered: { job: Job; waited: number }[] = [];
+    for (const job of held) {
+      // Never older than the streak: a clock from before it (a restart, a state file) does not count
+      const since = Math.max(job.stuck?.since ?? now, stuck.since);
+      if (now - since >= giveUpMs) answered.push({ job, waited: now - since });
+      else {
+        job.state = "pending";
+        job.stuck = { since, last };
+      }
+    }
+    const streakMs = now - stuck.since;
+    if (answered.length) {
+      this.history({ kind: "stuck", gaveUp: answered.length, ms: streakMs, tries: stuck.tries, error: last });
+      this.log(`queue: Studio refused to start a play for ${shortAgo(streakMs)} (${stuck.tries} tries): ${answered.length} job(s) that waited ${settings.stuckGiveUpMin} min on it are answered as infra`);
+      for (const { job, waited } of answered) {
+        job.stuck = undefined;
+        this.infra(job, `Studio refused to start a play for ${shortAgo(waited)} (${stuck.tries} tries): ${last} Unstick in the app, Stop in Studio or reopening the place ends the test it thinks is running`, { retry: false });
+      }
+    }
+    this.save();
+    if (this.pendingSummary().count === 0) {
+      this.endStuck("no job waits on it");
+      return;
+    }
+    this.log(`queue: Studio refuses to start a play (${streak ? `refused ${stuck.tries} times in ${shortAgo(streakMs)}` : "first refusal"}), ${held.size - answered.length} job(s) wait, no try spent; again in ${settings.stuckRetrySec} s: ${last}`);
+  }
+
+  /**
+   * A play nobody's tool started is up (a Local Server test started in Studio: its server peer is
+   * connected): the queue waits for it and never stops it, so the app shows it with Unstick. No job
+   * is answered for it. A refusal streak ends here: Studio refuses because of this play.
+   */
+  private foreignPlayUp(): void {
+    const now = this.now();
+    if (this.stuck?.kind === "foreign-play") {
+      this.stuck.tries++;
+      this.stuck.last = now;
+      return;
+    }
+    if (this.stuck) this.endStuck("a play Quack did not start is up");
+    this.stuck = { kind: "foreign-play", since: now, error: FOREIGN_PLAY, tries: 1, last: now, retryAt: 0 };
+    this.history({ kind: "stuck", as: "foreign-play", error: FOREIGN_PLAY });
+    this.log(`queue: ${FOREIGN_PLAY}; Unstick in the app ends it`);
+    this.save();
+  }
+
+  /** Nothing holds the jobs back any more (a play started, a play is up, no job waits, a new streak) */
+  private endStuck(why: string): void {
+    const s = this.stuck;
+    if (!s) return;
+    const ms = this.now() - s.since;
+    this.history({ kind: "stuck", as: s.kind, ended: true, ms, tries: s.tries, why });
+    this.log(
+      s.kind === "refused"
+        ? `queue: Studio refused plays ${s.tries} time(s) in ${shortAgo(ms)}; that wait ends: ${why}`
+        : `queue: the wait on a play Quack did not start ends after ${shortAgo(ms)}: ${why}`,
+    );
+    this.stuck = null;
+    for (const job of this.jobs.values()) job.stuck = undefined;
+    this.save();
+  }
+
+  /**
+   * The app's Unstick (decision 24, never automatic: the test Studio thinks runs may be a
+   * session's): the play's server ends it (StudioTestService:EndTest), and the queue tries a start
+   * at once. Every failure is an answer, so the app shows why.
+   */
+  async unstick(): Promise<{ ok: boolean; stopped: boolean; message: string }> {
+    const no = (message: string) => ({ ok: false, stopped: false, message });
+    if (this.playing) return no("the play up is the queue's own, and Studio started it: there is nothing to unstick");
+    let status: any;
+    try {
+      status = await this.studio("playtest", { action: "status" }, 10_000);
+    } catch (error) {
+      return no(`could not ask Studio about its play: ${(error as Error).message}`);
+    }
+    if (status?.editConnected === false) return no("Studio is not connected to this place: open it in Studio");
+    if (status?.server !== "ready") {
+      return no(
+        `Studio has no play peer Quack can stop (the play's server: ${status?.server ?? "none"}): press Stop in Studio, or close and reopen the place`,
+      );
+    }
+    try {
+      await this.studio("playtest", { action: "stop", timeoutMs: 30_000 }, 30_000);
+    } catch (error) {
+      return no(`the play's server did not end the test: ${(error as Error).message}. Press Stop in Studio, or close and reopen the place`);
+    }
+    this.history({ kind: "unstick", stuck: this.stuck ? this.now() - this.stuck.since : null });
+    this.log("queue: unstick: the play's server ended the test Studio thought was running");
+    if (this.stuck) this.stuck.retryAt = 0;
+    this.save();
+    this.kick();
+    return { ok: true, stopped: true, message: "the play's server ended the test: the queue tries a play now" };
   }
 
   private requeueAlone(job: Job, firstRun: NonNullable<Job["soloRetry"]>): void {
@@ -960,6 +1227,8 @@ export class PlaceQueue {
   }
 
   private async runJob(job: Job, how: string, extra: Extra, sourcemap: Sourcemap): Promise<void> {
+    // Dropped while its play started (its client is gone): it has its verdict, and does not run
+    if (this.jobs.get(job.id) !== job) return;
     const started = this.now();
     // A phase that timed out earlier may still run in this play: this job waits for a play of its own
     if (this.playTainted) {
@@ -1058,6 +1327,7 @@ export class PlaceQueue {
 
   /** A play just started is the runner's: its folders, and the token a later hub adopts it by */
   private async ownPlay(folders: string[], kind: string, startMs: number): Promise<void> {
+    this.endStuck("a play started");
     this.playing = true;
     this.playTainted = false;
     this.playRoots = [...folders];
@@ -1191,14 +1461,17 @@ return HttpService:JSONEncode(out)`;
   }
 
   /** One play for a worktree's jobs: its branch, checked inside the play */
-  private async branchCycle(jobs: Job[], sourcemap: Sourcemap, folder: string): Promise<void> {
+  private async branchCycle(queued: Job[], sourcemap: Sourcemap, folder: string): Promise<void> {
+    const jobs = this.stillQueued(queued);
+    if (!jobs.length || this.stuckHolds(jobs)) return;
     await this.stopPlay();
     const preStart = hashAll(folder);
     this.setPhase(`play of ${folder}`);
-    const t = this.now();
+    const t = (this.attemptAt = this.now());
     const { state, error } = await this.startBranchPlay([folder]);
     this.log(`queue: play of ${folder}: ${error ?? "started"} (${this.now() - t} ms)`);
     if (error !== null) {
+      if (STUDIO_REFUSES.test(error)) return this.refused(jobs, error, t);
       const why = (await this.playingNow()) ? "a play the queue did not start is running" : "the play did not start";
       for (const job of jobs) this.infra(job, `${why}: ${error}`);
       return;
@@ -1230,18 +1503,26 @@ return HttpService:JSONEncode(out)`;
   }
 
   /** One play for several worktrees whose branches change no script in common; each one the play's check says is missing plays alone */
-  private async sharedCycle(group: { folder: string; jobs: Job[] }[], sourcemap: Sourcemap): Promise<void> {
+  private async sharedCycle(queued: { folder: string; jobs: Job[] }[], sourcemap: Sourcemap): Promise<void> {
+    const group = queued.map((g) => ({ folder: g.folder, jobs: this.stillQueued(g.jobs) })).filter((g) => g.jobs.length);
+    if (group.length < 2) {
+      for (const g of group) await this.branchCycle(g.jobs, sourcemap, g.folder);
+      return;
+    }
     const folders = group.map((g) => g.folder);
     const alone = async (list: { folder: string; jobs: Job[] }[]) => {
       for (const g of list) await this.branchCycle(g.jobs, sourcemap, g.folder);
     };
+    if (this.stuckHolds(group.flatMap((g) => g.jobs))) return;
     await this.stopPlay();
     const preStart = new Map(folders.map((f) => [f, hashAll(f)]));
     this.setPhase(`play of ${folders.length} worktrees`);
-    const t = this.now();
+    const t = (this.attemptAt = this.now());
     const { state, error } = await this.startBranchPlay(folders);
     this.log(`queue: shared play of ${folders.join(", ")}: ${error ?? "started"} (${this.now() - t} ms)`);
     if (error !== null) {
+      // Studio refuses every play: playing each worktree alone would only ask it again, once per folder
+      if (STUDIO_REFUSES.test(error)) return this.refused(group.flatMap((g) => g.jobs), error, t);
       if (/plays one worktree at a time/.test(error)) this.multiPlay = false;
       if (!state && (await this.playingNow())) {
         for (const g of group) for (const job of g.jobs) this.infra(job, `a play the queue did not start is running: ${error}`);
@@ -1292,9 +1573,12 @@ return HttpService:JSONEncode(out)`;
   }
 
   /** One play for jobs of one folder: a worktree's goes to branchCycle; the synced folder's is stop, sync check, start, run */
-  private async cycle(jobs: Job[], sourcemap: Sourcemap): Promise<void> {
+  private async cycle(queued: Job[], sourcemap: Sourcemap): Promise<void> {
+    const jobs = this.stillQueued(queued);
+    if (!jobs.length) return;
     const folder = jobs[0].root;
     if (!this.isSynced(folder)) return this.branchCycle(jobs, sourcemap, folder);
+    if (this.stuckHolds(jobs)) return;
     await this.stopPlay();
     const now = hashAll(this.folder);
     const declared = jobs.flatMap((j) => j.files ?? []);
@@ -1329,7 +1613,7 @@ return HttpService:JSONEncode(out)`;
     this.carryOver = new Set(unverified);
     this.lastSourcemap = sourcemap;
     this.setPhase("starting the play");
-    const t = this.now();
+    const t = (this.attemptAt = this.now());
     const deadline = this.now() + this.t.startRetryMs;
     for (;;) {
       try {
@@ -1337,6 +1621,7 @@ return HttpService:JSONEncode(out)`;
         break;
       } catch (error) {
         const why = (error as Error).message;
+        if (STUDIO_REFUSES.test(why)) return this.refused(runnable, why, t);
         if (!/transition|already running/i.test(why) || this.now() > deadline) throw new Error(`play did not start: ${why}`);
         await this.sleep(1000);
       }
@@ -1366,6 +1651,8 @@ return HttpService:JSONEncode(out)`;
     if (!this.playing) {
       let status = await this.studio("playtest", { action: "status" }, 10_000);
       if (status?.editConnected === false) throw new Error("Studio is not connected to this place: open it in Studio");
+      // A play up explains a refusal: the refusals in a row end here (a foreign one shows as such below)
+      if (status?.playing && this.stuck?.kind === "refused") this.endStuck("a play is up in Studio");
       if (status?.playing && typeof status.startedBy === "string") {
         this.log(`queue: stopping the play left up by ${status.startedBy}: whoever started it no longer holds Studio`);
         this.history({ kind: "orphan-stop", startedBy: status.startedBy });
@@ -1377,6 +1664,7 @@ return HttpService:JSONEncode(out)`;
         status = await this.studio("playtest", { action: "status" }, 10_000);
       }
       if (status?.playing) return "foreign play";
+      if (this.stuck?.kind === "foreign-play") this.endStuck("the play Quack did not start ended");
     }
     this.endWait();
 

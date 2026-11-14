@@ -3457,6 +3457,10 @@ local HANDLERS: { [string]: { [Role]: (args: { [string]: any }) -> any } } = {
 			if not StudioTestService.EditModeActive then error("a play is already running: stop it first", 0) end
 			local run = args.mode == "run"
 			local players = tonumber(args.players)
+			-- Studio refuses a start in about a second ("a previous one is still in progress"):
+			-- wait for that answer so the caller gets it, instead of a plugin that never connects
+			local started = false
+			local startError: string? = nil
 			task.spawn(function()
 				local ok, err = pcall(function()
 					if players then
@@ -3468,8 +3472,18 @@ local HANDLERS: { [string]: { [Role]: (args: { [string]: any }) -> any } } = {
 					end
 					return StudioTestService:ExecutePlayModeAsync({})
 				end)
-				if not ok then warn("[Quack]: the play ended with an error:", err) end
+				if not ok then
+					if not started then startError = tostring(err) end
+					warn("[Quack]: the play ended with an error:", err)
+				end
 			end)
+			-- A solo play leaves edit mode once it is up; a multiplayer test never does, so the wait has a cap
+			local waitedFrom = os.clock()
+			while not startError and StudioTestService.EditModeActive and os.clock() - waitedFrom < 3 do
+				task.wait()
+			end
+			started = true
+			if startError then error(startError, 0) end
 			return { mode = if players then "multiplayer" elseif run then "run" else "play" }
 		end,
 	},

@@ -416,6 +416,105 @@ test("playtest status names who started the play through Quack's tools; a play s
   }
 });
 
+// playStart waits for Studio's refusal, and a big place's copy stalls the edit VM inside that wait:
+// its answer can come after 10 s although the play started. The start must not fail on it
+test("playtest start waits for a playStart answer delayed past 10 s by the place copy", { timeout: 30000 }, async () => {
+  const d = await daemon();
+  try {
+    let editMode = true;
+    const edit = await editStudio(d.url, async (tool) => {
+      if (tool === "playState") return { editModeActive: editMode };
+      if (tool === "playStart") {
+        editMode = false;
+        await new Promise((r) => setTimeout(r, 11_000));
+        await playPeer(d.url, "server", () => ({}));
+        await playPeer(d.url, "client", () => ({}));
+        return { mode: "play" };
+      }
+      throw new Error(`unexpected ${tool}`);
+    });
+    const started: any = await d.tools.call("playtest", { action: "start", timeoutSeconds: 25 });
+    assert.equal(started.mode, "play");
+    edit.close();
+  } finally {
+    await d.close();
+  }
+});
+
+// 14/11/26: a multiplayer test (Local Server) runs in other Studio processes and leaves the edit
+// DataModel's EditModeActive true; status said no play, so the queue neither stopped it nor waited,
+// and Studio refused 46 plays over 6 minutes ("a previous one is still in progress")
+test("a multiplayer test counts as a play although edit mode stays on: status says so, start refuses, stop ends it", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    const peers: WebSocket[] = [];
+    let starts = 0;
+    const startPeers = async () => {
+      peers.push(await playPeer(d.url, "server", (tool) => {
+        if (tool !== "stop") return {};
+        setTimeout(() => peers.splice(0).forEach((p) => p.close()), 50);
+        return { stopping: true };
+      }));
+    };
+    // Edit mode never leaves: Studio's edit DataModel during a Local Server test
+    const edit = await editStudio(d.url, (tool) => {
+      if (tool === "playState") return { editModeActive: true };
+      if (tool === "playStart") {
+        starts += 1;
+        return { mode: "play" };
+      }
+      throw new Error(`unexpected ${tool}`);
+    });
+    d.tools.expectPlay("mcp-7");
+    await startPeers();
+    await waitFor(() => d.ipc.playPeers().server === "ready");
+    const status: any = await d.tools.call("playtest", { action: "status" });
+    assert.equal(status.playing, true, "the server peer is up: a play runs");
+    assert.equal(status.multiplayer, true);
+    assert.equal(status.startedBy, "mcp-7", "the queue may stop it once mcp-7 no longer holds Studio");
+    await assert.rejects(d.tools.call("playtest", { action: "start" }), /a play is already running/);
+    assert.equal(starts, 0, "Studio was never asked");
+    assert.equal(d.tools.playRunning(), true, "quack play refuses before the swap");
+    await d.tools.call("playtest", { action: "stop" });
+    const after: any = await d.tools.call("playtest", { action: "status" });
+    assert.equal(after.playing, false);
+    assert.equal(after.multiplayer, undefined);
+    assert.equal(d.tools.playRunning(), false);
+    edit.close();
+  } finally {
+    await d.close();
+  }
+});
+
+// A socket that never said which peer it is ("old": a plugin from before the tools, or the older
+// of two sockets a reconnect left) is no running play: status, start and quack play ignore it
+test("an old play socket does not count as a play: status says none, start asks Studio, quack play goes on", { timeout: 20000 }, async () => {
+  const d = await daemon();
+  try {
+    let starts = 0;
+    const edit = await editStudio(d.url, (tool) => {
+      if (tool === "playState") return { editModeActive: true };
+      if (tool === "playStart") {
+        starts += 1;
+        throw new Error("refused for the test");
+      }
+      throw new Error(`unexpected ${tool}`);
+    });
+    const old = await playPeer(d.url, "server", () => ({}), { hello: false });
+    await waitFor(() => d.ipc.playPeers().server === "old");
+    const status: any = await d.tools.call("playtest", { action: "status" });
+    assert.equal(status.playing, false, "an old socket is no play");
+    assert.equal(status.multiplayer, undefined);
+    assert.equal(d.tools.playRunning(), false, "quack play is not refused for it");
+    await assert.rejects(d.tools.call("playtest", { action: "start" }), /refused for the test/);
+    assert.equal(starts, 1, "Studio was asked for the play");
+    old.close();
+    edit.close();
+  } finally {
+    await d.close();
+  }
+});
+
 test("a screenshot: the play client captures, edit mode reads the pixels, the PNG is saved", { timeout: 20000 }, async () => {
   const d = await daemon();
   try {
@@ -1250,7 +1349,6 @@ test("multiplayer: each client says its player, a call with player goes to that 
       editSeen.push({ tool, args });
       return tool === "playStart" ? { mode: "multiplayer" } : {};
     });
-    const server = await playPeer(d.url, "server", () => ({ ok: true, values: ["server"], output: [] }));
     const client = async (name: string | undefined) => {
       const ws = new WebSocket(`${d.url}/studio-output`);
       answer(ws, () => ({ ok: true, values: [name ?? "nameless"], output: [] }));
@@ -1261,6 +1359,8 @@ test("multiplayer: each client says its player, a call with player goes to that 
     const starting = d.tools.call("playtest", { action: "start", players: 2 });
     await waitFor(() => editSeen.some((m) => m.tool === "playStart"));
     assert.deepEqual(editSeen.find((m) => m.tool === "playStart").args, { mode: "play", players: 2 });
+    // The play's server comes up after the start (one already up means a play runs: start refuses)
+    const server = await playPeer(d.url, "server", () => ({ ok: true, values: ["server"], output: [] }));
     const one = await client("Player1");
     // A client whose LocalPlayer came late names itself after its hello
     const two = await client(undefined);

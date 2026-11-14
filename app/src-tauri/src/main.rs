@@ -219,6 +219,14 @@ fn hub_call(port: u16, method: &str, path: &str, body: Option<&Value>) -> Result
     hub_call_with(port, method, path, body, None)
 }
 
+/** How long a hub call may take: unstick ends a play, which takes 9 to 13 s (Dev hub, 14/11/26) */
+fn hub_timeout(path: &str) -> Duration {
+    match path {
+        "/api/queue/unstick" => Duration::from_secs(45),
+        _ => Duration::from_secs(5),
+    }
+}
+
 /**
  * A call to the hub. Every one says it is the app (the hub then knows an app is there to ask
  * the user); `token`, the approval token, only on the calls that read or answer approvals.
@@ -228,7 +236,7 @@ fn hub_call_with(port: u16, method: &str, path: &str, body: Option<&Value>, toke
         return Err("not a hub API path".into());
     }
     let url = format!("http://127.0.0.1:{port}{path}");
-    let agent = ureq::AgentBuilder::new().timeout_connect(CONNECT_TIMEOUT).timeout(Duration::from_secs(5)).build();
+    let agent = ureq::AgentBuilder::new().timeout_connect(CONNECT_TIMEOUT).timeout(hub_timeout(path)).build();
     let mut request = agent.request(method, &url).set(approval::APP_HEADER, "1");
     if let Some(token) = token {
         request = request.set(approval::TOKEN_HEADER, token);

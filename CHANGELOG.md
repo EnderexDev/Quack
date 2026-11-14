@@ -6,6 +6,13 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.36] - 2026-11-14
+
+### Fixed
+- A multiplayer test (`solo_playtest` with `players`, Studio's Local Server) now counts as a play. Studio runs it in other windows and keeps the place in edit mode, so `solo_playtest status` said no play was running while Studio refused every other play with "a previous one is still in progress" (46 plays over 6 minutes on 14/11/26, until the test was stopped). Status now says `playing` and `multiplayer`, a new start or `quack play` is refused before anything is swapped, and the Studio queue stops such a test once the session that started it no longer holds Studio.
+- The app's Queue tab no longer shows a test that never ran as if it had been tested. When Studio refuses to start a play ("a previous one is still in progress"), the Studio card says so and for how long, with an Unstick button that stops the play left up. The same card and button show while a play Quack did not start keeps the queue waiting (a Local Server test started from Studio); the waiting tests say they wait on Studio; a new Recent list shows the day's answers with the ones that did not run in red; and Today counts them apart ("did not run") instead of among the tests and failures. Settings > Queue gets the two timings of that wait.
+- Test jobs now wait while Studio refuses to start a play ("a previous one is still in progress") instead of failing as infra within a minute without running. The queue tries one play every 30 s for all of them and answers a job as infra only after it has itself waited 10 min of refusals in a row (both in Settings); a play seen up, an empty queue, or a pause of more than two tries' time (a session holding Studio, the hub restarting) starts that count over; `POST /api/queue/unstick` and `quack queue unstick` end the test Studio thinks is running. Jobs answered as infra no longer count as tests or failures in today's numbers: they are counted as not run, and the status lists the day's last 15 results.
+
 ## [1.0.35] - 2026-11-14
 
 ### Fixed
@@ -385,7 +392,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.35...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.36...HEAD
+[1.0.36]: https://github.com/EnderexDev/Quack/compare/v1.0.35...v1.0.36
 [1.0.35]: https://github.com/EnderexDev/Quack/compare/v1.0.34...v1.0.35
 [1.0.34]: https://github.com/EnderexDev/Quack/compare/v1.0.33...v1.0.34
 [1.0.33]: https://github.com/EnderexDev/Quack/compare/v1.0.32...v1.0.33

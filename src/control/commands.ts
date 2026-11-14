@@ -30,6 +30,8 @@ import { FINDINGS_EXIT, runPrecommit } from "../auto/precommit.js";
  */
 
 export const EXIT = { ok: 0, error: 1, offline: 2, timeout: 3 } as const;
+/** `queue unstick` ends a play: 9 to 13 s measured in the Dev hub (14/11/26), past the 5 s default */
+const UNSTICK_TIMEOUT_MS = 45_000;
 
 export interface ControlContext {
   info: FlavorInfo;
@@ -906,6 +908,10 @@ Studio queue (one per place: test jobs, the Studio lock and who waits for it)
                             {"version": N, "commit": "<sha>"} to; exit 0 means published.
                             --level: critical|blocking|update|normal|low (default blocking)
   queue release [place]     Free the Studio lock, whoever holds it
+  queue unstick [place]     Studio refuses to start a play ("a previous one is still in progress"), or a
+                            play Quack did not start (a Local Server test) holds the queue:
+                            the play's server ends the test Studio thinks is running, and the
+                            queue tries a play at once. Never done by the queue on its own
   queue settings            The queue's timings (the app's Settings change them)
 
 Change${info.flavor === "official" ? " (each asks first; --yes to skip, required without a terminal)" : ""}
@@ -3696,11 +3702,13 @@ export function queueText(q: any): string {
     const covered = pub.last.covered?.length ?? 0;
     lines.push(`  last publish: ${pub.last.version !== undefined ? `version ${pub.last.version}` : "a new version"} by ${clientLabel(pub.last.client)}, ${minutes(Date.now() - pub.last.at)} ago${pub.last.head ? ` (${pub.last.head.slice(0, 8)})` : ""}${covered ? `, answered ${covered} more` : ""}`);
   }
+  if (q.stuck?.kind === "foreign-play") lines.push(`  STUCK: ${q.stuck.error} (for ${minutes(Date.now() - q.stuck.since)}); no job is answered for it. \`queue unstick\` ends it`);
+  else if (q.stuck) lines.push(`  STUCK: Studio refused ${q.stuck.tries} play start(s) in the last ${minutes(Date.now() - q.stuck.since)} (${q.stuck.error}); no try spent. \`queue unstick\` ends the test Studio thinks is running`);
   if (q.running) lines.push(`  running: ${q.running.name} (${clientLabel(q.running.client)}), ${minutes(q.running.ms)}`);
   const queued = (q.jobs ?? []).filter((j: any) => j.state === "pending");
   if (queued.length) {
     lines.push(`  jobs queued (${queued.length}):`);
-    for (const j of queued) lines.push(`    ${j.name} (${clientLabel(j.client)}), ${minutes(j.waitedMs)}${j.infra ? `, infra try ${j.infra.tries}, again in ${minutes(j.infra.retryInMs)}` : ""}${j.alone ? ", again alone" : ""}`);
+    for (const j of queued) lines.push(`    ${j.name} (${clientLabel(j.client)}), ${minutes(j.waitedMs)}${j.stuck ? `, waiting: Studio refuses plays (${minutes(Date.now() - j.stuck.since)})` : j.infra ? `, infra try ${j.infra.tries}, again in ${minutes(j.infra.retryInMs)}` : ""}${j.alone ? ", again alone" : ""}`);
   }
   if (q.play) lines.push(`  play: ${q.play.roots.join(", ")}, ${q.play.jobs} job(s), up ${minutes(Date.now() - q.play.since)}${q.play.held ? `, held for ${q.play.held.client} (${minutes(q.play.held.leftMs)} left)` : ""}`);
   const t = q.today;
@@ -3709,7 +3717,7 @@ export function queueText(q: any): string {
       .map(([k, n]) => `${k} ${n}`)
       .join(", ");
     lines.push(
-      `  today: ${t.jobs} job(s), ${t.passed} passed, ${t.plays} play(s) (${t.sharedPlays} shared), ${t.jobsPerPlay ?? "-"} jobs per play, queue p50 ${minutes(t.queueP50Ms)} p90 ${minutes(t.queueP90Ms)}${fails ? `, failed: ${fails}` : ""}, ${t.grants} hold(s) by clients${t.grantsCapped ? ` (${t.grantsCapped} capped)` : ""}`,
+      `  today: ${t.jobs} job(s), ${t.passed} passed${t.notRun ? `, ${t.notRun} did not run (infra)` : ""}, ${t.plays} play(s) (${t.sharedPlays} shared), ${t.jobsPerPlay ?? "-"} jobs per play, queue p50 ${minutes(t.queueP50Ms)} p90 ${minutes(t.queueP90Ms)}${fails ? `, failed: ${fails}` : ""}, ${t.grants} hold(s) by clients${t.grantsCapped ? ` (${t.grantsCapped} capped)` : ""}`,
     );
   }
   return lines.join("\n");
@@ -3779,6 +3787,13 @@ async function queue(ctx: ControlContext, options: Options, args: string[]): Pro
           : `Studio lock of ${placeLabel(place)} was already free.`,
     );
     return EXIT.ok;
+  }
+  if (sub === "unstick") {
+    const place = await resolvePlace(ctx, rest[0]);
+    if (ctx.info.flavor === "official") await confirmOfficial(ctx, options, `queue unstick ${placeLabel(place)}`);
+    const answer = await ctx.client.post("/api/queue/unstick", { placeId: place.placeId }, UNSTICK_TIMEOUT_MS);
+    ctx.out(options.json ? JSON.stringify(answer, null, 2) : `${placeLabel(place)}: ${answer.message}`);
+    return answer.ok ? EXIT.ok : EXIT.error;
   }
   if (sub === "publish") return queuePublish(ctx, options, rest);
   if (sub !== "submit") return showStatus(sub);

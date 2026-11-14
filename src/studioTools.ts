@@ -317,6 +317,11 @@ export class StudioTools {
    * a play of Quack's tools once nobody holds Studio, never one started by hand.
    */
   private playStarter: string | undefined;
+  /** A play's server is connected: Studio would refuse a new play ("a previous one is still in progress") */
+  public static readonly PLAY_RUNNING = "a play is already running (its server is connected; a multiplayer test keeps edit mode on): stop it first";
+  public playRunning(): boolean {
+    return this.link.playPeers().server === "ready";
+  }
   private expectedStarter: { by: string; until: number } | undefined;
 
   /** The next play to come up within `ms` was asked for by `by` */
@@ -666,8 +671,18 @@ export class StudioTools {
     if (action === "status") {
       if (!this.link.editConnected()) return { editConnected: false, ...this.peerState() };
       const state = await this.request("edit", "playState", {}, 5000);
-      const playing = state.editModeActive === false;
-      return { editConnected: true, playing, ...(playing && this.playStarter ? { startedBy: this.playStarter } : {}), ...this.peerState() };
+      // A multiplayer test (Local Server) runs in other Studio processes: the edit DataModel keeps
+      // EditModeActive true all through it, and Studio refuses every other play until it ends
+      // (14/11/26: the test ran 11 minutes, and for its last 6 Studio refused 46 plays with status saying none ran)
+      const elsewhere = state.editModeActive !== false && this.link.playPeers().server === "ready";
+      const playing = state.editModeActive === false || elsewhere;
+      return {
+        editConnected: true,
+        playing,
+        ...(elsewhere ? { multiplayer: true } : {}),
+        ...(playing && this.playStarter ? { startedBy: this.playStarter } : {}),
+        ...this.peerState(),
+      };
     }
     if (action === "start") {
       const mode = args.mode === "run" ? "run" : "play";
@@ -675,14 +690,17 @@ export class StudioTools {
       const players = args.players === undefined || args.players === null ? undefined : Number(args.players);
       if (players !== undefined && (!Number.isInteger(players) || players < 1 || players > 8)) throw new ToolError("players must be a whole number from 1 to 8");
       if (players !== undefined && mode === "run") throw new ToolError("a multiplayer test has clients: leave out mode run");
+      if (this.link.playPeers().server === "ready") throw new ToolError(StudioTools.PLAY_RUNNING);
       this.expectPlay(typeof args.caller === "string" && args.caller ? args.caller.slice(0, 80) : "cli");
+      const timeoutMs = StudioTools.timeout(args, players ? 120_000 : 60_000);
       try {
-        await this.request("edit", "playStart", { mode, ...(players !== undefined ? { players } : {}) }, 10_000);
+        // playStart waits up to 3 s for Studio's refusal, and the place copy of a big place stalls
+        // the edit VM inside that wait (seconds on a 261k-instance place): its answer gets the play's budget
+        await this.request("edit", "playStart", { mode, ...(players !== undefined ? { players } : {}) }, timeoutMs);
       } catch (error) {
         this.forgetExpectedPlay();
         throw error;
       }
-      const timeoutMs = StudioTools.timeout(args, players ? 120_000 : 60_000);
       const peers = () => this.link.playPeers();
       const ready = () => peers().server === "ready" && (mode === "run" || peers().client === "ready") && (players === undefined || (peers().players?.length ?? 0) >= players);
       if (!(await this.until(ready, timeoutMs))) {

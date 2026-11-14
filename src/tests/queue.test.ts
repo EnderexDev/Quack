@@ -7,7 +7,7 @@ import path from "node:path";
 import { fnv1a, planGroups } from "../queue/disk.js";
 import { RUNNER, StudioLock, rankWaiters, type GrantRecord, type Waiter } from "../queue/lock.js";
 import { PRELUDE } from "../queue/prelude.js";
-import { PlaceQueue, type StudioPort, type Verdict } from "../queue/queue.js";
+import { PlaceQueue, queueDir, type StudioPort, type Verdict } from "../queue/queue.js";
 import { DEFAULT_SETTINGS, effectiveSettings, loadSettings, saveSettings, type QueueSettings } from "../queue/settings.js";
 import { removeDir } from "./removeDir.js";
 
@@ -174,6 +174,12 @@ test("settings: defaults, a checked patch saved, and a game's own file on top", 
     assert.deepEqual(loadSettings(file), DEFAULT_SETTINGS);
     assert.throws(() => saveSettings(file, { capMin: -1 }), /capMin/);
     assert.throws(() => saveSettings(file, { sharedRetry: "some" }), /sharedRetry/);
+    assert.equal(DEFAULT_SETTINGS.stuckRetrySec, 30);
+    assert.equal(DEFAULT_SETTINGS.stuckGiveUpMin, 10);
+    // A retry under a second would ask Studio for a play in a tight loop
+    assert.throws(() => saveSettings(file, { stuckRetrySec: 0 }), /stuckRetrySec/);
+    assert.throws(() => saveSettings(file, { stuckGiveUpMin: 0 }), /stuckGiveUpMin/);
+    assert.equal(saveSettings(file, { stuckRetrySec: 45, stuckGiveUpMin: 20 }).stuckRetrySec, 45);
     const saved = saveSettings(file, { capMin: 7, historyDays: 0, infraWaitSec: [5, 10, 20] });
     assert.equal(saved.capMin, 7);
     assert.equal(loadSettings(file).historyDays, 0);
@@ -243,15 +249,42 @@ function fakeStudio(folder: string, options: FakeOptions = {}) {
     playRefuse: null as string | null,
     /** shared.__quackQueueOwner in the running play's server */
     owner: null as string | null,
+    /** Studio thinks a test is still in progress (edit mode says no play): every start is refused */
+    phantom: false,
+    /** That test still has a play server Quack's plugin answers from (unstick can end it) */
+    phantomPeer: false,
+    /** Starts refused that way before Studio takes plays again */
+    refuseLeft: 0,
+    /** When each play start was asked (refused or not) */
+    attempts: [] as number[],
+    /** What `playtest start` throws when Studio refuses (the daemon's real answer may differ) */
+    startError: null as string | null,
+    /** A start (synced or worktree) waits on this before it answers */
+    gate: null as Promise<void> | null,
+  };
+  const refuses = () => {
+    s.attempts.push(Date.now());
+    if (s.phantom) return true;
+    if (s.refuseLeft > 0) {
+      s.refuseLeft--;
+      return true;
+    }
+    return false;
   };
   const print = (message: string, type = "MessageOutput") => s.log.push({ seq: ++s.seq, source: "server", type, message });
   const port: StudioPort = {
     async studio(tool, args) {
       if (!s.connected) throw new Error("Studio is not connected to this place: open it in Studio and wait for the sync to connect");
       if (tool === "playtest") {
-        if (args.action === "status") return { editConnected: true, playing: s.playing };
+        if (args.action === "status") {
+          // As studioTools answers: a connected server peer is a play, whatever edit mode says (a Local Server test)
+          const peer = s.playing || (s.phantom && s.phantomPeer);
+          return { editConnected: true, playing: peer, ...(!s.playing && peer ? { multiplayer: true } : {}), server: peer ? "ready" : "none", client: s.playing ? "ready" : "none" };
+        }
         if (args.action === "start") {
+          if (s.gate) await s.gate;
           if (s.playing) throw new Error("a play is already running: stop it first");
+          if (refuses()) throw new Error(s.startError ?? REFUSAL);
           s.playing = true;
           s.owner = null;
           s.roots = [folder];
@@ -259,6 +292,13 @@ function fakeStudio(folder: string, options: FakeOptions = {}) {
           return { action: "start" };
         }
         if (args.action === "stop") {
+          if (!s.playing && s.phantom && s.phantomPeer) {
+            // The server's EndTest ends the test Studio thought was running
+            s.phantom = false;
+            s.phantomPeer = false;
+            s.stops++;
+            return { action: "stop" };
+          }
           if (!s.playing) throw new Error("no play is running in this place");
           s.playing = false;
           s.owner = null;
@@ -328,8 +368,11 @@ function fakeStudio(folder: string, options: FakeOptions = {}) {
       throw new Error(`fake: no tool ${tool}`);
     },
     async play(worktrees) {
+      if (s.gate) await s.gate;
       if (s.playing) return { result: { ok: false, error: "a playtest is already running: stop it first" } };
       if (s.playRefuse) throw new Error(s.playRefuse);
+      // The daemon's worktree play answers the overlay's startError (ExecutePlayModeAsync's) in its result
+      if (refuses()) return { id: "refused", worktree: worktrees[0], patches: 1, creates: 0, disables: 0, checks: 1, conflicts: [], result: { ok: false, error: REFUSAL }, worktrees: [] };
       s.playing = true;
       s.owner = null;
       s.roots = [...worktrees];
@@ -341,7 +384,8 @@ function fakeStudio(folder: string, options: FakeOptions = {}) {
   return { s, port };
 }
 
-const FAST = { windowMs: 30, tickMs: 5, lockRetryMs: 20, syncWaitMs: 100, startRetryMs: 300, phaseTimeoutMs: 2000, capPlayMs: 100 };
+const REFUSAL = "Failed to start the test because a previous one is still in progress.";
+const FAST = { windowMs: 30, tickMs: 5, lockRetryMs: 20, syncWaitMs: 100, startRetryMs: 300, phaseTimeoutMs: 2000, capPlayMs: 100, stuckSlackMs: 500 };
 const FAST_SETTINGS: QueueSettings = { ...DEFAULT_SETTINGS, lingerSec: 0.3, holdSec: 0.6, readySec: 0.3, infraWaitSec: [0.05, 0.1], infraTries: 3 };
 
 function git(cwd: string, ...args: string[]) {
@@ -852,6 +896,15 @@ test("hub API: capability, settings, the lock and its line, a job kept over a hu
       job = (await api(port, "GET", "/api/queue?placeId=555")).body.jobs[0];
     } while (!job?.infra && Date.now() < end);
     assert.match(job.infra.last, /no daemon runs for this place/);
+    // Unstick with no daemon: an answer the app shows, not an HTTP error
+    const unstick = await api(port, "POST", "/api/queue/unstick", { placeId: "555" });
+    assert.equal(unstick.status, 200, JSON.stringify(unstick.body));
+    assert.deepEqual([unstick.body.ok, unstick.body.stopped], [false, false]);
+    assert.match(unstick.body.message, /no daemon runs for this place/);
+    const status2 = (await api(port, "GET", "/api/queue?placeId=555")).body;
+    assert.equal(status2.stuck, null);
+    assert.deepEqual(status2.recent, []);
+    assert.equal(status2.today.notRun, 0);
   } finally {
     await hub.stop();
     removeDir(tmp);
@@ -1428,6 +1481,449 @@ test("publish review 2: a request answered at once replaces the client's older o
     assert.equal(((await claiming) as any).state, "failed");
     assert.equal(queue.status().publish.waiting.find((w: any) => w.ticket === rider.ticket)!.rides, false);
   } finally {
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+// ---------------------------------------------------------------------------------------
+// Studio refusing to start a play (incident of 14/11/26, decisions 23-25): every start failed
+// with "a previous one is still in progress" while edit mode said no play, each job spent its 3
+// infra tries in ~50 s and left the queue as a test that never ran.
+
+async function until(what: () => boolean, ms: number, why: () => string): Promise<void> {
+  const end = Date.now() + ms;
+  while (!what()) {
+    if (Date.now() > end) throw new Error(`timed out: ${why()}`);
+    await wait(10);
+  }
+}
+
+test("queue: Studio refusing the play start spends no try: the jobs wait with `stuck`, one start per retry for the whole queue, then run", { timeout: 60_000 }, async () => {
+  const { tmp, folder, wt } = makeGame(true);
+  const { s, port } = fakeStudio(folder);
+  const { queue } = makeQueue(folder, port, { stuckRetrySec: 0.25, stuckGiveUpMin: 5 });
+  try {
+    s.phantom = true;
+    // The synced folder, two worktrees that share a play (A and B) and one that plays alone (C changes A too)
+    const jobs = [queue.submit(me, job("synced", folder)), queue.submit(me, job("on A", wt.wtA)), queue.submit(other, job("on B", wt.wtB)), queue.submit(other, job("on C", wt.wtC))];
+    await until(() => queue.status().stuck !== null, 5000, () => queue.status().phase);
+    const firstAt = s.attempts[0];
+    await wait(1300);
+    const st = queue.status();
+    for (const j of jobs) assert.equal(queue.jobStatus(j.id).state, "pending", `${j.name} was answered while Studio refused plays: ${JSON.stringify(queue.jobStatus(j.id).verdict?.reason)}`);
+    assert.equal(st.jobs.length, 4);
+    for (const j of st.jobs) {
+      assert.ok(j.stuck, `${j.name} carries stuck: ${JSON.stringify(j)}`);
+      assert.equal((j as any).infra, undefined, `${j.name} shows no infra try`);
+      assert.match(j.stuck!.last, /previous one is still in progress/);
+      assert.equal(typeof j.stuck!.since, "number");
+    }
+    assert.ok(st.stuck!.tries >= 3, `tried again every 0.25 s: ${st.stuck!.tries} tries`);
+    assert.match(st.stuck!.error, /previous one is still in progress/);
+    assert.match(st.phase, /^Studio refuses to start a play: a previous test is still in progress \(for \d+ s; \d+ tries, the next in \d+ s\)$/);
+    // One start per retry interval for the whole queue: never one per job, folder or play group
+    const gaps = s.attempts.slice(1).map((t, i) => t - s.attempts[i]);
+    assert.ok(gaps.every((g) => g >= 200), `starts asked closer than the retry interval: gaps ${gaps.join(", ")} ms`);
+    assert.ok(s.attempts.length <= Math.ceil((Date.now() - firstAt) / 250) + 1, `${s.attempts.length} starts in ${Date.now() - firstAt} ms`);
+    // Studio takes plays again: every job runs, and none spent a try
+    s.phantom = false;
+    for (const j of jobs) {
+      const v = await verdictOf(queue, j.id);
+      assert.equal(v.pass, true, `${j.name}: ${JSON.stringify(v.reason)}`);
+      assert.equal(v.infraRetried, undefined, `${j.name} spent no infra try`);
+    }
+    assert.equal(queue.status().stuck, null);
+    assert.equal(queue.stats().notRun, 0);
+  } finally {
+    queue.stop();
+    await queue.idle();
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+test("queue: three refusals with infraTries 3 still run the job, with no try spent", { timeout: 30_000 }, async () => {
+  const { tmp, folder, wt } = makeGame(true);
+  const { s, port } = fakeStudio(folder);
+  const { queue } = makeQueue(folder, port, { stuckRetrySec: 0.1, stuckGiveUpMin: 5, infraTries: 3 });
+  try {
+    s.refuseLeft = 3;
+    const v = await verdictOf(queue, queue.submit(me, job("after three refusals", wt.wtA)).id);
+    assert.equal(v.pass, true, JSON.stringify(v.reason));
+    assert.equal(v.infra, undefined);
+    assert.equal(v.infraRetried, undefined);
+    assert.equal(s.attempts.length, 4);
+  } finally {
+    queue.stop();
+    await queue.idle();
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+test("queue: refused past stuckGiveUpMin, the jobs that waited are answered as infra once, as not run today", { timeout: 30_000 }, async () => {
+  const { tmp, folder, wt } = makeGame(true);
+  const { s, port } = fakeStudio(folder);
+  // 10 min shrunk to 0.6 s
+  const { queue, lines } = makeQueue(folder, port, { stuckRetrySec: 0.1, stuckGiveUpMin: 0.01 });
+  try {
+    s.phantom = true;
+    const a = queue.submit(me, job("A waits", wt.wtA));
+    const c = queue.submit(other, job("C waits", wt.wtC));
+    const [va, vc] = await Promise.all([verdictOf(queue, a.id), verdictOf(queue, c.id)]);
+    for (const v of [va, vc]) {
+      assert.equal(v.infra, true);
+      assert.match(v.reason!, /^infra: Studio refused to start a play for \d+ s \(\d+ tries/);
+      assert.match(v.reason!, /previous one is still in progress/);
+    }
+    const tries = s.attempts.length;
+    assert.ok(tries >= 2 && tries <= 10, `one start per 0.1 s over 0.6 s: ${tries}`);
+    // The give-up answered every job: no cycle asks Studio again for C, and no stuck is left for a later job
+    await queue.idle();
+    assert.equal(s.attempts.length, tries, "a start was asked after every job was answered");
+    assert.equal(queue.status().stuck, null);
+    const today = queue.stats();
+    assert.equal(today.notRun, 2);
+    assert.equal(today.jobs, 0, "a job that did not run is no test");
+    assert.equal(today.passed, 0);
+    assert.equal(today.failures.infra, undefined);
+    assert.equal(lines.filter((l) => / INFRA/.test(l)).length, 2, "each answered once");
+  } finally {
+    queue.stop();
+    await queue.idle();
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+test("queue: unstick ends the test Studio thinks is running through its play server, and the queue tries at once; with no server it says so", { timeout: 30_000 }, async () => {
+  const { tmp, folder, wt } = makeGame(true);
+  const { s, port } = fakeStudio(folder);
+  // A retry 30 s away: a verdict within seconds proves unstick tried at once
+  const { queue } = makeQueue(folder, port, { stuckRetrySec: 30, stuckGiveUpMin: 10 });
+  try {
+    s.phantom = true;
+    const j = queue.submit(me, job("stuck job", wt.wtA));
+    await until(() => queue.status().stuck !== null, 5000, () => queue.status().phase);
+    // Studio's test has no play peer Quack reaches
+    const none = await queue.unstick();
+    assert.deepEqual([none.ok, none.stopped], [false, false]);
+    assert.match(none.message, /no play peer Quack can stop .*press Stop in Studio, or close and reopen the place/);
+    assert.equal(s.stops, 0);
+    assert.equal(queue.jobStatus(j.id).state, "pending");
+    // It has one: EndTest, then a play at once
+    s.phantomPeer = true;
+    const done = await queue.unstick();
+    assert.deepEqual([done.ok, done.stopped], [true, true], done.message);
+    assert.equal(s.stops, 1);
+    const v = await verdictOf(queue, j.id, 5000);
+    assert.equal(v.pass, true, JSON.stringify(v.reason));
+    assert.equal(queue.status().stuck, null);
+  } finally {
+    queue.stop();
+    await queue.idle();
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+test("queue: today leaves infra out of jobs and passed; recent lists the day's answers newest first", { timeout: 30_000 }, async () => {
+  const { tmp, folder } = makeGame();
+  const { s, port } = fakeStudio(folder);
+  const { queue } = makeQueue(folder, port, { holdSec: 0 });
+  try {
+    const pass = await verdictOf(queue, queue.submit(me, job("passes", folder)).id);
+    const fail = await verdictOf(queue, queue.submit(other, job("fails", folder, "-- FAILCHECK")).id);
+    s.unsynced.add("sync/ServerStorage/A.luau");
+    const infra = await verdictOf(queue, queue.submit(me, job("never ran", folder, "", { fresh: true })).id);
+    s.unsynced.clear();
+    assert.deepEqual([pass.pass, fail.pass, infra.infra], [true, false, true]);
+    const st = queue.status();
+    assert.equal(st.today.jobs, 2);
+    assert.equal(st.today.passed, 1);
+    assert.equal(st.today.notRun, 1);
+    assert.deepEqual(st.today.failures, { check: 1 });
+    assert.equal((st.today as any).recent, undefined, "recent is the status's, not inside today");
+    assert.deepEqual(
+      st.recent.map((r) => [r.name, r.verdict]),
+      [
+        ["never ran", "infra"],
+        ["fails", "fail"],
+        ["passes", "pass"],
+      ],
+    );
+    const [last] = st.recent;
+    assert.deepEqual(Object.keys(last).sort(), ["at", "client", "id", "ms", "name", "reason", "verdict"]);
+    assert.equal(last.id, infra.id);
+    assert.deepEqual(last.client, me);
+    assert.match(last.reason!, /Studio does not have the disk's version/);
+    assert.equal(typeof last.at, "number");
+    assert.equal(st.recent[2].reason, undefined, "a pass has no reason");
+    // At most 15, the newest kept
+    for (let i = 0; i < 15; i++) await verdictOf(queue, queue.submit(me, job(`more ${i}`, folder)).id);
+    const recent = queue.status().recent;
+    assert.equal(recent.length, 15);
+    assert.equal(recent[0].name, "more 14");
+  } finally {
+    queue.stop();
+    await queue.idle();
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+test("queue: while stuck, another failure (Studio gone) still spends the infra tries and answers", { timeout: 30_000 }, async () => {
+  const { tmp, folder, wt } = makeGame(true);
+  const { s, port } = fakeStudio(folder);
+  const { queue } = makeQueue(folder, port, { stuckRetrySec: 0.1, stuckGiveUpMin: 5 });
+  try {
+    s.phantom = true;
+    const j = queue.submit(me, job("Studio closes", wt.wtA));
+    await until(() => queue.status().stuck !== null, 5000, () => queue.status().phase);
+    // The user closes the place to reopen it: the next try finds no Studio at all
+    s.connected = false;
+    const v = await verdictOf(queue, j.id, 8000);
+    assert.equal(v.infra, true);
+    assert.match(v.reason!, /^infra \(after 3 tries\): the queue failed: Studio is not connected/);
+  } finally {
+    queue.stop();
+    await queue.idle();
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+// Review of the stuck queue (14/11/26): the give-up clock measures refusals in a row, per job; a
+// play Quack did not start shows the same banner; a dropped job gets one verdict.
+
+test("queue stuck: a foreign play between refusals starts the refusal clock over, so the next refusal answers nothing", { timeout: 30_000 }, async () => {
+  const { tmp, folder, wt } = makeGame(true);
+  const { s, port } = fakeStudio(folder);
+  // 1.8 s of refusals in a row give up; the retry 0.1 s
+  const { queue } = makeQueue(folder, port, { stuckRetrySec: 0.1, stuckGiveUpMin: 0.03 });
+  try {
+    s.phantom = true;
+    const j = queue.submit(me, job("waits", wt.wtA));
+    await until(() => queue.status().stuck?.kind === "refused", 5000, () => queue.status().phase);
+    await wait(300);
+    // A Local Server test comes up (its server peer: status says a play runs) and stays 1.7 s
+    s.phantomPeer = true;
+    await until(() => queue.status().stuck?.kind === "foreign-play", 5000, () => JSON.stringify(queue.status().stuck));
+    await wait(1700);
+    const before = s.attempts.length;
+    s.phantomPeer = false;
+    await until(() => s.attempts.length > before, 5000, () => queue.status().phase);
+    await wait(300);
+    assert.equal(queue.jobStatus(j.id).state, "pending", `answered on the first refusal after the foreign play: ${queue.jobStatus(j.id).verdict?.reason}`);
+    const st = queue.status();
+    assert.equal(st.stuck?.kind, "refused");
+    assert.ok(Date.now() - st.stuck!.since < 1000, `a new streak: since ${Date.now() - st.stuck!.since} ms ago`);
+    s.phantom = false;
+    assert.equal((await verdictOf(queue, j.id)).pass, true);
+  } finally {
+    queue.stop();
+    await queue.idle();
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+test("queue stuck: a session holding Studio longer than two retries starts the refusal clock over", { timeout: 30_000 }, async () => {
+  const { tmp, folder, wt } = makeGame(true);
+  const { s, port } = fakeStudio(folder);
+  const { queue } = makeQueue(folder, port, { stuckRetrySec: 0.1, stuckGiveUpMin: 0.03 });
+  try {
+    s.phantom = true;
+    const j = queue.submit(me, job("waits", wt.wtA));
+    await until(() => queue.status().stuck?.kind === "refused", 5000, () => queue.status().phase);
+    await wait(300);
+    // A session takes Studio between two tries, for longer than the gap (2 x 0.1 s + slack)
+    await until(() => queue.lock.state.holder === null, 5000, () => "the runner keeps the lock");
+    assert.equal(queue.lock.claim({ id: "session", pid: process.pid }, "solo_playtest").ok, true);
+    await wait(1700);
+    assert.equal(queue.status().stuck, null, "no banner while the session holds Studio and nothing was refused for a while");
+    const before = s.attempts.length;
+    queue.lock.release("session");
+    await until(() => s.attempts.length > before, 5000, () => queue.status().phase);
+    await wait(300);
+    assert.equal(queue.jobStatus(j.id).state, "pending", `answered on the first refusal after the hold: ${queue.jobStatus(j.id).verdict?.reason}`);
+    s.phantom = false;
+    assert.equal((await verdictOf(queue, j.id)).pass, true);
+  } finally {
+    queue.stop();
+    await queue.idle();
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+test("queue stuck: a hub down longer than two retries starts the clock over; a stuck kept with no job shows no banner", { timeout: 30_000 }, async () => {
+  const { tmp, folder, wt } = makeGame(true);
+  const { s, port } = fakeStudio(folder);
+  const first = makeQueue(folder, port, { stuckRetrySec: 0.1, stuckGiveUpMin: 0.03 });
+  let second: ReturnType<typeof makeQueue> | null = null;
+  let third: ReturnType<typeof makeQueue> | null = null;
+  try {
+    s.phantom = true;
+    const j = first.queue.submit(me, job("waits", wt.wtA));
+    await until(() => first.queue.status().stuck?.kind === "refused", 5000, () => first.queue.status().phase);
+    first.queue.stop();
+    await first.queue.idle();
+    // The hub was down 20 minutes: the state file's refusals and the job's wait are that old
+    const file = path.join(queueDir(folder, "1"), "state.json");
+    const state = JSON.parse(fs.readFileSync(file, "utf8"));
+    const old = Date.now() - 20 * 60_000;
+    state.stuck.since = old;
+    state.stuck.last = old;
+    for (const saved of state.jobs) saved.stuck = { since: old, last: "refused" };
+    fs.writeFileSync(file, JSON.stringify(state));
+    const attempts = s.attempts.length;
+    second = makeQueue(folder, port, { stuckRetrySec: 0.1, stuckGiveUpMin: 0.03 });
+    assert.equal(second.queue.status().stuck, null, "no banner for refusals 20 minutes old");
+    second.queue.kick();
+    await until(() => s.attempts.length > attempts, 5000, () => second!.queue.status().phase);
+    await wait(300);
+    assert.equal(second.queue.jobStatus(j.id).state, "pending", `answered at once after the restart: ${second.queue.jobStatus(j.id).verdict?.reason}`);
+    second.queue.stop();
+    await second.queue.idle();
+    // A state file with a stuck and no job left
+    const empty = JSON.parse(fs.readFileSync(file, "utf8"));
+    empty.jobs = [];
+    empty.stuck = { kind: "refused", since: Date.now(), error: "x", tries: 3, last: Date.now() };
+    fs.writeFileSync(file, JSON.stringify(empty));
+    third = makeQueue(folder, port, { stuckRetrySec: 0.1, stuckGiveUpMin: 0.03 });
+    assert.equal(third.queue.status().stuck, null, "the banner over an empty queue");
+  } finally {
+    for (const q of [first.queue, second?.queue, third?.queue]) {
+      if (!q) continue;
+      q.stop();
+      await q.idle();
+      q.stop();
+    }
+    removeDir(tmp);
+  }
+});
+
+test("queue stuck: the last job dropped ends the stuck state, with its one verdict (dropped)", { timeout: 30_000 }, async () => {
+  const { tmp, folder, wt } = makeGame(true);
+  const { s, port } = fakeStudio(folder);
+  const alive = new Set([process.pid, 4242]);
+  const { queue } = makeQueue(folder, port, { stuckRetrySec: 0.1, stuckGiveUpMin: 5 }, { alive: (pid) => alive.has(pid) });
+  try {
+    s.phantom = true;
+    const j = queue.submit({ id: "gone", pid: 4242 }, job("its client dies", wt.wtA));
+    await until(() => queue.status().stuck?.kind === "refused", 5000, () => queue.status().phase);
+    alive.delete(4242);
+    queue.tick();
+    assert.equal(queue.status().stuck, null, "the banner over an empty queue");
+    await queue.idle();
+    assert.equal(queue.status().stuck, null);
+    assert.ok(queue.jobStatus(j.id).verdict?.dropped);
+    assert.equal(queue.status().today.notRun, 0);
+  } finally {
+    queue.stop();
+    await queue.idle();
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+test("queue stuck: each job is answered only after it waited stuckGiveUpMin itself", { timeout: 30_000 }, async () => {
+  const { tmp, folder, wt } = makeGame(true);
+  const { s, port } = fakeStudio(folder);
+  // 1.2 s of refusals give up
+  const { queue } = makeQueue(folder, port, { stuckRetrySec: 0.1, stuckGiveUpMin: 0.02 });
+  try {
+    s.phantom = true;
+    const a = queue.submit(me, job("A from the start", wt.wtA));
+    await until(() => queue.status().stuck?.kind === "refused", 5000, () => queue.status().phase);
+    await wait(800);
+    const b = queue.submit(other, job("B late", wt.wtA));
+    const va = await verdictOf(queue, a.id);
+    assert.equal(va.infra, true, JSON.stringify(va));
+    assert.equal(queue.jobStatus(b.id).state, "pending", `B waited ${Date.now() - b.submittedAt} ms and was answered with A: ${queue.jobStatus(b.id).verdict?.reason}`);
+    assert.equal(queue.status().stuck?.kind, "refused", "B still waits on the refusals");
+    assert.ok(queue.status().jobs[0].stuck, "B still shows it waits on Studio");
+    const vb = await verdictOf(queue, b.id);
+    assert.equal(vb.infra, true);
+    assert.ok(vb.queuedMs >= 1100, `B answered after ${vb.queuedMs} ms`);
+  } finally {
+    queue.stop();
+    await queue.idle();
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+test("queue stuck: a play Quack did not start (Local Server test) shows as stuck foreign-play, never answers jobs, and unstick ends it", { timeout: 30_000 }, async () => {
+  const { tmp, folder, wt } = makeGame(true);
+  const { s, port } = fakeStudio(folder);
+  const { queue } = makeQueue(folder, port, { stuckRetrySec: 0.1, stuckGiveUpMin: 0.01 });
+  try {
+    // The real 14/11 shape: Studio refuses every play, and the test it runs has a server peer
+    s.phantom = true;
+    s.phantomPeer = true;
+    const j = queue.submit(me, job("waits on the test", wt.wtA));
+    await until(() => queue.status().stuck != null, 5000, () => queue.status().phase);
+    let st = queue.status();
+    assert.equal(st.stuck!.kind, "foreign-play");
+    assert.match(st.stuck!.error, /a play Quack did not start is up/);
+    assert.equal(typeof st.stuck!.since, "number");
+    // Far past stuckGiveUpMin (0.6 s): a foreign play never answers a job
+    await wait(1500);
+    assert.equal(queue.jobStatus(j.id).state, "pending", `answered: ${queue.jobStatus(j.id).verdict?.reason}`);
+    assert.equal(s.attempts.length, 0, "Studio was never asked for a play over a running one");
+    st = queue.status();
+    assert.equal(st.stuck?.kind, "foreign-play");
+    assert.equal((st.jobs[0] as any).infra, undefined);
+    const done = await queue.unstick();
+    assert.deepEqual([done.ok, done.stopped], [true, true], done.message);
+    const v = await verdictOf(queue, j.id, 5000);
+    assert.equal(v.pass, true, JSON.stringify(v.reason));
+    assert.equal(queue.status().stuck, null);
+  } finally {
+    queue.stop();
+    await queue.idle();
+    queue.stop();
+    removeDir(tmp);
+  }
+});
+
+test("queue: a job dropped while its play starts gets no second verdict, and is not counted as not run", { timeout: 30_000 }, async () => {
+  const { tmp, folder, wt } = makeGame(true);
+  const { s, port } = fakeStudio(folder);
+  const alive = new Set([process.pid, 4242, 4343]);
+  const { queue } = makeQueue(folder, port, { infraTries: 1 }, { alive: (pid) => alive.has(pid) });
+  try {
+    // The start fails (infra at once with one try) after the job was dropped
+    let open!: () => void;
+    s.gate = new Promise<void>((r) => (open = r));
+    s.playRefuse = "the daemon is gone";
+    const a = queue.submit({ id: "a", pid: 4242 }, job("dropped, start fails", wt.wtA));
+    await until(() => /play of/.test(queue.status().phase), 5000, () => queue.status().phase);
+    alive.delete(4242);
+    queue.tick();
+    open();
+    await queue.idle();
+    assert.ok(queue.jobStatus(a.id).verdict?.dropped, `the verdict: ${JSON.stringify(queue.jobStatus(a.id).verdict)}`);
+    // The start works: the dropped job does not run
+    s.playRefuse = null;
+    s.gate = new Promise<void>((r) => (open = r));
+    const b = queue.submit({ id: "b", pid: 4343 }, job("dropped, start works", wt.wtB, "", { files: ["sync/ServerStorage/B.luau"] }));
+    await until(() => /play of/.test(queue.status().phase), 5000, () => queue.status().phase);
+    alive.delete(4343);
+    queue.tick();
+    open();
+    await queue.idle();
+    assert.ok(queue.jobStatus(b.id).verdict?.dropped, `the verdict: ${JSON.stringify(queue.jobStatus(b.id).verdict)}`);
+    assert.equal(s.evals.length, 0, "a dropped job ran");
+    const st = queue.status();
+    assert.equal(st.today.notRun, 0);
+    assert.deepEqual(st.recent, []);
+  } finally {
+    queue.stop();
+    await queue.idle();
     queue.stop();
     removeDir(tmp);
   }

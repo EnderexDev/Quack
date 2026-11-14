@@ -2247,6 +2247,9 @@ export class SyncDaemon {
     if (this.play && !this.play.done) throw new Error("a play is already being started");
     if (this.standby) throw new Error("this daemon is on standby for a hub switch");
     if (!this.ipc.isConnected() || this.lastSync === undefined) throw new Error("no Studio is synced with this place");
+    // Before the swap: a multiplayer test leaves edit mode on, so the plugin's own check passes and
+    // Studio refuses the play only after the branch went in
+    if (this.studioTools?.playRunning()) throw new Error(StudioTools.PLAY_RUNNING);
     // The project root, as for .quack/: the folder of the sourcemap (the hub's cwd for its daemons)
     const registered = path.dirname(path.resolve(config.sourcemapPath));
     const roots: string[] = [];
