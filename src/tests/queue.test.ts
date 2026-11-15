@@ -41,7 +41,7 @@ const waiter = (id: string, level: Waiter["level"], holdMin: number, since: numb
   ...extra,
 });
 
-test("waiting list: rush first, then level, then the shorter hold, then who came first", () => {
+test("waiting list: rush first, then level, then who came first; the hold asked never ranks", () => {
   const list = [
     waiter("low-early", "low", 5, 0),
     waiter("normal-long", "normal", 20, 1000),
@@ -50,9 +50,10 @@ test("waiting list: rush first, then level, then the shorter hold, then who came
     waiter("critical", "critical", 30, 4000),
     waiter("rush-low", "low", 30, 5000, { rush: true }),
   ];
+  // decision 13 (15/11/26): the 20-minute ask that came first is no longer passed by the 5-minute ones
   assert.deepEqual(
     rankWaiters(list, 6000, 10).map((w) => w.client.id),
-    ["rush-low", "critical", "normal-short", "normal-short-later", "normal-long", "low-early"],
+    ["rush-low", "critical", "normal-long", "normal-short", "normal-short-later", "low-early"],
   );
 });
 
@@ -936,7 +937,7 @@ test("settings: a settings file holding null or a list is replaced on the next s
   }
 });
 
-test("hub queues: a hold asked as an absurd number is kept in range, so the line still sorts", async () => {
+test("hub queues: a hold asked as an absurd number is kept in range, and the line stays in arrival order", async () => {
   const { HubQueues } = await import("../queue/hubQueues.js");
   const { tmp, folder } = makeGame();
   const { port } = fakeStudio(folder);
@@ -947,7 +948,7 @@ test("hub queues: a hold asked as an absurd number is kept in range, so the line
     join("long", 5000);
     const last = join("small", 2);
     // Infinity is no number of minutes: the default; a finite one past 10 h is held at 600
-    assert.deepEqual(last.queue.map((w: any) => [w.client.id, w.holdMin]), [["small", 2], ["huge", 10], ["long", 600]]);
+    assert.deepEqual(last.queue.map((w: any) => [w.client.id, w.holdMin]), [["huge", 10], ["long", 600], ["small", 2]]);
     assert.equal(queues.summary()["9"].waiters, 3);
     assert.equal(queues.summary()["9"].jobs, 0);
   } finally {

@@ -6,6 +6,11 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.38] - 2026-11-15
+
+### Changed
+- Sessions waiting for Studio at the same priority level now get it in the order they arrived. The hold each one asks for is still shown and recorded, but no longer puts a shorter ask first: in a week of real use, holds ran about a third of what was asked, and a shorter ask did not mean Studio came back sooner, while the session that asked for more kept being passed.
+
 ## [1.0.37] - 2026-11-14
 
 ### Added
@@ -400,7 +405,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.37...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.38...HEAD
+[1.0.38]: https://github.com/EnderexDev/Quack/compare/v1.0.37...v1.0.38
 [1.0.37]: https://github.com/EnderexDev/Quack/compare/v1.0.36...v1.0.37
 [1.0.36]: https://github.com/EnderexDev/Quack/compare/v1.0.35...v1.0.36
 [1.0.35]: https://github.com/EnderexDev/Quack/compare/v1.0.34...v1.0.35

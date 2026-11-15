@@ -8,8 +8,10 @@
  * process whose life is its life. That process ending frees the lock and drops its place in line.
  *
  * Who gets a free Studio: rush first, then the priority level, which rises one step for every
- * `agingMin` waited, then the shorter hold asked for, then who came first. A free Studio goes
- * to the head of that list, never to whoever asks first.
+ * `agingMin` waited, then who came first. A free Studio goes to the head of that list, never to
+ * whoever asks first. The hold a client asks for is shown and recorded, never ranked: in a week
+ * of real use (review of 15/11/26) a hold ran about a third of what was asked, and a shorter ask
+ * did not bring Studio back sooner.
  *
  * Pure: the clock, the pid check and the jobs waiting come from outside, so it is tested without
  * processes or timers. The hub ticks it every second.
@@ -129,7 +131,6 @@ export function rankWaiters(list: Waiter[], now: number, agingMin: number): Wait
     (a, b) =>
       Number(b.rush === true) - Number(a.rush === true) ||
       effectiveRank(a, now, agingMin) - effectiveRank(b, now, agingMin) ||
-      (a.holdMin ?? 10) - (b.holdMin ?? 10) ||
       a.since - b.since,
   );
 }
