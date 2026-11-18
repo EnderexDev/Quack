@@ -117,6 +117,8 @@ export interface Job extends JobInput {
    * waited through itself (none yet for a job that arrived between two tries)
    */
   stuck?: { since: number; last: string; tries?: number };
+  /** jobFingerprint taken when its run began, so an edit made while it ran never names what ran */
+  fingerprint?: string;
   /** Failed in a shared play: runs again alone, and this is the first run */
   soloRetry?: { with: string[]; pass: false; play: string; reason: string; ms: number };
 }
@@ -980,7 +982,7 @@ export class PlaceQueue {
       name: job.name,
       client: job.client,
       files: job.files,
-      fingerprint: jobFingerprint(job.root, job.source, job.files),
+      fingerprint: job.fingerprint ?? jobFingerprint(job.root, job.source, job.files),
       ...result,
       ...(job.soloRetry ? { firstRun: job.soloRetry } : {}),
       ...(tries && !result.infra ? { infraRetried: `${tries.n} time(s), last: ${tries.last}` } : {}),
@@ -1277,6 +1279,7 @@ export class PlaceQueue {
       job.state = "pending";
       return;
     }
+    job.fingerprint = jobFingerprint(job.root, job.source, job.files);
     // The lock is confirmed (and its idle clock refreshed) before anything runs
     const lock = this.lock.claim(RUNNER, "queue");
     if (!lock.ok) {

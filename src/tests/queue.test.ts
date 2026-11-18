@@ -223,6 +223,8 @@ interface FakeOptions {
   failShared?: boolean;
   readyAfter?: number;
   infraFirst?: number;
+  /** Called as each job phase starts, before it answers (a test edits a file mid-run there) */
+  onPhase?: (phase: string) => void;
 }
 
 function fakeStudio(folder: string, options: FakeOptions = {}) {
@@ -348,6 +350,7 @@ function fakeStudio(folder: string, options: FakeOptions = {}) {
         }
         const name = /--! name: (.*)/.exec(code)?.[1] ?? "?";
         s.evals.push({ peer: String(args.peer), phase, job: name });
+        options.onPhase?.(phase);
         if (phase === "setup" && s.infraLeft > 0 && code.includes("-- INFRA")) {
           s.infraLeft--;
           throw new Error("the play client is not connected: a Run-mode play has no client");
@@ -475,6 +478,23 @@ test("jobFingerprint: same source and text give the same hash; the source, a fil
     fs.writeFileSync(path.join(tmp, "sync", "A.luau"), "return 2");
     assert.notEqual(jobFingerprint(tmp, "src", ["sync/A.luau"]), one);
   } finally {
+    removeDir(tmp);
+  }
+});
+
+test("queue: a file edited while the job runs does not change the fingerprint of what ran", { timeout: 30_000 }, async () => {
+  const { tmp, folder } = makeGame();
+  const file = path.join(folder, "sync", "ServerStorage", "A.luau");
+  const { port } = fakeStudio(folder, { onPhase: (phase) => phase === "check" && fs.writeFileSync(file, "return 'edited mid-run'") });
+  const { queue } = makeQueue(folder, port);
+  try {
+    const j = job("mid-run edit", folder);
+    const before = jobFingerprint(folder, j.source, j.files);
+    const v = await verdictOf(queue, queue.submit(me, j).id);
+    assert.equal(v.fingerprint, before, "the fingerprint is the code that ran, not the edit made during the check");
+    assert.notEqual(jobFingerprint(folder, j.source, j.files), before);
+  } finally {
+    queue.stop();
     removeDir(tmp);
   }
 });
