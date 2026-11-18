@@ -6,6 +6,11 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.39] - 2026-11-18
+
+### Added
+- A Studio queue verdict now records the files the job named and a fingerprint of what it tested: the job's own text and the text of each of those files when it ran. Two verdicts of the same test with the same fingerprint ran the same code, so a fail followed by a pass under one fingerprint marks a flaky test, and under two fingerprints a fix.
+
 ## [1.0.38] - 2026-11-15
 
 ### Changed
@@ -405,7 +410,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.38...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.39...HEAD
+[1.0.39]: https://github.com/EnderexDev/Quack/compare/v1.0.38...v1.0.39
 [1.0.38]: https://github.com/EnderexDev/Quack/compare/v1.0.37...v1.0.38
 [1.0.37]: https://github.com/EnderexDev/Quack/compare/v1.0.36...v1.0.37
 [1.0.36]: https://github.com/EnderexDev/Quack/compare/v1.0.35...v1.0.36

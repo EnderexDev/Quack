@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fnv1a, planGroups } from "../queue/disk.js";
+import { fnv1a, jobFingerprint, planGroups } from "../queue/disk.js";
 import { RUNNER, StudioLock, rankWaiters, type GrantRecord, type Waiter } from "../queue/lock.js";
 import { PRELUDE } from "../queue/prelude.js";
 import { PlaceQueue, queueDir, type StudioPort, type Verdict } from "../queue/queue.js";
@@ -462,6 +462,23 @@ async function verdictOf(queue: PlaceQueue, id: string, ms = 10_000): Promise<Ve
   }
 }
 
+test("jobFingerprint: same source and text give the same hash; the source, a file's text or the file list change it", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "quack-print-"));
+  try {
+    fs.mkdirSync(path.join(tmp, "sync"));
+    fs.writeFileSync(path.join(tmp, "sync", "A.luau"), "return 1");
+    const one = jobFingerprint(tmp, "src", ["sync/A.luau"]);
+    assert.match(one, /^[0-9a-f]{8}$/);
+    assert.equal(jobFingerprint(tmp, "src", ["sync/A.luau"]), one);
+    assert.notEqual(jobFingerprint(tmp, "src2", ["sync/A.luau"]), one);
+    assert.notEqual(jobFingerprint(tmp, "src", null), one);
+    fs.writeFileSync(path.join(tmp, "sync", "A.luau"), "return 2");
+    assert.notEqual(jobFingerprint(tmp, "src", ["sync/A.luau"]), one);
+  } finally {
+    removeDir(tmp);
+  }
+});
+
 const me = { id: "client-1", name: "tester", pid: process.pid };
 const other = { id: "client-2", name: "other", pid: process.pid };
 
@@ -477,6 +494,10 @@ test("queue: jobs that arrive together share one play, a late one joins it, a ch
     assert.equal(vb.pass, true);
     assert.equal(s.plays.length, 1, "one play for both");
     assert.equal(va.play, "fresh play");
+    // The verdict says what ran: the job's files and the fingerprint of its source and their text
+    assert.deepEqual(va.files, ["sync/ServerStorage/A.luau"]);
+    const firstPrint = jobFingerprint(folder, job("first", folder).source, ["sync/ServerStorage/A.luau"]);
+    assert.equal(va.fingerprint, firstPrint);
     // While the play lingers, a job whose files did not change joins it
     const c = queue.submit(me, job("late", folder));
     const vc = await verdictOf(queue, c.id);
@@ -487,6 +508,7 @@ test("queue: jobs that arrive together share one play, a late one joins it, a ch
     const d = queue.submit(me, job("after edit", folder));
     const vd = await verdictOf(queue, d.id);
     assert.equal(vd.play, "fresh play");
+    assert.notEqual(jobFingerprint(folder, job("first", folder).source, ["sync/ServerStorage/A.luau"]), firstPrint, "the same job after the edit has another fingerprint");
     assert.equal(s.plays.length, 2);
     await queue.idle();
     assert.equal(s.playing, false, "the play stops after the linger");

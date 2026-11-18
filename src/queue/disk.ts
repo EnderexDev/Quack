@@ -23,6 +23,25 @@ export function fnv1a(text: string): number {
   return h >>> 0;
 }
 
+/**
+ * What a job tested, as one hex hash: its own source and the text of each file it names, read
+ * from its root. Two verdicts with the same fingerprint ran the same code, so a fail then a pass
+ * under one fingerprint is a flaky test, under two a fix. A missing file counts as empty.
+ */
+export function jobFingerprint(root: string, source: string, files: string[] | null): string {
+  const parts = [`source:${fnv1a(source)}`];
+  for (const f of [...(files ?? [])].sort()) {
+    let text = "";
+    try {
+      text = fs.readFileSync(path.join(root, f), "utf8");
+    } catch {
+      // gone: the hash says so by being the empty text's
+    }
+    parts.push(`${f}:${fnv1a(text)}`);
+  }
+  return fnv1a(parts.join("\n")).toString(16).padStart(8, "0");
+}
+
 /** Two folders are the same one on NTFS whatever their case and slashes */
 export function samePath(a: string | null | undefined, b: string | null | undefined): boolean {
   if (a == null || b == null) return false;

@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { changedScripts, fnv1a, foreignIn, hashAll, loadSourcemap, planGroups, publishGit, recentFiles, samePath, type Sourcemap } from "./disk.js";
+import { changedScripts, fnv1a, foreignIn, hashAll, jobFingerprint, loadSourcemap, planGroups, publishGit, recentFiles, samePath, type Sourcemap } from "./disk.js";
 import { isLevel, RUNNER, StudioLock, type Client, type Level } from "./lock.js";
 import { luaString, phaseCode } from "./prelude.js";
 import { PublishLine, type PublishGit } from "./publish.js";
@@ -139,6 +139,10 @@ export interface Verdict {
   firstRun?: Job["soloRetry"];
   infraRetried?: string;
   dropped?: string;
+  /** The files the job named (null: it named none) */
+  files?: string[] | null;
+  /** jobFingerprint of the job's source and files when it ran */
+  fingerprint?: string;
   ms: number;
   queuedMs: number;
   finishedAt: number;
@@ -975,6 +979,8 @@ export class PlaceQueue {
       id: job.id,
       name: job.name,
       client: job.client,
+      files: job.files,
+      fingerprint: jobFingerprint(job.root, job.source, job.files),
       ...result,
       ...(job.soloRetry ? { firstRun: job.soloRetry } : {}),
       ...(tries && !result.infra ? { infraRetried: `${tries.n} time(s), last: ${tries.last}` } : {}),
