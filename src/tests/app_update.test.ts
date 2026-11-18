@@ -122,3 +122,20 @@ test("Settings saves the Open Cloud key through `cloud`, and the rule notice sta
     assert.equal([...i18n.matchAll(new RegExp(`\\n\\s+${key}: "`, "g"))].length, 2, key);
   }
 });
+
+// 18/11/26: Quit stopped the hub this app started, and the poll, seeing it exit, started a new one
+// before the app's process ended: a hub left running after Quit. The quit raises a flag first,
+// and every start of a hub (the poll's, a restart's) is refused once it is up. The race itself is
+// the Rust test the_poll_starts_no_hub_after_the_quit_stops_its_own (cargo test).
+test("no hub starts once the app quits", () => {
+  const main = read("src-tauri/src/main.rs");
+  const stop = main.slice(main.indexOf("fn stop_hub("), main.indexOf("\nfn main()"));
+  assert.ok(stop.indexOf("quitting.store(true") >= 0 && stop.indexOf("quitting.store(true") < stop.indexOf(".lock()"), "the flag goes up before the stop waits on the hub");
+  const claim = main.slice(main.indexOf("fn claim_hub_slot<"), main.indexOf("fn stop_own_hub("));
+  assert.match(claim, /quitting\.load\(/);
+  const spawn = main.slice(main.indexOf("fn spawn_hub_with("), main.indexOf("fn remember_token("));
+  assert.match(spawn, /claim_hub_slot\(&shared\.hub, &shared\.quitting\)/, "the poll's start goes through the slot");
+  assert.doesNotMatch(spawn, /shared\.hub\.lock\(\)/, "no start takes the slot around the flag");
+  const restart = main.slice(main.indexOf("fn restart_hub_now("), main.indexOf("async fn restart_hub("));
+  assert.ok(restart.indexOf("quitting.load(") >= 0 && restart.indexOf("quitting.load(") < restart.indexOf(".take()"), "a restart while quitting keeps the old hub the app's, for the quit to stop");
+});

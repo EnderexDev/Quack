@@ -14,7 +14,8 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::image::Image;
@@ -200,6 +201,8 @@ struct Shared {
     settings_file: PathBuf,
     /** The hub this app started, if it started one */
     hub: Mutex<Option<Child>>,
+    /** Set by the quit: no hub starts again (the poll would replace the one the quit stops) */
+    quitting: AtomicBool,
     last_spawn: Mutex<Option<Instant>>,
     /** The last /api/state, to check the paths the windows ask to open */
     last_state: Mutex<Value>,
@@ -421,6 +424,10 @@ fn port_open(port: u16) -> bool {
  */
 fn restart_hub_now(app: &AppHandle) -> Result<(), String> {
     let shared = app.state::<Shared>();
+    // Quitting: the old hub stays this app's, so the quit still stops it
+    if shared.quitting.load(Ordering::SeqCst) {
+        return Err("Quack is quitting".into());
+    }
     // The old hub is no longer this app's to watch: its exit is expected, not a crash to answer
     let old = shared.hub.lock().unwrap().take();
     // The new hub gets ready while the old one still serves, then asks it to step down and takes
@@ -1426,6 +1433,42 @@ mod tests {
     }
 
     #[test]
+    fn the_poll_starts_no_hub_after_the_quit_stops_its_own() {
+        // 18/11/26: the quit stopped the app's hub, the poll saw it exit and started a new one
+        // before the process ended; that hub kept running after Quit. Here the poll's own wait
+        // and start run on a thread while the quit stops a real hub.
+        let hub = std::sync::Arc::new(Mutex::new(Some(Command::new("node").args(["-e", "setTimeout(() => {}, 30000)"]).spawn().unwrap())));
+        let quitting = std::sync::Arc::new(AtomicBool::new(false));
+        let poll = {
+            let (hub, quitting) = (hub.clone(), quitting.clone());
+            thread::spawn(move || {
+                let mut started = 0;
+                if sleep_until_own_hub_exits(&hub, Duration::from_secs(5)) {
+                    if let Some(mut slot) = claim_hub_slot(&hub, &quitting) {
+                        *slot = Some(Command::new("node").args(["-e", "setTimeout(() => {}, 30000)"]).spawn().unwrap());
+                        started += 1;
+                    }
+                }
+                started
+            })
+        };
+        thread::sleep(Duration::from_millis(300));
+        stop_hub(&hub, &quitting, || false);
+        let started = poll.join().unwrap();
+        let mut slot = hub.lock().unwrap();
+        let still_running = slot.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)));
+        if let Some(child) = slot.as_mut() {
+            let _ = child.kill();
+        }
+        assert_eq!(started, 0, "the poll started a hub after the quit");
+        assert!(!still_running);
+        // Before any quit, a hub that exited is replaced as before
+        let free = Mutex::new(Some(Command::new("node").args(["-e", ""]).spawn().unwrap()));
+        free.lock().unwrap().as_mut().unwrap().wait().unwrap();
+        assert!(claim_hub_slot(&free, &AtomicBool::new(false)).is_some());
+    }
+
+    #[test]
     fn a_hub_call_to_a_closed_port_fails_fast() {
         // Free a port, then call it: on Windows a plain connect took ~2 s to be refused
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
@@ -1688,12 +1731,7 @@ fn session_ending() -> bool {
 fn spawn_hub_with(app: &AppHandle, takeover: bool) {
     let shared = app.state::<Shared>();
     let settings = shared.settings.lock().unwrap().clone();
-    let mut hub = shared.hub.lock().unwrap();
-    if let Some(child) = hub.as_mut() {
-        if matches!(child.try_wait(), Ok(None)) {
-            return; // still starting
-        }
-    }
+    let Some(mut hub) = claim_hub_slot(&shared.hub, &shared.quitting) else { return };
     let mut last = shared.last_spawn.lock().unwrap();
     if last.is_some_and(|at| at.elapsed() < RESPAWN_AFTER) {
         return;
@@ -2036,16 +2074,44 @@ fn sleep_until_own_hub_exits(hub: &Mutex<Option<Child>>, max: Duration) -> bool 
     false
 }
 
+/**
+ * The app's hub slot, locked for a new start. None while the app quits, or while the hub it
+ * started still runs (a hub still starting has not answered yet).
+ */
+fn claim_hub_slot<'a>(hub: &'a Mutex<Option<Child>>, quitting: &AtomicBool) -> Option<MutexGuard<'a, Option<Child>>> {
+    let mut slot = hub.lock().unwrap();
+    // Read under the lock: a start waiting on it while the quit stops the hub sees the flag
+    if quitting.load(Ordering::SeqCst) {
+        return None;
+    }
+    if let Some(child) = slot.as_mut() {
+        if matches!(child.try_wait(), Ok(None)) {
+            return None;
+        }
+    }
+    Some(slot)
+}
+
 /** Stop the hub this app started, with its daemons; a hub someone else started keeps running */
 fn stop_own_hub(app: &AppHandle) {
     let shared = app.state::<Shared>();
-    let mut hub = shared.hub.lock().unwrap();
+    let port = shared.settings.lock().unwrap().hub_port;
+    stop_hub(&shared.hub, &shared.quitting, || hub_call(port, "POST", "/api/shutdown", Some(&json!({}))).is_ok());
+}
+
+/**
+ * The quit's stop. The flag goes up first: the poll sees this hub exit and would start a new one
+ * before the app's process ends, a hub left running after Quit (18/11/26). `shutdown` asks the
+ * hub to stop its daemons; true when it heard.
+ */
+fn stop_hub(hub: &Mutex<Option<Child>>, quitting: &AtomicBool, shutdown: impl FnOnce() -> bool) {
+    quitting.store(true, Ordering::SeqCst);
+    let mut hub = hub.lock().unwrap();
     let Some(child) = hub.as_mut() else { return };
     if !matches!(child.try_wait(), Ok(None)) {
         return;
     }
-    let port = shared.settings.lock().unwrap().hub_port;
-    if hub_call(port, "POST", "/api/shutdown", Some(&json!({}))).is_ok() {
+    if shutdown() {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
             thread::sleep(Duration::from_millis(100));
@@ -2072,6 +2138,7 @@ fn main() {
         settings: Mutex::new(settings),
         settings_file,
         hub: Mutex::new(early_hub),
+        quitting: AtomicBool::new(false),
         approval_token: Mutex::new(approval_token),
         last_spawn: Mutex::new(None),
         last_state: Mutex::new(Value::Null),

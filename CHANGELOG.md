@@ -6,6 +6,11 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.41] - 2026-11-18
+
+### Fixed
+- Quit in the tray panel no longer leaves a hub running. It stopped the hub the app had started, and the app then started a new one before it closed. A hub that was already running before the app opened still keeps running, as before.
+
 ## [1.0.40] - 2026-11-18
 
 ### Fixed
@@ -415,7 +420,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.40...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.41...HEAD
+[1.0.41]: https://github.com/EnderexDev/Quack/compare/v1.0.40...v1.0.41
 [1.0.40]: https://github.com/EnderexDev/Quack/compare/v1.0.39...v1.0.40
 [1.0.39]: https://github.com/EnderexDev/Quack/compare/v1.0.38...v1.0.39
 [1.0.38]: https://github.com/EnderexDev/Quack/compare/v1.0.37...v1.0.38
