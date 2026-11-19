@@ -1,0 +1,72 @@
+/* Queue (the Studio queue) and Folder (the game's folder). Owner: the Queue and Folder group.
+   Sizes in rem (px / 16), never px past a 2 px hairline: 1rem grows with the window (base.css).
+   Reuse controls.css (its list is at its top) before making a control here.
+   Every rule is scoped under .queue or .folder, the views' own wrappers (main.js renderQueue and
+   renderFolder), so the header's numbers and the other views never move with these. The slot,
+   the armed danger button and the glyphs these views use are shared (controls.css). */
+
+/* ---------- Shared by the two views ---------- */
+/* Nothing to show, or the hub failed: centred, a slot over the line */
+.queue > .empty, .folder > .empty { display: flex; flex-direction: column; align-items: center; gap: 0.5rem; margin: auto 0; max-width: 32rem; align-self: center; }
+.queue > .empty .slot, .folder > .empty .slot { margin-bottom: 0.25rem; }
+.queue > .empty strong, .folder > .empty strong { margin: 0; }
+.queue > .qfail { color: var(--bad-soft); overflow-wrap: anywhere; }
+
+/* ---------- Queue ---------- */
+.queue { gap: 0.875rem; }
+.queue .qcard { flex: none; padding: 0.875rem 1.125rem 0.375rem; }
+.queue .qhead { display: flex; align-items: center; gap: 0.625rem; min-height: 1.625rem; margin-bottom: 0.25rem; }
+
+/* A row: slot, name over its hint, pills, time. A hairline between rows, none under the heading */
+.queue .qrow { display: flex; align-items: center; gap: 0.75rem; min-height: 3rem; padding: 0.4375rem 0; border-top: 1px solid var(--line); }
+.queue .qhead + .qrow { border-top-color: transparent; }
+/* The name never gives all its room to the pills: past this they wrap among themselves */
+.queue .qmain { flex: 1; min-width: 9rem; display: flex; flex-direction: column; gap: 0.125rem; }
+.queue .qmain b { color: var(--text); font-size: 0.84375rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.queue .qmain .hint { color: var(--muted); font-size: 0.75rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.queue .qmain .hint.mono { font-size: 0.6875rem; }
+.queue .qmain.bad b { color: var(--bad-soft); }
+.queue .qtags { flex: 0 1 auto; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.375rem; min-width: 0; }
+.queue .qtime { flex: none; min-width: 3rem; text-align: right; color: var(--muted); font-size: 0.71875rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* An empty card: one line, the empty text at the heading's end */
+.queue .qcard.none { padding-bottom: 0.875rem; }
+.queue .qcard.none .qhead { margin-bottom: 0; }
+.queue .qnone { color: var(--muted); font-size: 0.8125rem; }
+
+/* Studio: the lock in a big line, its state in the slot (free is green) */
+.queue .qphase b { color: var(--text); font-weight: 500; }
+.queue .qlock { display: flex; align-items: center; gap: 0.875rem; padding: 0.375rem 0 0.875rem; }
+.queue .qlock .qmain { gap: 0.25rem; }
+.queue .qlock .qmain b { font-family: var(--display); font-size: 1.125rem; font-weight: 700; letter-spacing: -0.01em; white-space: normal; text-wrap: balance; }
+.queue .qlock .qmain .hint { white-space: normal; }
+.queue .qlock.free .qmain b { color: var(--live); }
+.queue .qlock .btn { flex: none; }
+/* Studio refusing the play, or a play Quack did not start: the tab's one red block */
+.queue .qalert { display: flex; align-items: center; gap: 0.875rem; padding: 0.75rem 0.75rem 0.75rem 0.875rem; margin-bottom: 0.875rem; border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--bad) 9%, transparent); border: 1px solid color-mix(in srgb, var(--bad) 26%, transparent); }
+.queue .qalert .qmain b { white-space: normal; line-height: 1.35; text-wrap: pretty; }
+.queue .qalert .qmain .hint { white-space: normal; overflow-wrap: anywhere; }
+.queue .qalert .btn { flex: none; }
+.queue .qstudio > .note { margin: 0 0 0.875rem; }
+.queue .qstudio > .qrow:last-child { padding-bottom: 0.625rem; }
+
+/* Today: six tiles in a row, three when the window is narrow; the number over its label */
+.queue .qstats { grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 0.5rem; margin: 0.25rem 0 0.75rem; }
+@media (max-width: 960px) { .queue .qstats { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+.queue .qstats .stat { padding: 0.625rem 0.75rem 0.6875rem; background: var(--well); }
+.queue .qstats .stat .v { font-size: 1.25rem; }
+.queue .qstats .stat .label { order: 0; white-space: normal; text-wrap: balance; line-height: 1.3; font-size: 0.75rem; }
+.queue .qtoday > .field { padding: 0.5rem 0; }
+.queue .qtoday > .note { margin: 0 0 0.75rem; }
+
+/* ---------- Folder ---------- */
+.folder { gap: 0.875rem; }
+.folder .fcard { flex: none; max-width: 47.5rem; padding: 0.875rem 1.125rem 1.125rem; }
+.folder .fcard > .label { margin-bottom: 0.625rem; }
+.folder .place { gap: 0.875rem; margin: 0; padding: 0 0 0.875rem; background: none; border: 0; border-radius: 0; }
+.folder .place b { font-family: var(--display); font-size: 1.125rem; font-weight: 700; letter-spacing: -0.01em; margin-bottom: 0.1875rem; }
+.folder .place .mono { font-size: 0.75rem; user-select: text; }
+.folder .fcard > .field { font-weight: 500; color: var(--text-soft); }
+.folder .fcard > .field .mono { user-select: text; }
+.folder .fcard > .note { margin: 0.125rem 0 1rem; }
+.folder .fcard > .note.bad { margin: 0.75rem 0 0; }

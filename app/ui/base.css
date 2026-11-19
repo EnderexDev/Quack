@@ -1,0 +1,95 @@
+/*
+  Quack app styles, on Quackify's look (its src/styles/tokens.css, as Wyll and Quack Time use it):
+  a near-black page under a soft aura, glass panels with hairline edges, neutral surfaces in
+  white at low alpha, pills, one easing curve. The brand colour (yellow, green in Quack Dev) is
+  kept for the logo and the screen's main action or state; everything else is neutral.
+
+  The styles are split by owner, linked by index.html and tray.html in this order (a later file
+  wins a tie): base.css (fonts, tokens, page), controls.css (the shared controls: read its list
+  before making a new one), shell.css (top bar, notices, sidebar, the game's page, Output and
+  Playtest), views-merges.css (Merges, Conflict, Analysis), views-queue.css (Queue, Folder),
+  views-settings.css (Settings), dialogs.css (dialogs, menu, toast, Connect to AI), tray.css.
+  A rule more than one group needs goes to controls.css, never into two group files.
+
+  This file: fonts, tokens, the page. Owner: the shared layer (no view group edits it).
+*/
+/* The logo's face (Fredoka Bold, OFL, fonts/Fredoka-OFL.txt): the name wherever it shows as a wordmark */
+@font-face { font-family: "Fredoka"; src: url("fonts/Fredoka.ttf") format("truetype"); font-weight: 300 700; font-stretch: 75% 125%; }
+@font-face { font-family: "JetBrains Mono"; src: url("fonts/JetBrainsMono.woff2") format("woff2"); font-weight: 100 800; }
+
+/* ---------- Tokens ---------- */
+:root {
+  --bg: #0a0a0c;
+  --glass: rgba(16, 16, 21, 0.62);
+  --glass-strong: rgba(22, 22, 28, 0.94);
+  --surface-1: rgba(255, 255, 255, 0.045);
+  --surface-2: rgba(255, 255, 255, 0.08);
+  --surface-3: rgba(255, 255, 255, 0.14);
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.14);
+  --well: rgba(0, 0, 0, 0.26);
+  --text: #f6f4ee;
+  --text-soft: #d8d5cd;
+  --muted: #9a978f;
+  --faint: #6b6861;
+  /* The brand: the logo, the main action and the main state of a screen (green in Quack Dev) */
+  --brand-300: #ffe48a; --brand-400: #ffd84d; --brand-500: #ffb800; --brand-end: #ff8a0f; --brand-ink: #1a1400;
+  /* The wordmark's gradient, top to bottom (Figma "Quack - Logo", lockup "quack-lockup-ouro") */
+  --word-1: #fff6c8; --word-2: #ffcc1f; --word-3: #b87400;
+  /* States: strong against the dark so a glance tells them apart */
+  --live: #29d39a; --warn: #ffab52; --bad: #ff6b6b; --bad-soft: #ff9b94; --sky: #7cb7ff;
+  /* The aura's cool side, under the glass (the warm side is the brand's) */
+  --aura-cool: #3a3f8f;
+  --r-sm: 0.5rem; --r-md: 0.875rem; --r-lg: 1.25rem; --r-pill: 999px;
+  --gap: 0.625rem;
+  --shadow-popup: 0 1.25rem 3.125rem rgba(0, 0, 0, 0.5);
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --t-fast: 150ms;
+  --body: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --display: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+  --logo: "Fredoka", "Arial Rounded MT Bold", sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+  color-scheme: dark;
+}
+/* Quack Dev wears green where Official wears yellow, so the two apps tell apart by colour alone
+   (common.js sets the class; the same greens are in app/scripts/icons.mjs and the plugin) */
+html.dev { --brand-300: #a8f29c; --brand-400: #5ee36a; --brand-500: #2fbf4a; --brand-end: #1fa88c; --brand-ink: #0f3d16;
+  --word-1: #f0ffe8; --word-2: #5ee36a; --word-3: #1f8a3a; }
+
+/* ---------- Base ---------- */
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+/* The whole layout is in rem and grows with the window from this one size: 16 px at the window's
+   own 1120 x 740 and below (the 820 x 560 minimum keeps it), then with the window's smaller side,
+   so a big screen shows the same layout bigger instead of small text in a wide page (23.4 px at
+   1920 x 1080, 31.1 px at 2560 x 1440). Hairlines (1 to 2 px) and the short-window query stay px */
+html {
+  --ui-base-w: 70; --ui-base-h: 46.25; --ui-max: 32px;
+  font-size: clamp(16px, min(100vw / var(--ui-base-w), 100vh / var(--ui-base-h)), var(--ui-max));
+}
+/* The aura: still gradients and a grain so they never band. No blurred layer and no backdrop
+   filter: the WebView runs with --disable-gpu, where both are repainted on the CPU, and over a
+   gradient this smooth the glass looks the same without them */
+body {
+  font-family: var(--body); font-size: 0.875rem; line-height: 1.4; color: var(--text-soft);
+  background-color: var(--bg);
+  background-image:
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%' height='100%' filter='url(%23n)' opacity='.05'/></svg>"),
+    radial-gradient(60% 55% at 6% -8%, color-mix(in srgb, var(--brand-500) 16%, transparent), transparent 70%),
+    radial-gradient(55% 65% at 104% 108%, color-mix(in srgb, var(--aura-cool) 42%, transparent), transparent 70%);
+  -webkit-font-smoothing: antialiased; user-select: none; overflow: hidden;
+}
+::selection { background: var(--brand-400); color: var(--brand-ink); }
+:focus-visible { outline: 2px solid color-mix(in srgb, var(--brand-400) 80%, transparent); outline-offset: 2px; }
+::-webkit-scrollbar { width: 0.75rem; height: 0.75rem; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.16); border: 0.1875rem solid transparent; background-clip: padding-box; border-radius: 0.5rem; }
+::-webkit-scrollbar-thumb:hover { background-color: rgba(255, 255, 255, 0.28); }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+
+.label { font-size: 0.71875rem; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.display { font-family: var(--display); font-weight: 700; letter-spacing: -0.02em; color: var(--text); }
+.mono { font-family: var(--mono); font-size: 0.75rem; }
+.grow { flex: 1; min-width: 0; }
+.hidden { display: none !important; }
+.row { display: flex; align-items: center; gap: 0.75rem; }
+.muted { color: var(--muted); }

@@ -30,7 +30,8 @@ test("app: no button is tied to VS Code; each one opens the editor the app found
   const direct = [...main.matchAll(/invoke\("open_path", \{ path(?::\s*[\w.]+)?, editor: true \}\)/g)].map((m) => m.index);
   assert.equal(direct.length, 3, "the button, a pick in its list, a finding's file");
   assert.ok(direct.every((at) => (at > from && at < to) || (at > analysisFrom && at < analysisTo)), "only editorButtons, its list and a finding open an editor");
-  assert.equal([...main.matchAll(/editorButtons\(/g)].length, 4, "nav, Folder tab, conflict view, and its definition");
+  // Not the Folder tab: the game header above it already opens that same folder in the same editor
+  assert.equal([...main.matchAll(/editorButtons\(/g)].length, 3, "nav, conflict view, and its definition");
   // The app answers both calls the window makes
   const rust = read("src-tauri", "src", "main.rs");
   assert.match(rust, /generate_handler!\[[^\]]*\beditors,/s);

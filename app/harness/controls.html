@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Quack controls</title>
+<!-- Every shared control of app/ui/controls.css in each of its states, inside the app's shell, for
+     the harness shots "controls" and "controls-1920" and as a reference for whoever restyles a view.
+     serve.mjs puts the app's stylesheets here, in the order index.html links them -->
+<!-- stylesheets -->
+</head>
+<body>
+  <div class="app">
+    <nav class="topbar">
+      <span class="brand"><span class="mark"></span><span class="word">Quack</span></span>
+      <div class="tabs"><button class="navlink on">Output</button><button class="navlink">Merges <span class="n">2</span></button><button class="navlink">Queue</button></div>
+    </nav>
+    <div class="body">
+      <aside class="side">
+        <div class="label">Connected</div>
+        <button class="game sel"><span class="dot live"></span><b class="grow">Selected game</b></button>
+        <button class="game"><span class="dot warn"></span><b class="grow">Warning</b></button>
+        <button class="game"><span class="dot bad"></span><b class="grow">Error</b></button>
+        <button class="game"><span class="dot"></span><b class="grow">Idle</b></button>
+      </aside>
+      <section class="main">
+        <div class="view">
+          <div class="title"><h1 class="display grow">Shared controls</h1><span class="pill brand">Main state</span><button class="btn yellow">Main action</button></div>
+
+          <div class="cards">
+            <div class="card">
+              <span class="label">Buttons</span>
+              <div class="actions">
+                <button class="btn yellow">Yellow</button><button class="btn light">Light</button><button class="btn">Neutral</button>
+                <button class="btn ghost">Ghost</button><button class="btn danger">Danger</button><button class="btn" disabled>Disabled</button>
+              </div>
+              <div class="actions" style="margin-top: 0.75rem">
+                <button class="btn sm">Small</button><button class="btn sm danger">Small danger</button>
+                <button class="btn icon" aria-label="Settings"><span class="ico sliders"></span></button><button class="btn sm icon" aria-label="Settings"><span class="ico sliders"></span></button>
+                <span class="split"><button class="btn">Open in Cursor</button><button class="btn more">▾</button></span>
+              </div>
+              <p class="note">A note under a control. Yellow only once per screen.</p>
+              <p class="note bad">A note about a failure.</p>
+            </div>
+
+            <div class="card">
+              <span class="label">Fields</span>
+              <div class="field"><span class="grow">Toggle on<span class="hint">White when on, never the brand</span></span><button class="tog"></button></div>
+              <div class="field"><span class="grow">Toggle off</span><button class="tog off"></button></div>
+              <div class="field"><span class="grow">Read only</span><button class="tog ro"></button></div>
+              <div class="field"><span class="grow">Segmented</span><div class="seg"><button class="on">English</button><button>Português</button></div></div>
+              <div class="field"><span class="grow">Select</span><select class="field-input"><option>The one used last (Cursor)</option></select></div>
+              <div class="field"><input class="field-input grow" placeholder="Text field"><input class="field-input mono" value="122779716334700" style="width: 10rem"></div>
+            </div>
+
+            <div class="card">
+              <span class="label">Pills and chips</span>
+              <div class="actions">
+                <span class="pill">Neutral</span><span class="pill strong">high</span><span class="pill live"><span class="dot live"></span>Live</span>
+                <span class="pill warn">Warn</span><span class="pill bad">Bad</span><span class="pill sky">Info</span><span class="pill mono">pid 18244</span>
+              </div>
+              <div class="actions" style="margin-top: 0.75rem">
+                <button class="chip on">All</button><button class="chip">Server</button><button class="chip">Client</button><button class="chip">Shared</button>
+              </div>
+              <div class="place" style="margin-top: 0.75rem"><div class="grow"><b>Anime Astral Copy</b><span class="mono">122779716334700 · E:\Dev\AnimeAstralCopy</span></div><button class="btn danger">Remove</button></div>
+            </div>
+
+            <div class="card">
+              <span class="label">List rows</span>
+              <div class="list scroll" style="max-height: 9rem; padding: 0">
+                <div class="lrow sel"><span class="dot live"></span><span class="grow mono">ServerScriptService/Services/TradeService.luau</span><span class="pill warn">1 hunk</span></div>
+                <div class="lrow"><span class="dot"></span><span class="grow mono">ReplicatedStorage/Shared/Config/EggOdds.luau</span><span class="muted">14:05</span></div>
+                <div class="lrow"><span class="dot"></span><span class="grow mono">StarterPlayer/StarterPlayerScripts/HudController.client.luau</span><span class="muted">14:06</span></div>
+                <div class="lrow"><span class="dot"></span><span class="grow mono">ServerScriptService/Data/ProfileTemplate.luau</span><span class="muted">14:08</span></div>
+                <div class="lrow"><span class="dot"></span><span class="grow mono">ReplicatedStorage/Shared/Old/LegacyTween.luau</span><span class="muted">14:07</span></div>
+              </div>
+            </div>
+
+            <div class="card">
+              <span class="label">Signs, picks and search</span>
+              <div class="actions">
+                <span class="slot">2</span><span class="slot live"><span class="ico i-run"></span></span><span class="slot warn"><span class="ico i-cross"></span></span><span class="slot bad"><span class="ico i-alert"></span></span><span class="slot sky"><span class="ico i-up"></span></span>
+                <span class="slot lg"><span class="ico i-lock"></span></span><span class="slot lg live"><span class="ico i-unlock"></span></span><span class="slot lg"><span class="ico i-folder"></span></span>
+                <span class="ico i-play"></span><span class="ico i-check"></span><span class="ico i-info"></span><span class="ico sliders"></span>
+              </div>
+              <div class="actions" style="margin-top: 0.75rem">
+                <input type="checkbox" class="checkbox" checked><input type="checkbox" class="checkbox"><span class="radio on"></span><span class="radio"></span>
+                <button class="btn danger armed">Remove?</button><button class="btn sm ghost"><span class="chev">‹</span>Back</button>
+              </div>
+              <label class="search-field" style="margin-top: 0.75rem"><span class="ico i-search"></span><input class="field-input" placeholder="Search settings"></label>
+            </div>
+          </div>
+
+          <div class="panel" style="flex: none">
+            <div class="panel-top"><span class="label grow">A well</span><span class="pill live">Live</span></div>
+            <div class="empty"><strong>Nothing here yet</strong>An empty state: one heading, one line of why.</div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</body>
+</html>

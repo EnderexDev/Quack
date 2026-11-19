@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { appCss } from "./app_css.js";
 
 const app = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "app");
 const read = (p: string) => fs.readFileSync(path.join(app, p));
@@ -29,7 +30,7 @@ test("each app swaps its own colour of tray icons", () => {
 });
 
 test("the Dev UI overrides every brand token", () => {
-  const css = read("ui/style.css").toString("utf8");
+  const css = appCss();
   const tokens = (block: string) => [...block.matchAll(/(--brand-[a-z0-9]+):/g)].map((m) => m[1]).sort();
   const root = css.slice(css.indexOf(":root {"), css.indexOf("\n}", css.indexOf(":root {")));
   const dev = css.slice(css.indexOf("html.dev {"), css.indexOf("}", css.indexOf("html.dev {")));

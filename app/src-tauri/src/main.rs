@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod approval;
+mod test_profile;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -15,7 +16,7 @@ use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::image::Image;
@@ -91,8 +92,41 @@ const APPROVAL_WAIT: Duration = Duration::from_secs(5 * 60);
 
 use flavor::{ICON_BAD, ICON_OK, ICON_PAUSED, ICON_WARN};
 
+/** %APPDATA%, or the test profile's own folder under QUACK_TEST_PROFILE (test_profile.rs) */
 fn appdata() -> PathBuf {
+    match test_profile() {
+        Some(profile) => profile.appdata(),
+        None => real_appdata(),
+    }
+}
+
+fn real_appdata() -> PathBuf {
     std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+}
+
+/** Set once, first thing in main: Some only under QUACK_TEST_PROFILE */
+static TEST_PROFILE: OnceLock<Option<test_profile::TestProfile>> = OnceLock::new();
+
+fn test_profile() -> Option<&'static test_profile::TestProfile> {
+    TEST_PROFILE.get().and_then(Option::as_ref)
+}
+
+/** What a command that would change the machine (not the profile) answers in a test profile */
+const NOT_IN_TEST_PROFILE: &str = "not in a test profile (QUACK_TEST_PROFILE)";
+
+/**
+ * The real folders a test profile must stay apart from: both flavors' settings and app folders,
+ * %APPDATA%\quack (registries, config.json, the Open Cloud vault) and Roblox's (the plugins)
+ */
+fn real_quack_folders() -> Vec<PathBuf> {
+    let roaming = real_appdata();
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let mut folders = vec![roaming.join("quack"), local.join("Quack"), local.join("Quack Dev"), local.join("Roblox")];
+    for name in ["dev.enderex.quack", "dev.enderex.quack.dev"] {
+        folders.push(roaming.join(name));
+        folders.push(local.join(name));
+    }
+    folders
 }
 
 /** The flavor's settings folder: settings.json, the update marker, the approval token */
@@ -357,11 +391,17 @@ fn set_settings(app: AppHandle, language: Option<String>, notify: Option<bool>, 
 
 #[tauri::command]
 fn get_autostart(app: AppHandle) -> bool {
+    if test_profile().is_some() {
+        return false;
+    }
     app.autolaunch().is_enabled().unwrap_or(false)
 }
 
 #[tauri::command]
 fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    if test_profile().is_some() {
+        return Err(NOT_IN_TEST_PROFILE.into());
+    }
     let launcher = app.autolaunch();
     if enabled { launcher.enable() } else { launcher.disable() }.map_err(|e| e.to_string())?;
     Ok(launcher.is_enabled().unwrap_or(false))
@@ -388,6 +428,9 @@ fn project_roots(app: AppHandle) -> Vec<String> {
 /** Creates a new game folder for setup; an absolute path only, and fine if it already exists */
 #[tauri::command]
 fn make_folder(path: String) -> Result<(), String> {
+    if test_profile().is_some() {
+        return Err(NOT_IN_TEST_PROFILE.into());
+    }
     let target = PathBuf::from(&path);
     if !target.is_absolute() {
         return Err("the folder must be an absolute path".into());
@@ -496,12 +539,15 @@ async fn fetch_update(app: &AppHandle) -> Result<Option<String>, String> {
  */
 #[tauri::command]
 async fn check_update(app: AppHandle) -> Result<Value, String> {
+    if test_profile().is_some() {
+        return Err(NOT_IN_TEST_PROFILE.into());
+    }
     let ready = fetch_update(&app).await?;
     Ok(json!({ "ready": ready }))
 }
 
 fn update_loop(app: AppHandle) {
-    if cfg!(debug_assertions) {
+    if cfg!(debug_assertions) || test_profile().is_some() {
         return;
     }
     loop {
@@ -527,6 +573,9 @@ fn update_status(app: AppHandle) -> Value {
  */
 #[tauri::command]
 async fn install_update(app: AppHandle) -> Result<(), String> {
+    if test_profile().is_some() {
+        return Err(NOT_IN_TEST_PROFILE.into());
+    }
     let ready = app.state::<Shared>().ready_update.lock().unwrap().take();
     let Some((update, bytes)) = ready else {
         return Err("no update is ready".into());
@@ -554,7 +603,7 @@ async fn install_update(app: AppHandle) -> Result<(), String> {
  * running already is this build; finish_update and the poll loop cover what is left.
  */
 fn early_update_takeover(settings: &Settings) -> Option<(Child, String)> {
-    if cfg!(debug_assertions) {
+    if cfg!(debug_assertions) || test_profile().is_some() {
         return None;
     }
     let marker = update_marker();
@@ -585,6 +634,9 @@ fn early_update_takeover(settings: &Settings) -> Option<(Child, String)> {
  * a few minutes of the click, and only if its build really differs.
  */
 fn finish_update(app: AppHandle) {
+    if test_profile().is_some() {
+        return;
+    }
     let marker = update_marker();
     let Ok(text) = fs::read_to_string(&marker) else { return };
     let _ = fs::remove_file(&marker);
@@ -698,7 +750,7 @@ fn write_if_changed(new: &[u8], to: &Path) -> std::io::Result<bool> {
  * the plugin's code alone leaves the file alone too.
  */
 fn install_plugin(app: &AppHandle) {
-    if cfg!(debug_assertions) {
+    if cfg!(debug_assertions) || test_profile().is_some() {
         return;
     }
     let Some(from) = resource(app, &["plugin", flavor::PLUGIN]) else { return };
@@ -726,7 +778,7 @@ fn install_plugin(app: &AppHandle) {
  * the user PATH once; terminals opened after that find it.
  */
 fn install_cli(app: &AppHandle) {
-    if cfg!(debug_assertions) || !cfg!(windows) {
+    if cfg!(debug_assertions) || !cfg!(windows) || test_profile().is_some() {
         return;
     }
     let Some(dir) = app.path().resource_dir().ok().map(|d| without_verbatim(d).join("bin")) else { return };
@@ -863,6 +915,10 @@ fn valid_ai_targets(ids: &[String]) -> bool {
 #[tauri::command]
 async fn ai_clients(app: AppHandle, connect: bool, only: Option<Vec<String>>) -> Result<Value, String> {
     // The folders ticked in the dialog: each one by its id, and none ticked connects nothing
+    // Connecting writes into the AI clients' real config files
+    if connect && test_profile().is_some() {
+        return Err(NOT_IN_TEST_PROFILE.into());
+    }
     if let Some(ids) = &only {
         if !valid_ai_targets(ids) {
             return Err("only takes connect-ai ids".into());
@@ -1019,6 +1075,10 @@ fn hidden_command(program: &str) -> Command {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
+    // The hub, its daemons and the CLI read and write %APPDATA%\quack: a test profile's own
+    if let Some(profile) = test_profile() {
+        command.env("APPDATA", profile.appdata());
+    }
     command
 }
 
@@ -1120,7 +1180,8 @@ impl EditorRoots {
                     .collect()
             })
             .unwrap_or_default();
-        EditorRoots { installs, on_path, appdata: appdata(), local_appdata }
+        // Only read (when each editor was last used): the real folder, in a test profile too
+        EditorRoots { installs, on_path, appdata: real_appdata(), local_appdata }
     }
 }
 
@@ -1257,13 +1318,40 @@ const WEBVIEW_DIR: &str = "webview-sem-gpu";
 
 /** Builds a window of tauri.conf.json (both have "create": false) in WEBVIEW_DIR */
 fn build_window(app: &AppHandle, label: &str) -> tauri::Result<WebviewWindow> {
-    let config = app.config().app.windows.iter().find(|w| w.label == label).cloned().ok_or(tauri::Error::WindowNotFound)?;
-    let dir = app.path().app_local_data_dir()?.join(WEBVIEW_DIR);
+    let mut config = app.config().app.windows.iter().find(|w| w.label == label).cloned().ok_or(tauri::Error::WindowNotFound)?;
+    let dir = match test_profile() {
+        Some(profile) => {
+            test_window(&mut config, label);
+            profile.webview_dir()
+        }
+        None => app.path().app_local_data_dir()?.join(WEBVIEW_DIR),
+    };
     tauri::WebviewWindowBuilder::from_config(app, &config)?.data_directory(dir).build()
+}
+
+/**
+ * A test profile's window: shown from its creation, which tao does without activating it when
+ * `focus` is false (SW_SHOWNOACTIVATE; a later show() would activate it). Off screen, off the
+ * taskbar and never focusable, so a test run neither takes the focus nor covers anything.
+ */
+fn test_window(config: &mut tauri::utils::config::WindowConfig, label: &str) {
+    let (x, y) = test_profile::OFF_SCREEN;
+    config.visible = true;
+    config.focus = false;
+    config.focusable = false;
+    config.skip_taskbar = true;
+    config.always_on_top = false;
+    config.center = false;
+    config.x = Some(if label == "main" { x } else { x + 4000.0 });
+    config.y = Some(y);
 }
 
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        // A test profile's window is shown already, and never brought to the front
+        if test_profile().is_some() {
+            return;
+        }
         show(&window);
         let _ = window.unminimize();
         let _ = window.set_focus();
@@ -2121,14 +2209,26 @@ fn stop_hub(hub: &Mutex<Option<Child>>, quitting: &AtomicBool, shutdown: impl Fn
 }
 
 fn main() {
+    // Unusable test profile settings stop the app: never a fall back to the real profile
+    let profile = test_profile::resolve(std::env::var_os(test_profile::PROFILE_VAR), std::env::var_os(test_profile::PORT_VAR), flavor::IDENTIFIER, &real_quack_folders())
+        .unwrap_or_else(|error| {
+            eprintln!("Quack app: {error}");
+            std::process::exit(2);
+        });
+    let _ = TEST_PROFILE.set(profile);
     let started_hidden = std::env::args().any(|arg| arg == "--hidden");
     // Managed before the builder runs: the windows in tauri.conf.json are created (and fire
     // focus events) before `setup`. Same folder Tauri's app_config_dir gives on Windows.
     let settings_file = appdata().join(flavor::IDENTIFIER).join("settings.json");
-    let settings = fs::read_to_string(&settings_file)
+    let mut settings = fs::read_to_string(&settings_file)
         .ok()
         .and_then(|text| serde_json::from_str::<Settings>(&text).ok())
         .unwrap_or_default();
+    // A test profile's hub is its own, whatever its settings file says
+    if let Some(profile) = test_profile() {
+        settings.hub_port = profile.port;
+        settings.registry = profile.appdata().join("quack").join(flavor::REGISTRY).to_string_lossy().into_owned();
+    }
     // After an update click: the new hub starts now, while Tauri is still building the windows
     let (early_hub, early_token) = early_update_takeover(&settings).unzip();
     // A hub this app did not start (an earlier instance did; it outlives the app) answers to the
@@ -2146,6 +2246,11 @@ fn main() {
         tray_hidden_at: Mutex::new(None),
         ready_update: Mutex::new(None),
     };
+    let mut context = tauri::generate_context!();
+    // The identifier is the single-instance key: a test profile's start never reaches the installed app
+    if let Some(profile) = test_profile() {
+        context.config_mut().identifier = profile.identifier.clone();
+    }
     tauri::Builder::default()
         .manage(shared)
         // A second start shows the window, except the hub's own (--hidden, when a write waits and
@@ -2193,19 +2298,22 @@ fn main() {
             build_window(app.handle(), "tray")?;
             // No native menu: Windows opens it under the cursor, over the taskbar, which covers
             // it whenever a fullscreen game keeps the foreground. Quit lives in the panel.
-            TrayIconBuilder::with_id(TRAY_ID)
-                .icon(Image::from_bytes(ICON_BAD)?)
-                .tooltip(flavor::NAME)
-                .on_tray_icon_event(|tray, event| {
-                    if let Some(rect) = opens_tray_panel(event) {
-                        let app = tray.app_handle();
-                        let scale = app.get_webview_window("tray").and_then(|w| w.scale_factor().ok()).unwrap_or(1.0);
-                        let position = rect.position.to_physical::<f64>(scale);
-                        let size = rect.size.to_physical::<f64>(scale);
-                        toggle_tray(app, (position.x, position.y, size.width, size.height));
-                    }
-                })
-                .build(app)?;
+            // A test profile shows no icon: its panel is built all the same, off screen.
+            if test_profile().is_none() {
+                TrayIconBuilder::with_id(TRAY_ID)
+                    .icon(Image::from_bytes(ICON_BAD)?)
+                    .tooltip(flavor::NAME)
+                    .on_tray_icon_event(|tray, event| {
+                        if let Some(rect) = opens_tray_panel(event) {
+                            let app = tray.app_handle();
+                            let scale = app.get_webview_window("tray").and_then(|w| w.scale_factor().ok()).unwrap_or(1.0);
+                            let position = rect.position.to_physical::<f64>(scale);
+                            let size = rect.size.to_physical::<f64>(scale);
+                            toggle_tray(app, (position.x, position.y, size.width, size.height));
+                        }
+                    })
+                    .build(app)?;
+            }
 
             let handle = app.handle().clone();
             thread::spawn(move || poll_loop(handle));
@@ -2217,9 +2325,12 @@ fn main() {
             thread::spawn(move || finish_update(handle));
             let handle = app.handle().clone();
             thread::spawn(move || update_loop(handle));
-            // The windows start hidden (tauri.conf.json), but their WebView2 starts visible
-            for window in app.webview_windows().values() {
-                hide(window);
+            // The windows start hidden (tauri.conf.json), but their WebView2 starts visible. A test
+            // profile's windows stay shown, off screen, as test_window built them.
+            if test_profile().is_none() {
+                for window in app.webview_windows().values() {
+                    hide(window);
+                }
             }
             if !started_hidden {
                 show_main_window(app.handle());
@@ -2253,7 +2364,7 @@ fn main() {
             }
             _ => {}
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("Quack app failed to start")
         .run(|app, event| match event {
             RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),

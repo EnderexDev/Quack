@@ -6,6 +6,20 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.42] - 2026-11-19
+
+### Changed
+- The app has a new look, the one Quackify uses: dark glass panels with thin lines and soft corners replace the thick black outlines, hard shadows and dotted background. The brand colour (yellow, green in Quack Dev) is kept for the logo and the main action of each screen; toggles, tabs and pills are neutral. Every screen was redone (Output, Playtest, Merges, the conflict view, Analysis, Queue, Folder, Settings, the dialogs, the menu, the toasts and the tray panel), and no command or option was removed.
+- The window's contents grow with the window, so text stays readable on a large screen.
+- Settings is one page with an index of its sections on the left and a search box on top. Each option has a one-line description, with the longer text behind an "i" button, and the daemon's read-only settings show as words.
+- Queue lists the running test first, and Merges shows each merge as one line with the time, the file, how it merged and the result. In a conflict, each side has its own button under its code.
+- "Free the lock", "Unstick" and "Remove" take two clicks: the first turns the button red, the second runs it.
+- Toasts show their kind (done, info or error), and a dialog no longer fades in while the window is not focused.
+
+### Fixed
+- An approval request that arrived while the window was not focused could stay invisible: its fade-in never ran.
+- A conflict older than the merge history showed "Invalid Date", and a production error without a count showed "(undefined×)".
+
 ## [1.0.41] - 2026-11-18
 
 ### Fixed
@@ -420,7 +434,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.41...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.42...HEAD
+[1.0.42]: https://github.com/EnderexDev/Quack/compare/v1.0.41...v1.0.42
 [1.0.41]: https://github.com/EnderexDev/Quack/compare/v1.0.40...v1.0.41
 [1.0.40]: https://github.com/EnderexDev/Quack/compare/v1.0.39...v1.0.40
 [1.0.39]: https://github.com/EnderexDev/Quack/compare/v1.0.38...v1.0.39

@@ -1,0 +1,83 @@
+/* The window's shell: top bar and its tabs, the notices, the sidebar, and the game's page with its
+   header, numbers and the Output / Playtest log. Owner: the shared layer (approved in step 1).
+   Sizes in rem (px / 16), never px past a 2 px hairline: 1rem grows with the window (base.css).
+   Reuse controls.css (its list is at its top) before making a control here. */
+/* ---------- Shell: top bar, notices, sidebar ---------- */
+.app { --side-w: clamp(13.125rem, 19vw, 18.125rem); height: 100%; display: flex; flex-direction: column; gap: var(--gap); padding: 0 var(--gap) var(--gap); }
+.topbar { flex: none; height: 3.75rem; display: grid; grid-template-columns: var(--side-w) minmax(0, 1fr); align-items: center; gap: var(--gap); }
+/* #openCode starts here and moves into the game's header (main.js renderMain) */
+.topbar #openCode { display: none; }
+.topbar .brand { padding-left: 0.625rem; }
+/* The game's views: one glass pill, the open one lit (neutral: the brand stays for the action) */
+.tabs { justify-self: start; display: inline-flex; gap: 0.125rem; padding: 0.25rem; border-radius: var(--r-pill); background: var(--glass); border: 1px solid var(--line); max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+.navlink { position: relative; display: inline-flex; align-items: center; gap: 0.4375rem; height: 2.125rem; padding: 0 0.9375rem; border-radius: var(--r-pill);
+  font-size: 0.84375rem; font-weight: 600; color: var(--muted); white-space: nowrap; transition: background-color var(--t-fast), color var(--t-fast); }
+.navlink:hover { color: var(--text); }
+.navlink.on { background: var(--surface-3); color: var(--text); }
+.navlink:disabled { opacity: .4; pointer-events: none; }
+/* A count that needs the user (conflicts, findings): the warning colour, dark figures */
+.navlink .n { display: inline-grid; place-items: center; min-width: 1.1875rem; height: 1.1875rem; padding: 0 0.375rem; border-radius: var(--r-pill); background: var(--warn); color: #1f1600; font-size: 0.6875rem; font-weight: 750; }
+
+/* An app update, a hub update, the rule for AI: one line each, the button at the end */
+.card.update { flex: none; display: flex; align-items: center; gap: 0.875rem; padding: 0.625rem 0.625rem 0.625rem 1rem; border-radius: var(--r-lg); background: var(--glass); border: 1px solid var(--line); }
+.update .pill { flex: none; color: var(--text); background: var(--surface-2); border-color: var(--line); }
+.update .grow { color: var(--text-soft); font-size: 0.8125rem; line-height: 1.45; }
+.update .btn { flex: none; }
+/* A notice's own action (here and the banners over a game) is light, not brand: the brand stays
+   on the game's main action */
+.update .btn.yellow, .update .btn.yellow:hover, .top > .card .btn.yellow, .top > .card .btn.yellow:hover { background: var(--text); color: #111114; }
+.update .btn.yellow:hover, .top > .card .btn.yellow:hover { filter: brightness(0.92); }
+.top > .card .pill { color: var(--text); background: var(--surface-2); border-color: var(--line); }
+
+.body { flex: 1; min-height: 0; display: grid; grid-template-columns: var(--side-w) minmax(0, 1fr); gap: var(--gap); }
+.side { display: flex; flex-direction: column; gap: 0.125rem; min-height: 0; overflow-y: auto; padding: 0.625rem; border-radius: var(--r-lg); background: var(--glass); border: 1px solid var(--line); }
+.side .label { padding: 0.75rem 0.625rem 0.375rem; }
+.side .label:first-child { padding-top: 0.375rem; }
+.side .game { background: transparent; color: var(--muted); min-height: 2.625rem; padding: 0 0.75rem; }
+.side .game b { font-weight: 600; }
+.side .game:hover { background: var(--surface-2); color: var(--text); }
+.side .game.sel { background: var(--surface-3); color: var(--text); }
+.side > .grow { min-height: 0.75rem; }
+.side-add { flex: none; display: flex; align-items: center; justify-content: center; min-height: 2.5rem; margin-bottom: 0.25rem; border-radius: var(--r-md); border: 1.5px dashed var(--line-strong);
+  color: var(--muted); font-size: 0.8125rem; font-weight: 600; transition: border-color var(--t-fast), color var(--t-fast); }
+.side-add:hover { color: var(--text); border-color: var(--muted); }
+/* ---------- The game's page: header, numbers, Output and Playtest ---------- */
+.main { min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 1.125rem; padding: 1.375rem 1.5rem 1.25rem; border-radius: var(--r-lg); background: var(--glass); border: 1px solid var(--line); }
+.top { display: flex; flex-direction: column; gap: 1.125rem; flex: none; }
+.content { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.head { display: flex; flex-direction: column; gap: 0.75rem; min-width: 0; }
+.head-row { display: flex; align-items: center; gap: 1rem; min-width: 0; }
+.head h1 { flex: 1; min-width: 0; margin: 0; font-size: clamp(1.5rem, 0.8vw + 1rem, 2rem); line-height: 1.15; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.head-row #openCode { flex: none; display: inline-flex; }
+.meta { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+
+.stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--gap); }
+.top .stats { max-width: 47.5rem; }
+.stat { position: relative; display: flex; flex-direction: column; gap: 0.25rem; padding: 0.75rem 1rem 0.8125rem; border-radius: var(--r-md); background: var(--surface-1); border: 1px solid var(--line); text-align: left; min-width: 0; }
+.stat .label { order: -1; text-transform: none; letter-spacing: 0; font-size: 0.78125rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stat .v { font-family: var(--display); font-size: 1.5rem; line-height: 1.1; font-weight: 700; letter-spacing: -0.01em; color: var(--text); font-variant-numeric: tabular-nums; }
+.stat.link { cursor: pointer; transition: background-color var(--t-fast), border-color var(--t-fast); }
+.stat.link:hover { background: var(--surface-2); border-color: var(--line-strong); }
+.stat.warn .v { color: var(--warn); }
+.stat.bad .v { color: var(--bad-soft); }
+/* A short window (the minimum is 560 px) keeps the log readable: the numbers go to one line */
+@media (max-height: 660px) {
+  .main { gap: 0.875rem; padding-top: 1.125rem; }
+  .top { gap: 0.875rem; }
+  .top .stat { flex-direction: row; align-items: baseline; justify-content: space-between; gap: 0.625rem; padding: 0.5625rem 0.875rem; }
+  .top .stat .v { font-size: 1.125rem; }
+}
+
+.log { flex: 1; overflow: auto; padding: 0.125rem 1rem 0.875rem; font-size: 0.75rem; line-height: 1.75; user-select: text; }
+.log .ln { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-soft); }
+.log .t { color: var(--faint); } .log .msg { color: var(--text-soft); }
+.log .ok { color: var(--live); } .log .chg { color: var(--warn); } .log .del { color: var(--bad); }
+.log .info { color: var(--sky); } .log .warn, .log .ln.warn .msg { color: var(--warn); } .log .err, .log .ln.err .msg { color: var(--bad-soft); }
+/* A script updated (~) or deleted (−) is logged yellow or red like a warning or an error; it is
+   routine, so only its mark is coloured */
+.log .ln.warn:has(> .chg) .msg, .log .ln.err:has(> .del) .msg { color: var(--text-soft); }
+.log .sep { color: var(--faint); }
+.log .src { color: var(--faint); }
+.offline { margin: auto; text-align: center; display: flex; flex-direction: column; gap: 0.875rem; align-items: center; max-width: 27.5rem; color: var(--muted); }
+.offline h2 { margin: 0; font-size: 1.5rem; }
+.top > .card { display: flex; align-items: center; gap: 0.875rem; padding: 0.625rem 0.625rem 0.625rem 1rem; }

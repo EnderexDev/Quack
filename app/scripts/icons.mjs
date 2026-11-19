@@ -24,7 +24,7 @@ const smallSvg = fs.readFileSync(path.join(assets, "icon-small.svg"), "utf8");
 
 /**
  * The SVGs are drawn in the official logo's gold; Dev swaps every gold tone for a green one (the
- * light, mid and dark stops follow the --brand-* greens in app/ui/style.css and Theme.luau)
+ * light, mid and dark stops follow the --brand-* greens in app/ui/base.css and Theme.luau)
  */
 const DEV_GREEN = {
   "#ffe680": "#a8f29c", // tile top
@@ -39,7 +39,7 @@ const DEV_GREEN = {
 };
 // The wordmark beside the mark (Figma lockup "quack-lockup-ouro") is drawn by the app and the
 // plugin, not here: gold #fff6c8 / #ffcc1f / #b87400, Dev #f0ffe8 / #5ee36a / #1f8a3a, in
-// app/ui/style.css (--word-*), Theme.luau (Word) and build-rbxmx.mjs
+// app/ui/base.css (--word-*), Theme.luau (Word) and build-rbxmx.mjs
 const recolor = (svg, swap) => Object.entries(swap).reduce((out, [from, to]) => out.split(from).join(to), svg);
 
 const flavors = [

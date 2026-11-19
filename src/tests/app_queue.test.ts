@@ -46,6 +46,7 @@ type View = {
   recentOf(q: unknown): { verdict: string; name: string }[];
   todayOf(d: unknown): { notRun: number | null; failures: [string, number][] };
   knownFields(fields: [string, string][], settings: unknown): [string, string][];
+  runningFirst(jobs: unknown, runningId: unknown): { id: string }[];
 };
 const loadView = async (): Promise<View> => import(pathToFileURL(path.join(ui, "queueview.js")).href);
 
@@ -129,4 +130,19 @@ test("app: Unstick says it works while the play stops, and its success toast is 
   assert.match(read("common.js"), /export function toast\(text, bad = false, ms = /, "toast takes a duration");
   const i18n = read("i18n.js");
   assert.equal((i18n.match(/queueUnsticking:/g) ?? []).length, 2, "en and pt");
+});
+
+// 18/11/26, the Quackify restyle: the Tests card numbers the queued jobs by their place in line,
+// so the running one goes first wherever the hub lists it, and the hub's own list is not touched
+test("app queue: the running test comes first, the queued ones keep their order, the list is a copy", async () => {
+  const v = await loadView();
+  const jobs = [{ id: "a" }, { id: "b" }, { id: "c" }];
+  assert.deepEqual(v.runningFirst(jobs, "c").map((j) => j.id), ["c", "a", "b"]);
+  assert.deepEqual(v.runningFirst(jobs, "a").map((j) => j.id), ["a", "b", "c"]);
+  assert.deepEqual(v.runningFirst(jobs, undefined).map((j) => j.id), ["a", "b", "c"], "nothing running");
+  assert.deepEqual(v.runningFirst(jobs, "gone").map((j) => j.id), ["a", "b", "c"], "a running id no longer listed");
+  assert.deepEqual(v.runningFirst(undefined, "a"), []);
+  assert.deepEqual(jobs.map((j) => j.id), ["a", "b", "c"], "the hub's list is left as it came");
+  const main = read("main.js");
+  assert.match(main, /for \(const j of runningFirst\(q\.jobs, q\.running\?\.id\)\)/, "the Tests card uses it");
 });

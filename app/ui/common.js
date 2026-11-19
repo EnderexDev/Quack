@@ -35,7 +35,7 @@ export const api = {
 };
 export { invoke, listen };
 
-// Dev wears green instead of yellow (html.dev in style.css). Both windows start hidden, so the
+// Dev wears green instead of yellow (html.dev in base.css). Both windows start hidden, so the
 // class is on before anything shows.
 const appInfo = await invoke("app_info").catch(() => ({}));
 document.documentElement.classList.toggle("dev", appInfo.flavor === "dev");
@@ -57,11 +57,32 @@ export function h(tag, props = {}, ...children) {
   return node;
 }
 
+/**
+ * A short entrance (0.96 to 1, faded in) for a dialog, a menu or a toast. A Web Animation, not a
+ * CSS one: body.idle pauses CSS animations on their first frame, which once left the approval
+ * popup invisible in a window without focus. With no focus there is no entrance at all, and one
+ * started runs to its end on time, whatever the focus does meanwhile.
+ */
+export function popIn(node, from = "scale(0.96)") {
+  if (document.body.classList.contains("idle") || typeof node.animate !== "function") return;
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  node.animate([{ opacity: 0, transform: from }, { opacity: 1, transform: "none" }], { duration: 180, easing: "cubic-bezier(0.22, 1, 0.36, 1)" });
+}
+
+const TOAST_KINDS = { success: "✓", info: "i", error: "!" };
 let toastTimer;
-export function toast(text, bad = false, ms = bad ? 5000 : 2200) {
+/**
+ * A short line at the bottom. `bad` is its kind: true or "error", "info", or false / "success"
+ * (the default). Errors stay longer.
+ */
+export function toast(text, bad = false, ms = bad === true || bad === "error" ? 5000 : 2200) {
+  const type = bad === true ? "error" : TOAST_KINDS[bad] ? bad : "success";
   document.querySelector(".toast")?.remove();
-  const node = h("div", { class: `toast chunk${bad ? " bad" : ""}` }, text);
+  const node = h("div", { class: `toast ${type}${type === "error" ? " bad" : ""}`, role: type === "error" ? "alert" : "status" },
+    h("span", { class: "toast-icon", "aria-hidden": "true" }, TOAST_KINDS[type]),
+    h("span", { class: "toast-text" }, text));
   document.body.append(node);
+  popIn(node, "translateY(0.5rem) scale(0.96)");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => node.remove(), ms);
 }

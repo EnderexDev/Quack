@@ -20,6 +20,16 @@ export function jobWait(j) {
   return null;
 }
 
+/**
+ * The Tests card's order: the running job first, the queued ones after it in the hub's order (a
+ * place in line is counted from there). A copy: the hub's list is left as it came.
+ */
+export function runningFirst(jobs, runningId) {
+  const list = Array.isArray(jobs) ? jobs : [];
+  const at = runningId == null ? -1 : list.findIndex((j) => j?.id === runningId);
+  return at < 0 ? [...list] : [list[at], ...list.slice(0, at), ...list.slice(at + 1)];
+}
+
 /** The day's answered jobs, newest first; [] from a hub that does not send them */
 export function recentOf(q) {
   return Array.isArray(q?.recent) ? q.recent.filter((r) => r && (r.verdict === "pass" || r.verdict === "fail" || r.verdict === "infra")) : [];

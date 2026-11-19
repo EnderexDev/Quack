@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { APP_HEADER, APPROVAL_TOKEN_HEADER } from "../cloud/approve.js";
+import { appCss } from "./app_css.js";
 
 // 10/11/26: a write to the live game is answered in the app's own popup (Ender: the PowerShell
 // window "looked like a virus"). These read the app's real code: the Rust side holds the token,
@@ -121,7 +122,7 @@ test("app approval: the popup shows the title and the whole text read only, Refu
   assert.match(bar, /ui\.hub\.approvalsAnswerable === false/);
   assert.match(bar, /t\("approvalNeedsRestart"\)/);
   assert.match(bar, /invoke\("restart_hub"\)/);
-  assert.match(read("ui/style.css"), /#approval \{ z-index: 30; \}/);
+  assert.match(appCss(), /#approval \{ z-index: 30; \}/);
 
   const used = new Set([...ui.matchAll(/t\("(approval\w*)"/g)].map((m) => m[1]));
   assert.ok(used.size >= 8, `${used.size} approval strings`);
@@ -132,4 +133,67 @@ test("app approval: the popup shows the title and the whole text read only, Refu
   const i18n = read("ui/i18n.js");
   assert.match(i18n, /approvalRefuse: "Recusar"/);
   assert.match(i18n, /approvalAccept: "Aceitar"/);
+});
+
+// 18/11/26, the Quackify restyle of the dialogs: an entrance must never hide a dialog. body.idle
+// pauses every CSS animation on its first frame, and the approval usually opens in a window
+// without focus (minimized on the taskbar), so a CSS fade would leave it invisible there
+test("app dialogs: the entrance is a Web Animation skipped without focus, never a CSS one, for every dialog, the menu and the toast", () => {
+  const strip = (css: string) => css.replace(/\/\*[\s\S]*?\*\//g, "");
+  for (const sheet of ["ui/dialogs.css", "ui/tray.css"]) assert.doesNotMatch(strip(read(sheet)), /animation|@keyframes/, sheet);
+  const common = read("ui/common.js");
+  const pop = between(common, "export function popIn(", "\n}");
+  assert.match(pop, /if \(document\.body\.classList\.contains\("idle"\)[^)]*\) return;/, "no entrance without the focus");
+  assert.match(pop, /node\.animate\(/);
+  assert.match(between(common, "export function toast(", "\n}"), /popIn\(node/);
+  const ui = read("ui/main.js");
+  for (const [from, to] of [["function renderApproval(", "\nui.app = await"], ["function renderChoice(", "\n// ----------"], ["async function renderSetup(", "\n/** One dialog"], ["function aiConnectDialog(", "\n/**"]]) {
+    assert.match(between(ui, from, to), /document\.body\.append\(dialog\);\n\s+popIn\(dialog\.firstChild\);/, from);
+  }
+  assert.match(between(ui, "function popMenu(", "\nfunction "), /placeMenu\(menu, anchor\);\n\s+popIn\(menu\);/);
+});
+
+test("app dialogs: one brand-coloured element per dialog (its main answer), none in the menu, the tray's states or the AI picks", () => {
+  const ui = read("ui/main.js");
+  const brandIn = (body: string) => [...body.matchAll(/btn yellow|option\("keep"|pill brand/g)].length;
+  assert.equal(brandIn(between(ui, "function renderApproval(", "\nui.app = await")), 1, "Refuse");
+  assert.match(between(ui, "function renderApproval(", "\nui.app = await"), /const refuse = h\("button", \{ class: "btn yellow/);
+  assert.equal(brandIn(between(ui, "function renderChoice(", "\n// ----------")), 1, "Keep the current one");
+  assert.equal(brandIn(between(ui, "async function renderSetup(", "\n/** One dialog")), 1, "Set up and connect");
+  assert.equal(brandIn(between(ui, "function aiConnectDialog(", "\n/**")), 1, "Connect");
+  // In the stylesheets the brand is the keep option's fill and nothing else
+  const css = read("ui/dialogs.css").replace(/\/\*[\s\S]*?\*\//g, "");
+  const branded = [...css.matchAll(/([^{}]+)\{([^}]*)\}/g)].filter((m) => /--brand-/.test(m[2])).map((m) => m[1].trim());
+  assert.deepEqual(branded.filter((s) => !s.startsWith(".option.keep")), []);
+  assert.doesNotMatch(read("ui/tray.css"), /--brand-/);
+  const trayHtml = read("ui/tray.html");
+  assert.equal([...trayHtml.matchAll(/btn yellow/g)].length, 1, "Open window");
+  // Every rule of the tray's sheet is under the panel: both windows load it, the sidebar must not change
+  const tray = read("ui/tray.css").replace(/\/\*[\s\S]*?\*\//g, "");
+  for (const m of tray.matchAll(/([^{}]+)\{[^}]*\}/g)) for (const s of m[1].split(",")) assert.match(s.trim(), /^(\.tray\b|body\.traybody\b)/, s.trim());
+});
+
+test("app menu: placed from rem and its own size, above the anchor when there is no room below, never outside the window", () => {
+  const ui = read("ui/main.js");
+  const place = between(ui, "function placeMenu(", "\n}");
+  assert.match(place, /getComputedStyle\(document\.documentElement\)\.fontSize/);
+  assert.match(place, /menu\.getBoundingClientRect\(\)/);
+  assert.match(place, /classList\.toggle\("up", up\)/);
+  assert.match(place, /innerWidth - gap - box\.width/);
+  assert.match(place, /innerHeight - gap - box\.height/);
+  assert.doesNotMatch(between(ui, "function popMenu(", "\nfunction "), /\d+\}px|\+ \d+\}/, "no fixed px offsets");
+});
+
+// 18/11/26, the merge of the Quackify restyle: toast() with no kind shows a success tick, so a
+// line that only informs passes "info" (being up to date is not an action that succeeded)
+test("app toasts: a line that only informs is an info toast, an error is an error", () => {
+  const ui = read("ui/main.js");
+  assert.match(ui, /toast\(t\("upToDate", \{ version: ui\.app\.version \}\), "info"\)/);
+  assert.match(ui, /toast\(t\("mcpRestart"\), "info"\)/);
+  assert.match(ui, /const fail = \(error\) => toast\(t\("error", \{ e: error \}\), true\);/);
+  // Every other call is a success (no kind), info or an error: no unknown kind falls back silently
+  for (const m of ui.matchAll(/\btoast\(t\("(\w+)"[^;\n]*/g)) {
+    const kind = /\),\s*(true|false|"[a-z]+")(?:,\s*\d+)?\)/.exec(m[0])?.[1];
+    assert.ok(kind === undefined || ["true", "false", '"info"', '"success"', '"error"'].includes(kind), m[0]);
+  }
 });

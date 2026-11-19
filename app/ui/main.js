@@ -1,10 +1,10 @@
 // The main window: games on the left, the chosen game's output, playtest, merges and folder
 // on the right, plus the conflict view and settings.
-import { api, h, invoke, listen, nameOf, shortPath, start, toast } from "./common.js";
+import { api, h, invoke, listen, nameOf, popIn, shortPath, start, toast } from "./common.js";
 import { applyStatic, duration, getLanguage, t, tn } from "./i18n.js";
 import { every } from "./idle.js";
 import { modelChoice, modelLabel, modelPill } from "./aiview.js";
-import { jobWait, knownFields, recentOf, stuckOf, todayOf } from "./queueview.js";
+import { jobWait, knownFields, recentOf, runningFirst, stuckOf, todayOf } from "./queueview.js";
 
 const LOG_LINES_KEPT = 3000;
 const LOG_POLL_MS = 1000;
@@ -152,20 +152,21 @@ function renderSide() {
   const connected = s.places.filter((p) => sessions.get(p.placeId)?.studioConnected);
   const others = s.places.filter((p) => !sessions.get(p.placeId)?.studioConnected);
   const item = (place, dot) => h("button", {
-    class: `game chunk press${place.placeId === ui.placeId && ui.view !== "settings" ? " sel" : ""}`,
+    class: `game${place.placeId === ui.placeId && ui.view !== "settings" ? " sel" : ""}`,
     onclick: () => select(place.placeId, ui.view === "settings" || ui.view === "conflict" ? "output" : ui.view),
   }, h("span", { class: `dot ${place.conflicts ? "warn" : dot}` }), h("b", { class: "grow" }, nameOf(place)));
   if (connected.length) side.append(h("span", { class: "label" }, t("connected")), ...connected.map((p) => item(p, "live")));
   if (others.length) side.append(h("span", { class: "label" }, t("offlineGames")), ...others.map((p) => item(p, "")));
   if (s.refused.length) {
     side.append(h("span", { class: "label" }, t("refused")), ...s.refused.map((r) => h("button", {
-      class: "game chunk press", onclick: () => openRegister(r),
+      class: "game", onclick: () => openRegister(r),
     }, h("span", { class: "dot bad" }), h("b", { class: "grow" }, nameOf(r)))));
   }
+  // Below the games: add one, and Settings, lit like a picked game while it is open
   side.append(
     h("span", { class: "grow" }),
-    h("button", { class: "btn dark chunk press", onclick: () => openRegister(null) }, t("addFolder")),
-    h("button", { class: `btn ${ui.view === "settings" ? "yellow chunk-bright" : "dark chunk"} press`, onclick: () => show("settings") }, t("settings")),
+    h("button", { class: "side-add", onclick: () => openRegister(null) }, t("addFolder")),
+    h("button", { class: `game${ui.view === "settings" ? " sel" : ""}`, onclick: () => show("settings") }, h("span", { class: "ico sliders" }), h("b", { class: "grow" }, t("settings"))),
   );
 }
 
@@ -186,7 +187,7 @@ function renderNav() {
   const key = place && ui.view !== "settings" && ui.editors.length ? `${place.folder}\n${ui.editors.map((e) => e.id)}\n${getLanguage()}` : "";
   if (key !== openCodeKey) {
     openCodeKey = key;
-    openCode.replaceChildren(key ? editorButtons(place.folder, "yellow chunk-bright") : "");
+    openCode.replaceChildren(key ? editorButtons(place.folder, "yellow") : "");
   }
 }
 
@@ -236,7 +237,8 @@ function editorMenu(anchor, path) {
 /**
  * A small menu under `anchor`, right-aligned to it: a title and one button per item. A second
  * click on the same anchor (same key) closes it; so do a click outside and Escape. Whatever
- * closes it also drops its window listeners (closeMenu), not only its element.
+ * closes it also drops its window listeners (closeMenu), not only its element. With no room
+ * below it opens above the anchor, and it never leaves the window (placeMenu).
  */
 let closeMenu = null;
 function popMenu(anchor, key, title, items) {
@@ -263,14 +265,32 @@ function popMenu(anchor, key, title, items) {
   const menu = h("div", { class: "menu chunk", role: "menu", dataset: { key } },
     h("span", { class: "label" }, title),
     items.map((item) => h("button", { role: "menuitem", class: item.on ? "on" : "", onclick: () => { close(); item.pick(); } }, item.label)));
-  const at = anchor.getBoundingClientRect();
-  menu.style.top = `${at.bottom + 12}px`;
-  menu.style.right = `${Math.max(8, innerWidth - at.right)}px`;
   document.body.append(menu);
+  placeMenu(menu, anchor);
+  popIn(menu);
   addEventListener("pointerdown", outside, true);
   addEventListener("keydown", escape, true);
   // The saved pick takes the focus, so focus and pick never show as two marked items
   (menu.querySelector("button.on") ?? menu.querySelector("button"))?.focus();
+}
+
+/**
+ * Puts an appended menu half a rem from its anchor, right edges lined up: below it, or above it
+ * when it does not fit below and does above; then pushed inside the window, half a rem from
+ * every edge. Measured in rem, so the gap grows with the window as the rest does.
+ */
+function placeMenu(menu, anchor) {
+  const rem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+  const gap = 0.5 * rem;
+  const at = anchor.getBoundingClientRect();
+  const box = menu.getBoundingClientRect();
+  const fitsBelow = at.bottom + gap + box.height <= innerHeight - gap;
+  const up = !fitsBelow && at.top - gap - box.height >= gap;
+  const top = up ? at.top - gap - box.height : Math.min(at.bottom + gap, innerHeight - gap - box.height);
+  const left = Math.min(Math.max(gap, at.right - box.width), innerWidth - gap - box.width);
+  menu.style.top = `${Math.max(gap, top)}px`;
+  menu.style.left = `${Math.max(gap, left)}px`;
+  menu.classList.toggle("up", up);
 }
 
 function header(place) {
@@ -278,9 +298,12 @@ function header(place) {
   const status = session?.studioConnected
     ? h("span", { class: "pill live" }, h("span", { class: "dot live" }), t("studioFor", { d: duration(Date.now() - session.studioSince) }))
     : h("span", { class: "pill" }, h("span", { class: "dot" }), session ? t("studioClosed") : t("daemonOff"));
-  return h("div", {},
-    h("div", { class: "title" }, h("div", { class: "grow" }, h("h1", { class: "display" }, nameOf(place)), h("div", { class: "bar" })), status),
-    h("div", { class: "meta", style: "margin-top:10px" },
+  // The name with the game's main action beside it (#openCode, moved in by renderMain), then
+  // Studio's state first among the facts
+  return h("div", { class: "head" },
+    h("div", { class: "head-row" }, h("h1", { class: "display", title: nameOf(place) }, nameOf(place))),
+    h("div", { class: "meta" },
+      status,
       h("span", { class: "pill mono" }, `place ${place.placeId}`),
       session && h("span", { class: "pill mono" }, `pid ${session.daemonPid} · :${session.daemonPort}`),
       h("span", { class: "pill mono", title: place.folder }, shortPath(place.folder))));
@@ -288,8 +311,8 @@ function header(place) {
 
 function stats(place) {
   const session = sessionOf(place.placeId);
-  const stat = (value, label, extra = "", onclick) => h("div", { class: `stat chunk press ${extra}`, onclick },
-    h("span", { class: "br tl" }), h("span", { class: "br brr" }), h("span", { class: "v" }, value), h("span", { class: "label" }, label));
+  const stat = (value, label, extra = "", onclick) => h("div", { class: `stat${onclick ? " link" : ""} ${extra}`, onclick },
+    h("span", { class: "v" }, value), h("span", { class: "label" }, label));
   return h("div", { class: "stats" },
     stat(compact(session?.instances), t("instances")),
     stat(String(place.today), t("mergesToday"), "", () => show("merges")),
@@ -435,8 +458,8 @@ function renderMain() {
   let top = document.getElementById("top");
   if (!top || contentKey === "offline" || contentKey.startsWith("none")) {
     contentKey = "";
-    top = h("div", { id: "top", style: "display:flex;flex-direction:column;gap:14px" });
-    main.replaceChildren(top, h("div", { id: "content", style: "flex:1;min-height:0;display:flex;flex-direction:column" }));
+    top = h("div", { id: "top", class: "top" });
+    main.replaceChildren(top, h("div", { id: "content", class: "content" }));
   }
   const session = sessionOf(place.placeId);
   const key = JSON.stringify([place, session && { ...session, studioSince: undefined }, state().paused, state().ai?.state, ui.view, getLanguage(),
@@ -453,6 +476,8 @@ function renderMain() {
       h("button", { class: "btn yellow chunk-bright press", onclick: () => show("settings") }, t("aiBannerAction")))
     : null;
   top.replaceChildren(...[banner, aiBanner, header(place), ui.view !== "conflict" ? stats(place) : null].filter(Boolean));
+  // "Open in …" sits beside the game's name: it opens this game's folder
+  top.querySelector(".head-row").append(openCode);
   renderContent();
 }
 
@@ -479,8 +504,8 @@ function renderContent() {
 function renderLog(target) {
   const playtest = ui.view === "playtest";
   const box = h("div", { class: "log mono", id: "log" });
-  target.replaceChildren(h("div", { class: "panel chunk" },
-    h("div", { class: "panel-top" }, h("span", { class: "label" }, playtest ? t("playtest") : t("daemon")), h("span", { class: "grow" }), h("span", { class: "pill brand" }, t("live"))),
+  target.replaceChildren(h("div", { class: "panel" },
+    h("div", { class: "panel-top" }, h("span", { class: "label" }, playtest ? t("playtest") : t("daemon")), h("span", { class: "grow" }), h("span", { class: "pill live" }, t("live"))),
     box));
   const lines = (logs.get(ui.placeId)?.lines ?? []).filter((l) => l.play === playtest);
   box.append(...(lines.length ? lines.map(lineNode) : [h("div", { class: "empty" }, t(playtest ? "noPlaytest" : "noLog"))]));
@@ -494,9 +519,28 @@ const hhmm = (iso) => {
   return d.toDateString() === new Date().toDateString() ? time : `${d.toLocaleDateString(getLanguage() === "pt" ? "pt-BR" : "en-GB", { day: "2-digit", month: "2-digit" })} ${time}`;
 };
 
+/** A script's path as its folder and its file name, for a name read at a glance over a quiet folder */
+const splitPath = (file = "") => {
+  const at = file.lastIndexOf("/");
+  return at < 0 ? ["", file] : [file.slice(0, at), file.slice(at + 1)];
+};
+
+/** A merge's time in a row: seconds under one, ms below that */
+const mergeMs = (ms) => (ms === undefined ? "" : ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`);
+
+/**
+ * An empty state: its first sentence as the heading, the rest under it. The strings were written
+ * as one paragraph ("No merges yet. When ..."); split here, so the text stays exactly as it was
+ */
+function emptyState(text) {
+  const at = text.indexOf(". ");
+  return at < 0 ? h("div", { class: "empty" }, text)
+    : h("div", { class: "empty" }, h("strong", {}, text.slice(0, at + 1)), text.slice(at + 2));
+}
+
 async function renderMerges(target) {
-  const list = h("div", { class: "list" });
-  target.replaceChildren(h("div", { class: "panel chunk" }, h("div", { class: "panel-top" }, h("span", { class: "label" }, t("merges"))), list));
+  const list = h("div", { class: "list mlist" });
+  target.replaceChildren(h("div", { class: "panel" }, h("div", { class: "panel-top" }, h("span", { class: "label" }, t("merges"))), list));
   const placeId = ui.placeId;
   const mine = generation;
   let pending = false;
@@ -517,17 +561,23 @@ async function renderMerges(target) {
     // Unresolved conflicts older than the listed history still need a row to be opened from
     const listed = new Set(merges.entries.map((e) => e.agentVersion).filter(Boolean));
     const rows = [...merges.conflicts.filter((c) => !listed.has(c.agentVersion)), ...merges.entries];
-    if (!rows.length) return list.replaceChildren(h("div", { class: "empty" }, t("noMerges")));
+    if (!rows.length) return list.replaceChildren(emptyState(t("noMerges")));
     list.replaceChildren(...rows.map((entry) => {
+      // A conflict older than the history comes with its file and id only: no time, no method
       const method = entry.method === "ai" ? h("span", { class: "pill sky" }, t("methodAi"))
         : entry.method === "error" ? h("span", { class: "pill bad" }, t("methodError"))
-        : h("span", { class: "pill" }, t("methodText"));
+        : entry.method ? h("span", { class: "pill" }, t("methodText")) : h("span");
+      const waiting = entry.agentVersion && !entry.resolved;
       const action = entry.agentVersion
         ? entry.resolved
-          ? h("span", { class: "label" }, t("seen"))
-          : h("button", { class: "pill warn", onclick: () => show("conflict", entry.agentVersion) }, entry.conflictingHunks ? tn("hunks", entry.conflictingHunks) : t("open"))
-        : h("span", { class: "label" }, entry.ms !== undefined ? `${entry.ms} ms` : "");
-      return h("div", { class: "mrow" }, h("span", { class: "mono muted" }, hhmm(entry.t)), h("span", { class: "file mono", title: entry.error ?? entry.file }, entry.file), method, action);
+          ? h("span", { class: "result" }, t("seen"))
+          : h("button", { class: "pill warn", onclick: () => show("conflict", entry.agentVersion) }, entry.conflictingHunks ? tn("hunks", entry.conflictingHunks) : t("open"), h("span", { class: "chev" }, "›"))
+        : h("span", { class: "result mono" }, mergeMs(entry.ms));
+      const [dir, name] = splitPath(entry.file);
+      return h("div", { class: `mrow${waiting ? " waiting" : ""}${entry.method === "error" ? " failed" : ""}` },
+        h("span", { class: "time mono" }, entry.t ? hhmm(entry.t) : ""),
+        h("span", { class: "file", title: entry.error ? `${entry.file}: ${entry.error}` : entry.file }, h("b", {}, name), h("span", { class: entry.error ? "dir why" : "dir mono" }, entry.error || dir)),
+        method, action);
     }));
   };
   await fill();
@@ -576,31 +626,58 @@ async function renderAnalysis(target) {
   const place = placeOf(ui.placeId);
   const placeId = place.placeId;
   const mine = generation;
-  const findings = h("div", { class: "list", style: "max-height:42vh" });
-  const findingsInfo = h("span", { class: "muted", style: "font-size:11.5px" });
-  const rerun = h("button", { class: "btn dark chunk press" }, t("analysisRerun"));
-  const errors = h("div", { class: "list", style: "max-height:30vh" });
-  const errorsInfo = h("span", { class: "muted", style: "font-size:11.5px" });
-  const dismiss = h("button", { class: "btn dark chunk press hidden" }, t("errorsDismiss"));
-  const check = h("button", { class: "btn dark chunk press" }, t("errorsCheck"));
-  const own = h("div", { class: "card chunk" }, h("span", { class: "label" }, t("autoPlace")));
-  target.replaceChildren(h("div", { class: "view" },
-    h("div", { class: "panel chunk", style: "flex:none" },
+  // No height cap on the lists: the view is the one scroll, never a scroll inside a scroll
+  const findings = h("div", { class: "list alist" });
+  const findingsInfo = h("span", { class: "ainfo" });
+  const rerun = h("button", { class: "btn sm press" }, t("analysisRerun"));
+  const errors = h("div", { class: "list alist" });
+  const errorsInfo = h("span", { class: "ainfo" });
+  const dismiss = h("button", { class: "btn sm ghost press hidden" }, t("errorsDismiss"));
+  const check = h("button", { class: "btn sm press" }, t("errorsCheck"));
+  const own = h("div", { class: "card" }, h("span", { class: "label" }, t("autoPlace")));
+  target.replaceChildren(h("div", { class: "view analysis" },
+    h("div", { class: "panel apanel" },
       h("div", { class: "panel-top" }, h("span", { class: "label" }, t("analysisFindings")), findingsInfo, h("span", { class: "grow" }), rerun),
       findings),
-    h("div", { class: "panel chunk", style: "flex:none" },
+    h("div", { class: "panel apanel" },
       h("div", { class: "panel-top" }, h("span", { class: "label" }, t("errorsTitle")), errorsInfo, h("span", { class: "grow" }), dismiss, check),
       errors),
     own));
-  // A finding's file in the editor the app found or the user picked (the row is the button)
+  // A finding's file in the editor the app found or the user picked (its name and its line are buttons)
   const open = (where) => {
     const file = `${place.folder}\\${where.replace(/:\d+$/, "").replace(/\//g, "\\")}`;
     return invoke("open_path", { path: file, editor: true }).catch(fail);
   };
-  const row = (where, rule, message, pill) => h("div", { class: "frow" },
-    h("button", { class: "file mono", title: where, onclick: () => open(where) }, where),
-    h("span", { class: `pill ${pill}` }, rule),
-    h("span", { class: "msg", title: message }, message));
+  /**
+   * One finding or error: its line (opens the file), the rule or side, the message. Without a
+   * line the cell holds `bare` (an error's hash when it names no script) or nothing
+   */
+  const row = (where, rule, message, pill, extra, bare = "") => {
+    const line = /:(\d+)$/.exec(where ?? "");
+    return h("div", { class: "frow" },
+      where && line
+        ? h("button", { class: "file mono", title: where, onclick: () => open(where) }, `:${line[1]}`)
+        : h("span", { class: "file mono", title: where ?? "" }, bare),
+      h("span", { class: `pill ${pill}`, title: rule }, rule),
+      h("span", { class: "msg", title: message }, message),
+      extra);
+  };
+  /** Rows grouped by file, in the order each file first shows up: the file's name, its folder and how many */
+  const grouped = (items) => {
+    const groups = new Map();
+    for (const item of items) {
+      const key = item.file ?? "";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(item);
+    }
+    return [...groups].map(([file, list]) => {
+      const [dir, name] = splitPath(file);
+      const head = file
+        ? h("button", { class: "fhead", title: file, onclick: () => open(file) }, h("b", {}, name), h("span", { class: "dir mono" }, dir), h("span", { class: "pill mono" }, list.length))
+        : null;
+      return h("div", { class: "fgroup" }, head, ...list.map((item) => item.row));
+    });
+  };
   let pending = false;
   let lastPanel = "";
   let lastErrors = "";
@@ -626,9 +703,11 @@ async function renderAnalysis(target) {
         : panel.state === "error" ? t("error", { e: panel.error })
         : panel.at === undefined ? t("analysisRunning")
         : t("analysisInfo", { n: panel.findings.length, scripts: panel.scripts ?? "?", s: ((panel.ms ?? 0) / 1000).toFixed(1), at: hhmm(new Date(panel.at).toISOString()) }) + (panel.state === "running" ? ` · ${t("analysisRunning")}` : "");
+      findingsInfo.className = `ainfo${panel.state === "error" ? " bad" : panel.state === "running" || panel.at === undefined ? " busy" : ""}`;
       findings.replaceChildren(...(panel.findings.length
-        ? panel.findings.map((f) => row(`${f.file}:${f.line}`, f.rule, f.message, "warn"))
-        : [h("div", { class: "empty" }, t(panel.state === "off" ? "analysisOffText" : panel.at === undefined ? "analysisRunning" : "analysisNone"))]));
+        ? grouped(panel.findings.map((f) => ({ file: f.file, row: row(`${f.file}:${f.line}`, f.rule, f.message, "warn") })))
+        // An analysis that failed says so in its info line: "nothing found" would contradict it
+        : panel.state === "error" ? [] : [emptyState(t(panel.state === "off" ? "analysisOffText" : panel.at === undefined ? "analysisRunning" : "analysisNone"))]));
     }
     const errorsKey = JSON.stringify(prod);
     if (errorsKey !== lastErrors) {
@@ -638,10 +717,18 @@ async function renderAnalysis(target) {
       errorsInfo.textContent = prod.state === "off" ? t("errorsOff")
         : prod.state === "problem" ? t("errorsProblemShort")
         : prod.checkedAt ? t("errorsChecked", { at: hhmm(new Date(prod.checkedAt).toISOString()) }) : t("errorsWaiting");
-      errors.replaceChildren(...(prod.state === "problem" ? [h("p", { class: "note bad", style: "padding:0 6px" }, prod.problem)] : []),
+      errorsInfo.className = `ainfo${prod.state === "problem" ? " bad" : ""}`;
+      // An error with no script line has no file to group under or open: its hash stands alone
+      errors.replaceChildren(...(prod.state === "problem" ? [h("p", { class: "note bad aproblem" }, prod.problem)] : []),
         ...(prod.fresh.length
-          ? prod.fresh.slice().reverse().map((e) => row(e.at ?? e.hash, e.source ?? "?", `${e.message ?? `hash ${e.hash}`} (${e.count}×)`, e.source === "Server" ? "bad" : "sky"))
-          : [h("div", { class: "empty" }, t(prod.state === "off" ? "errorsOffText" : "errorsNone"))]));
+          ? grouped(prod.fresh.slice().reverse().map((e) => ({
+            file: e.at ? e.at.replace(/:\d+$/, "") : undefined,
+            // An empty or missing field falls back like a missing one: no "undefined×", no "#undefi"
+            row: row(e.at || e.hash, e.source || "?", e.message || (e.hash ? `hash ${e.hash}` : "?"), e.source === "Server" ? "bad" : "sky",
+              Number.isFinite(e.count) ? h("span", { class: "pill mono", title: `${e.count}×` }, `${e.count}×`) : null, e.at || !e.hash ? "" : `#${String(e.hash).slice(0, 6)}`),
+          })))
+          // A key that cannot read the errors says so above: "no new error" would contradict it
+          : prod.state === "problem" ? [] : [emptyState(t(prod.state === "off" ? "errorsOffText" : "errorsNone"))]));
     }
   };
   rerun.addEventListener("click", () => api.post("/api/analysis/run", { placeId }).then(fill).catch(fail));
@@ -672,13 +759,29 @@ const QUEUE_POLL_MS = 1500;
 const span = (ms) => (ms == null ? "–" : ms < 60_000 ? `${Math.max(0, Math.round(ms / 1000))} s` : duration(ms));
 const who = (client) => client?.name || client?.id || "?";
 
+/** A square slot (.slot, controls.css) in a state's colour, "lg" for a block's big one: a glyph (.ico.i-<glyph>) or a short text, a place in line */
+const qslot = (kind, glyph, text) => h("span", { class: `slot${kind ? ` ${kind}` : ""}` }, glyph ? h("span", { class: `ico i-${glyph}` }) : text);
+
+/** One line of the Queue: its slot, the name with a hint under it, its pills, and a time at the end */
+function qrow({ slot, name, hint, mono = true, hintTitle, bad = false, title, tags = [], time, timeTitle }) {
+  const pills = tags.filter(Boolean);
+  return h("div", { class: "qrow", title },
+    slot,
+    h("div", { class: `qmain${bad ? " bad" : ""}` }, h("b", {}, name), hint ? h("span", { class: `hint${mono ? " mono" : ""}`, title: hintTitle ?? hint }, hint) : null),
+    pills.length ? h("div", { class: "qtags" }, ...pills) : null,
+    time === undefined ? null : h("span", { class: "qtime mono", title: timeTitle }, time));
+}
+
+/** A card's heading: the label, and what sits at its right end */
+const qhead = (label, ...end) => h("div", { class: "qhead" }, h("span", { class: "label" }, label), h("span", { class: "grow" }), ...end);
+
 /**
  * The place's Studio queue: who holds Studio and for how long, who waits (level and wait), the
- * tests queued and running, the play, and the day's speed. The one button frees the lock,
- * whoever holds it (armed by a first click, as Remove is).
+ * tests queued and running, the play, and the day's speed. Free the lock frees it, whoever holds
+ * it (armed by a first click, as Remove is); it is a danger action, never the screen's main one.
  */
 async function renderQueue(target) {
-  const body = h("div", { class: "view" });
+  const body = h("div", { class: "view queue" });
   target.replaceChildren(body);
   const placeId = ui.placeId;
   const mine = generation;
@@ -694,18 +797,19 @@ async function renderQueue(target) {
     try {
       q = await api.get(`/api/queue?placeId=${placeId}`);
     } catch (error) {
-      if (mine === generation) body.replaceChildren(h("div", { class: "empty" }, t("error", { e: error })));
+      if (mine === generation) body.replaceChildren(h("div", { class: "empty qfail" }, qslot("bad lg", "alert"), h("span", {}, t("error", { e: error }))));
       return;
     } finally {
       pending = false;
     }
     if (mine !== generation) return;
 
-    const release = h("button", { class: "btn dark chunk press danger" }, armed ? t("queueReleaseSure") : t("queueRelease"));
+    const release = h("button", { class: `btn danger press${armed ? " armed" : ""}` }, armed ? t("queueReleaseSure") : t("queueRelease"));
     release.addEventListener("click", async () => {
       if (!armed) {
         armed = true;
         release.textContent = t("queueReleaseSure");
+        release.classList.add("armed");
         setTimeout(() => {
           armed = false;
         }, 3000);
@@ -725,12 +829,13 @@ async function renderQueue(target) {
     let stuckRow = null;
     if (stuck) {
       // The poll redraws the card while the POST is out: the flag keeps the new button disabled
-      const unstick = h("button", { class: "btn dark chunk press danger", disabled: unsticking }, unsticking ? t("queueUnsticking") : unstickArmed ? t("queueUnstickSure") : t("queueUnstick"));
+      const unstick = h("button", { class: `btn danger press${unstickArmed ? " armed" : ""}`, disabled: unsticking }, unsticking ? t("queueUnsticking") : unstickArmed ? t("queueUnstickSure") : t("queueUnstick"));
       unstick.addEventListener("click", async () => {
         if (unsticking) return;
         if (!unstickArmed) {
           unstickArmed = true;
           unstick.textContent = t("queueUnstickSure");
+          unstick.classList.add("armed");
           setTimeout(() => {
             unstickArmed = false;
           }, 3000);
@@ -751,82 +856,110 @@ async function renderQueue(target) {
         fill();
       });
       const foreign = stuck.kind === "foreign-play";
-      stuckRow = h("div", { class: "field" },
-        h("span", { class: "grow bad" }, stuck.kind === "foreign-play" ? t("queueForeignPlay", { d: span(stuck.forMs) }) : t("queueStuck", { d: span(stuck.forMs) }),
+      // The one red block of the tab: everything waits on it
+      stuckRow = h("div", { class: "qalert" },
+        qslot("bad", "alert"),
+        h("div", { class: "qmain bad" }, h("b", {}, stuck.kind === "foreign-play" ? t("queueForeignPlay", { d: span(stuck.forMs) }) : t("queueStuck", { d: span(stuck.forMs) })),
           h("span", { class: "hint", title: stuck.error }, foreign ? t("queueForeignPlayHint") : [t("queueStuckTries", { n: stuck.tries }), stuck.error].filter(Boolean).join(" · "))),
         unstick);
     }
+
+    // Studio: the lock first, in a big line (free is green), then what holds the queue back
     const holder = q.holder;
-    const studio = h("div", { class: "card chunk" },
-      h("span", { class: "label" }, t("queueStudio")),
-      h("div", { class: "field" },
-        h("span", { class: "grow" },
-          holder ? (holder.runner ? t("queueHeldByQueue", { d: span(holder.heldMs) }) : t("queueHeldBy", { who: who(holder.client), d: span(holder.heldMs) })) : t("queueFree"),
+    const studio = h("div", { class: "card qcard qstudio" },
+      qhead(t("queueStudio"), h("span", { class: "pill qphase" }, t("queuePhase"), h("b", { class: "mono" }, q.phase))),
+      h("div", { class: `qlock${holder ? "" : " free"}` },
+        qslot(holder ? "lg" : "live lg", holder ? "lock" : "unlock"),
+        h("div", { class: "qmain" },
+          h("b", {}, holder ? (holder.runner ? t("queueHeldByQueue", { d: span(holder.heldMs) }) : t("queueHeldBy", { who: who(holder.client), d: span(holder.heldMs) })) : t("queueFree")),
           holder && h("span", { class: "hint" }, [holder.requestedMin ? t("queueAsked", { n: holder.requestedMin }) : null, t("queueLastCall", { d: span(holder.idleMs), tool: holder.tool })].filter(Boolean).join(" · "))),
-        holder ? release : h("span", { class: "pill live" }, t("queueFree"))),
+        holder ? release : null),
       stuckRow,
       q.cap?.active ? h("p", { class: "note" }, t("queueCapped", { who: q.cap.clientId })) : null,
-      q.publish?.current ? h("div", { class: "field" },
-        h("span", { class: "grow" }, t("queuePublishing", { who: who(q.publish.current.client), d: span(q.publish.current.ms) }),
-          q.publish.current.head ? h("span", { class: "hint mono" }, q.publish.current.head.slice(0, 8)) : null),
-        q.publish.current.riders?.length ? h("span", { class: "pill sky" }, t("queueRiders", { n: q.publish.current.riders.length })) : null) : null,
+      q.publish?.current ? qrow({
+        slot: qslot("sky", "up"),
+        name: t("queuePublishing", { who: who(q.publish.current.client), d: span(q.publish.current.ms) }),
+        hint: q.publish.current.head ? q.publish.current.head.slice(0, 8) : null,
+        tags: [q.publish.current.riders?.length ? h("span", { class: "pill sky" }, t("queueRiders", { n: q.publish.current.riders.length })) : null],
+      }) : null,
       q.publish?.last ? h("p", { class: "note" }, [
         t("queueLastPublish", { what: q.publish.last.version !== undefined ? `v${q.publish.last.version}` : (q.publish.last.head ?? "").slice(0, 8), who: who(q.publish.last.client), d: span(Date.now() - q.publish.last.at) }),
-        q.publish.last.covered?.length ? t("queueLastCovered", { n: q.publish.last.covered.length }) : null].filter(Boolean).join(" · ")) : null,
-      h("div", { class: "field" }, h("span", { class: "grow" }, t("queuePhase")), h("span", { class: "mono muted" }, q.phase)));
+        q.publish.last.covered?.length ? t("queueLastCovered", { n: q.publish.last.covered.length }) : null].filter(Boolean).join(" · ")) : null);
 
-    const waiting = h("div", { class: "card chunk" }, h("span", { class: "label" }, t("queueWaiting")));
-    if (!q.waiters.length) waiting.append(h("p", { class: "note" }, t("queueNoWaiting")));
-    q.waiters.forEach((w, i) => waiting.append(h("div", { class: "field" },
-      h("span", { class: "mono muted" }, `${i + 1}.`),
-      h("span", { class: "grow" }, who(w.client), w.task ? h("span", { class: "hint" }, w.task) : null),
-      w.rush ? h("span", { class: "pill bad" }, t("queueRush")) : null,
-      w.publish ? h("span", { class: "pill warn", title: w.publish.commit ?? "" }, w.publish.commit ? `${t("queuePublishPill")} ${w.publish.commit.slice(0, 8)}` : t("queuePublishPill"))
-        : w.exclusive ? h("span", { class: "pill sky" }, t("queueLive")) : null,
-      h("span", { class: "pill brand", title: w.effectiveLevel !== w.level ? t("queueWasLevel", { level: w.level }) : "" }, w.effectiveLevel),
-      h("span", { class: "pill mono" }, `~${w.holdMin} min`),
-      h("span", { class: "mono muted" }, span(w.waitedMs)))));
-
-    const jobs = h("div", { class: "card chunk" }, h("span", { class: "label" }, t("queueJobs")));
-    if (!q.jobs.length) jobs.append(h("p", { class: "note" }, t("queueNoJobs")));
-    for (const j of q.jobs) {
+    // Tests: the running one first (green), then the queued ones by their place in line
+    // An empty card is one line: its label, and the empty text at the other end
+    const noJobs = !q.jobs.length && !q.play;
+    const jobs = h("div", { class: `card qcard${noJobs ? " none" : ""}` }, qhead(t("queueJobs"), noJobs ? h("span", { class: "qnone" }, t("queueNoJobs")) : null));
+    let inLine = 0;
+    for (const j of runningFirst(q.jobs, q.running?.id)) {
       const running = q.running?.id === j.id;
       const wait = jobWait(j);
-      jobs.append(h("div", { class: "field" },
-        h("span", { class: "grow" }, j.name, h("span", { class: "hint mono" }, `${who(j.client)} · ${shortPath(j.root)}`)),
-        running ? h("span", { class: "pill live" }, t("queueRunning")) : null,
-        wait === "stuck" ? h("span", { class: "pill bad", title: j.stuck.last ?? "" }, t("queueStuckJob")) : null,
-        wait === "infra" ? h("span", { class: "pill warn", title: j.infra.last }, t("queueInfraTry", { n: j.infra.tries, d: span(j.infra.retryInMs) })) : null,
-        j.alone ? h("span", { class: "pill sky" }, t("queueAlone")) : null,
-        h("span", { class: "mono muted" }, span(running ? q.running.ms : j.waitedMs))));
+      if (!running) inLine++;
+      jobs.append(qrow({
+        slot: running ? qslot("live", "run") : qslot(wait === "stuck" ? "bad" : wait === "infra" ? "warn" : "", null, String(inLine)),
+        name: j.name,
+        hint: `${who(j.client)} · ${shortPath(j.root)}`,
+        hintTitle: j.root,
+        tags: [
+          running ? h("span", { class: "pill live" }, t("queueRunning")) : null,
+          wait === "stuck" ? h("span", { class: "pill bad", title: j.stuck.last ?? "" }, t("queueStuckJob")) : null,
+          wait === "infra" ? h("span", { class: "pill warn", title: j.infra.last }, t("queueInfraTry", { n: j.infra.tries, d: span(j.infra.retryInMs) })) : null,
+          j.alone ? h("span", { class: "pill sky" }, t("queueAlone")) : null],
+        time: span(running ? q.running.ms : j.waitedMs),
+      }));
     }
     if (q.play) {
-      jobs.append(h("div", { class: "field" },
-        h("span", { class: "grow" }, t("queuePlay"), h("span", { class: "hint mono" }, q.play.roots.map(shortPath).join(" + "))),
-        q.play.held ? h("span", { class: "pill warn" }, t("queuePlayHeld", { who: q.play.held.client, d: span(q.play.held.leftMs) })) : null,
-        h("span", { class: "mono muted" }, span(Date.now() - q.play.since))));
+      jobs.append(qrow({
+        slot: qslot("", "play"),
+        name: t("queuePlay"),
+        hint: q.play.roots.map(shortPath).join(" + "),
+        hintTitle: q.play.roots.join("\n"),
+        tags: [q.play.held ? h("span", { class: "pill warn" }, t("queuePlayHeld", { who: q.play.held.client, d: span(q.play.held.leftMs) })) : null],
+        time: span(Date.now() - q.play.since),
+      }));
     }
+
+    // Who waits for Studio, in line; the level pill is neutral (the brand stays off this tab)
+    const waiting = h("div", { class: `card qcard${q.waiters.length ? "" : " none"}` }, qhead(t("queueWaiting"), q.waiters.length ? null : h("span", { class: "qnone" }, t("queueNoWaiting"))));
+    q.waiters.forEach((w, i) => waiting.append(qrow({
+      slot: qslot(w.rush ? "bad" : "", null, String(i + 1)),
+      name: who(w.client),
+      // The task, then how long it asks to hold Studio (the commit of a publish rides in its pill)
+      hint: [w.task, `~${w.holdMin} min`].filter(Boolean).join(" · "),
+      mono: false,
+      tags: [
+        w.rush ? h("span", { class: "pill bad" }, t("queueRush")) : null,
+        w.publish ? h("span", { class: "pill warn", title: w.publish.commit ?? "" }, w.publish.commit ? `${t("queuePublishPill")} ${w.publish.commit.slice(0, 8)}` : t("queuePublishPill"))
+          : w.exclusive ? h("span", { class: "pill sky" }, t("queueLive")) : null,
+        h("span", { class: "pill strong", title: w.effectiveLevel !== w.level ? t("queueWasLevel", { level: w.level }) : "" }, w.effectiveLevel)],
+      time: span(w.waitedMs),
+    })));
 
     // The day's answers (decision 25): a job that never ran is red and says so, never a result
     const recent = recentOf(q);
-    const answers = recent.length ? h("div", { class: "card chunk" }, h("span", { class: "label" }, t("queueRecent"))) : null;
+    const answers = recent.length ? h("div", { class: "card qcard" }, qhead(t("queueRecent"))) : null;
     for (const r of recent) {
       const notRun = r.verdict === "infra";
-      const hint = [who(r.client), notRun ? r.reason : null].filter(Boolean).join(" · ");
-      answers.append(h("div", { class: "field", title: r.reason ?? "" },
-        h("span", { class: notRun ? "grow bad" : "grow" }, r.name, h("span", { class: "hint mono" }, hint)),
-        r.verdict === "pass" ? h("span", { class: "pill live" }, t("queueRecentPass"))
+      const pass = r.verdict === "pass";
+      answers.append(qrow({
+        slot: qslot(pass ? "live" : notRun ? "bad" : "warn", pass ? "check" : notRun ? "alert" : "cross"),
+        name: r.name,
+        bad: notRun,
+        title: r.reason ?? "",
+        hint: [who(r.client), notRun ? r.reason : span(r.ms)].filter(Boolean).join(" · "),
+        tags: [pass ? h("span", { class: "pill live" }, t("queueRecentPass"))
           : r.verdict === "fail" ? h("span", { class: "pill warn", title: r.reason ?? "" }, t("queueRecentFail"))
-            : h("span", { class: "pill bad", title: r.reason ?? "" }, t("queueRecentNotRun")),
-        notRun ? null : h("span", { class: "mono muted" }, span(r.ms)),
-        h("span", { class: "mono muted", title: new Date(r.at).toLocaleTimeString() }, t("queueAgo", { d: span(Date.now() - r.at) }))));
+            : h("span", { class: "pill bad", title: r.reason ?? "" }, t("queueRecentNotRun"))],
+        time: t("queueAgo", { d: span(Date.now() - r.at) }),
+        timeTitle: new Date(r.at).toLocaleTimeString(),
+      }));
     }
 
     const d = q.today;
-    const stat = (value, label, kind = "") => h("div", { class: `stat chunk${kind ? ` ${kind}` : ""}` }, h("span", { class: "v" }, value), h("span", { class: "label" }, label));
+    const stat = (value, label, kind = "") => h("div", { class: `stat${kind ? ` ${kind}` : ""}` }, h("span", { class: "v" }, value), h("span", { class: "label" }, label));
     const { notRun, failures } = todayOf(d);
     // A hub that counts the not-run jobs apart gets their own tile; p50 and p90 share one so the
-    // grid keeps its two rows of three
+    // row keeps six tiles
     const stats = notRun === null
       ? [
         stat(String(d.jobs), t("queueJobsDone")),
@@ -842,31 +975,46 @@ async function renderQueue(target) {
         stat(`${d.plays}`, `${t("queuePlays")} (${d.sharedPlays} ${t("queueShared")})`),
         stat(d.jobsPerPlay == null ? "–" : String(d.jobsPerPlay), t("queuePerPlay")),
         stat(span(d.queueP50Ms), `${t("queueP50")} (p90 ${span(d.queueP90Ms)})`)];
-    const today = h("div", { class: "card chunk" },
-      h("span", { class: "label" }, t("queueToday")),
-      h("div", { class: "stats", style: "margin-top:8px" }, ...stats),
+    const today = h("div", { class: "card qcard qtoday" },
+      qhead(t("queueToday")),
+      h("div", { class: "stats qstats" }, ...stats),
       failures.length ? h("div", { class: "field" }, h("span", { class: "grow" }, t("queueFailures")), ...failures.map(([k, n]) => h("span", { class: "pill warn" }, `${k} ${n}`))) : null,
       notRun ? h("p", { class: "note" }, t("queueNotRunNote", { n: notRun })) : null,
       h("p", { class: "note" }, `${d.grants} ${t("queueHolds", { n: d.grantsCapped })}`));
 
-    body.replaceChildren(h("div", { class: "cards" }, h("div", { style: "display:flex;flex-direction:column;gap:16px" }, studio, waiting), h("div", { style: "display:flex;flex-direction:column;gap:16px" }, jobs, answers, today)));
+    // The lock on top, then now (the tests, who waits), then the day (answers and numbers): one
+    // column, so a row keeps its name readable beside its pills at every width
+    body.replaceChildren(...[studio, jobs, waiting, answers, today].filter(Boolean));
   };
   await fill();
   if (mine === generation) queueTimer = every(QUEUE_POLL_MS, fill);
 }
 
+/**
+ * The game's folder and its registration: the folder, the place id, what lives there, opening it,
+ * and Remove from Quack as the danger action (armed by a first click: the button turns red and
+ * the line under the buttons says what removing does).
+ */
 function renderFolder(target) {
   const place = placeOf(ui.placeId);
+  // The registry never keeps a place without a folder; a game removed meanwhile lands here
+  if (!place?.folder) {
+    target.replaceChildren(h("div", { class: "view folder" }, h("div", { class: "empty" }, qslot("lg", "folder"), h("strong", {}, t("folder")), t("noFolder"))));
+    return;
+  }
   let armed = false;
-  const remove = h("button", { class: "btn dark chunk press danger", "aria-label": `${t("removeGame")}: ${nameOf(place)}` }, t("removeGame"));
+  const sure = h("p", { class: "note bad hidden" }, t("removeConfirm", { name: nameOf(place) }));
+  const remove = h("button", { class: "btn danger press", "aria-label": `${t("removeGame")}: ${nameOf(place)}` }, t("removeGame"));
   remove.addEventListener("click", async () => {
     if (!armed) {
       armed = true;
-      remove.textContent = t("removeConfirm", { name: nameOf(place) });
-      remove.setAttribute("aria-label", remove.textContent);
+      remove.classList.add("armed");
+      sure.classList.remove("hidden");
+      remove.setAttribute("aria-label", t("removeConfirm", { name: nameOf(place) }));
       setTimeout(() => {
         armed = false;
-        remove.textContent = t("removeGame");
+        remove.classList.remove("armed");
+        sure.classList.add("hidden");
         remove.setAttribute("aria-label", `${t("removeGame")}: ${nameOf(place)}`);
       }, 4000);
       return;
@@ -879,14 +1027,16 @@ function renderFolder(target) {
       fail(error);
     }
   });
-  target.replaceChildren(h("div", { class: "card chunk" },
+  target.replaceChildren(h("div", { class: "view folder" }, h("div", { class: "card fcard" },
     h("span", { class: "label" }, t("folder")),
-    h("div", { class: "place chunk" }, h("div", { class: "grow" }, h("b", {}, nameOf(place)), h("span", { class: "mono" }, place.folder))),
+    h("div", { class: "place" }, qslot("lg", "folder"), h("div", { class: "grow" }, h("b", {}, nameOf(place)), h("span", { class: "mono" }, place.folder))),
+    h("div", { class: "field" }, h("span", { class: "grow" }, t("placeId")), h("span", { class: "mono muted" }, place.placeId)),
     h("p", { class: "note" }, t("folderTab")),
-    h("div", { class: "actions", style: "margin-top:14px" },
-      h("button", { class: "btn yellow chunk-bright press", onclick: () => invoke("open_path", { path: place.folder, editor: false }).catch(fail) }, t("openFolder")),
-      editorButtons(place.folder, "dark chunk"),
-      h("span", { class: "grow" }), remove)));
+    h("div", { class: "actions" },
+      h("button", { class: "btn light press", onclick: () => invoke("open_path", { path: place.folder, editor: false }).catch(fail) }, t("openFolder")),
+      h("span", { class: "grow" }), remove),
+    // Under the buttons, so the armed one stays where the second click lands
+    sure)));
 }
 
 /** Line diff by longest common subsequence: [op, aIndex, bIndex] with op "=", "a" or "b" */
@@ -919,8 +1069,9 @@ function codeLine(no, text, cls = "") {
 
 /** Both panes show only the changed stretches, with a few unchanged lines around each */
 function diffPanes(current, saved) {
-  const left = h("div", { class: "pane chunk mono" }, h("span", { class: "label" }, t("kept")));
-  const right = h("div", { class: "pane chunk mono" }, h("span", { class: "label" }, t("lost")));
+  // The panes hold code only: each side's name, count and choice are around it (renderConflict)
+  const left = h("div", { class: "pane mono" });
+  const right = h("div", { class: "pane mono" });
   if (current === null) {
     left.append(h("div", { class: "gap" }, t("fileGone")));
     saved.split("\n").forEach((line, i) => right.append(codeLine(i + 1, line, "lost")));
@@ -935,7 +1086,12 @@ function diffPanes(current, saved) {
   }
   const ops = diffLines(a, b);
   const changed = ops.map((op) => op[0] !== "=");
-  if (!changed.some(Boolean)) return [left, right, t("sameText")];
+  // Nothing differs any more: both whole, so the choice is still made over the text it keeps
+  if (!changed.some(Boolean)) {
+    a.forEach((line, i) => left.append(codeLine(i + 1, line)));
+    b.forEach((line, i) => right.append(codeLine(i + 1, line)));
+    return [left, right, t("sameText")];
+  }
   const near = ops.map((_, k) => {
     for (let d = -CONTEXT_LINES; d <= CONTEXT_LINES; d++) if (changed[k + d]) return true;
     return false;
@@ -988,23 +1144,31 @@ async function renderConflict(target) {
       fail(error);
     }
   };
-  const method = entry?.method === "ai" ? t("methodAi") : t("methodText");
-  target.replaceChildren(h("div", { class: "view" },
-    h("div", { class: "title" },
-      h("div", { class: "grow" },
-        h("span", { class: "label" }, `${t("conflictTitle")} · ${entry ? hhmm(entry.t) : ""} · ${method}`),
-        h("h1", { class: "display", style: "font-size:22px;margin-top:6px" }, view.file.split("/").pop()),
-        h("div", { class: "bar" })),
-      entry?.conflictingHunks ? h("span", { class: "pill warn" }, h("span", { class: "dot warn" }), tn("hunks", entry.conflictingHunks)) : null),
-    note ? h("p", { class: "note" }, note) : null,
-    h("div", { class: "diff" }, left, right),
-    h("div", { class: "actions" },
-      h("button", { class: "btn yellow chunk-bright press", onclick: resolve("useDisk") }, t("useDisk")),
-      h("button", { class: "btn dark chunk press", onclick: resolve("keep") }, t("keep")),
-      editorButtons(view.path, "dark chunk"),
-      h("button", { class: "btn dark chunk press", onclick: () => show("merges") }, t("back")),
-      h("span", { class: "grow" }),
-      h("span", { class: "mono muted", style: "font-size:10.5px" }, id))));
+  // A conflict older than the merge history has no entry: no time and no method to show
+  const method = entry ? (entry.method === "ai" ? t("methodAi") : t("methodText")) : "";
+  const [dir] = splitPath(view.file);
+  /** One side: its name and how many lines only it has, its code, and the button that makes it win */
+  const side = (label, pane, only, cls, choice) => h("div", { class: "cf-side" },
+    h("div", { class: "cf-head" }, h("span", { class: "label grow" }, label), only ? h("span", { class: `pill mono ${cls}` }, `+${only}`) : null),
+    pane,
+    h("div", { class: "actions" }, choice));
+  // What it is over the full width; the script's name with what can be done to it beside it
+  target.replaceChildren(h("div", { class: "view conflict" },
+    h("div", { class: "cf-title" },
+      h("div", { class: "cf-meta" },
+        h("span", { class: "label" }, [t("conflictTitle"), entry?.t ? hhmm(entry.t) : "", method].filter(Boolean).join(" · ")),
+        entry?.conflictingHunks ? h("span", { class: "pill warn" }, h("span", { class: "dot warn" }), tn("hunks", entry.conflictingHunks)) : null),
+      h("div", { class: "cf-name" },
+        h("h1", { class: "display grow", title: view.file }, view.file.split("/").pop()),
+        h("div", { class: "actions" },
+          editorButtons(view.path, "sm"),
+          h("button", { class: "btn sm ghost press", onclick: () => show("merges") }, h("span", { class: "chev" }, "‹"), t("back")))),
+      h("div", { class: "cf-path mono" }, dir ? `${dir} · ${id}` : id)),
+    note ? h("p", { class: "note cf-note" }, note) : null,
+    // Each side's choice sits under its own code: the left keeps the merge, the right takes the disk's text
+    h("div", { class: "diff" },
+      side(t("kept"), left, left.querySelectorAll(".kept").length, "live", h("button", { class: "btn press", onclick: resolve("keep") }, t("keep"))),
+      side(t("lost"), right, right.querySelectorAll(".lost").length, "bad", h("button", { class: "btn yellow press", onclick: resolve("useDisk") }, t("useDisk"))))));
 }
 
 function toggle(on, onclick, readOnly = false) {
@@ -1018,19 +1182,19 @@ const AI_NAMES = { claude: "Claude Code", codex: "Codex" };
  * that one; both = a choice. The hub checks the CLIs and refuses a choice it cannot run.
  */
 function aiCard(ai) {
-  const card = h("div", { class: "card chunk" }, h("span", { class: "label" }, t("aiCard")));
   const redraw = () => {
     contentKey = "";
     renderContent();
   };
-  const check = h("button", { class: "btn dark chunk press" }, t("aiCheck"));
+  const check = h("button", { class: "btn sm press" }, t("aiCheck"));
   check.addEventListener("click", () => {
     check.disabled = true;
     ui.aiRefresh = true;
     redraw();
   });
+  const card = h("div", { class: "card set-group" }, setHead(t("aiCard"), check));
   if (!ai) {
-    card.append(h("p", { class: "note" }, t("aiUnknown")), h("div", { class: "row" }, h("span", { class: "grow" }), check));
+    card.append(h("p", { class: "note" }, t("aiUnknown")));
     return card;
   }
   const { effective, settings, usable, detected } = ai;
@@ -1039,10 +1203,12 @@ function aiCard(ai) {
   const on = !none && settings.ai;
   // The model of the AI in use: a menu of its models, or read-only from a hub without the lists
   const model = modelPill(ai) || (effective.provider === "codex" ? t("aiModelDefault") : "");
+  // The menu's name for it ("Opus", not "opus"); a menu with no model known yet still says what it picks
+  const shown = model ? modelLabel(model) : t("aiModelDefault");
   const choice = modelChoice(ai);
   let pill = null;
   if (choice) {
-    pill = h("button", { class: "pill brand", title: t("aiModelPick"), "aria-haspopup": "menu" }, model, " ▾");
+    pill = h("button", { class: "pill strong", title: t("aiModelPick"), "aria-haspopup": "menu" }, shown, " ▾");
     const items = choice.options.map((o) => ({
       label: o.value ? modelLabel(o.value) : t("aiModelDefault"),
       on: o.on,
@@ -1050,10 +1216,14 @@ function aiCard(ai) {
     }));
     pill.addEventListener("click", () => popMenu(pill, "ai-model", t("aiModel", { name: AI_NAMES[choice.provider] }), items));
   } else if (model) {
-    pill = h("span", { class: "pill brand" }, model);
+    pill = h("span", { class: "pill strong" }, shown);
   }
+  // What the switch does now, one line under its name (the choice to make has its own warning)
+  const now = none || effective.state === "choose" ? null
+    : effective.state === "off" ? t("aiOffNote")
+    : t("aiAccount", { name: AI_NAMES[effective.provider] });
   card.append(h("div", { class: "field" },
-    h("span", { class: "grow" }, t("aiMerge")),
+    h("span", { class: "grow" }, t("aiMerge"), now ? h("span", { class: "hint" }, now) : null),
     pill,
     toggle(on, () => set({ ai: !on }), none)));
   if (usable.length === 2 && settings.ai) {
@@ -1067,13 +1237,8 @@ function aiCard(ai) {
       card.append(h("p", { class: "note mono" }, t(status.installed ? "aiLoggedOut" : "aiNotInstalled", { name: AI_NAMES[provider] })));
     }
   } else if (effective.state === "choose") {
-    card.append(h("p", { class: "note", style: "color:var(--brand-400)" }, t("aiChoose")));
-  } else if (effective.state === "off") {
-    card.append(h("p", { class: "note" }, t("aiOffNote")));
-  } else {
-    card.append(h("p", { class: "note" }, t("aiAccount", { name: AI_NAMES[effective.provider] })));
+    card.append(h("p", { class: "note set-warn" }, t("aiChoose")));
   }
-  card.append(h("div", { class: "row", style: "margin-top:8px" }, h("span", { class: "grow" }), check));
   return card;
 }
 
@@ -1097,7 +1262,7 @@ function aiConnectDialog() {
     document.getElementById("aiConnect")?.remove();
     const list = h("div", { class: "setup-options" }, h("p", { class: "note" }, t("mcpFinding")));
     const go = h("button", { class: "btn yellow chunk-bright press", disabled: true }, t("mcpConnect"));
-    const cancel = h("button", { class: "btn dark chunk press" }, t("cancel"));
+    const cancel = h("button", { class: "btn ghost press" }, t("cancel"));
     const picked = new Set();
     let clients = [];
     let busy = false;
@@ -1111,7 +1276,7 @@ function aiConnectDialog() {
       go.textContent = busy ? t("mcpConnecting") : picked.size ? `${t("mcpConnect")} (${picked.size})` : t("mcpConnect");
     };
     const row = (c) => {
-      const box = h("input", { type: "checkbox", disabled: !c.installed || busy });
+      const box = h("input", { type: "checkbox", class: "checkbox", disabled: !c.installed || busy });
       box.checked = picked.has(c.id);
       box.addEventListener("change", () => {
         if (box.checked) picked.add(c.id); else picked.delete(c.id);
@@ -1120,7 +1285,8 @@ function aiConnectDialog() {
       return h("label", { class: `setup-option ai-option${c.installed ? "" : " off"}` },
         box,
         h("div", { class: "grow" }, h("b", {}, c.label), c.dir ? h("span", { class: "mono muted", title: c.dir }, c.dir) : null),
-        h("span", { class: c.connected ? "pill brand" : c.problem ? "pill bad" : "pill", title: c.problem ?? "" }, aiState(c)));
+        // Its state in its own colour; the brand stays on Connect
+        h("span", { class: c.problem ? "pill bad" : !c.connected ? "pill" : aiNeeds(c) ? "pill warn" : "pill live", title: c.problem ?? "" }, aiState(c)));
     };
     const show = (found) => {
       clients = found;
@@ -1152,13 +1318,13 @@ function aiConnectDialog() {
     cancel.addEventListener("click", () => close(null));
     dialog = h("div", { id: "aiConnect", class: "overlay" },
       h("div", { class: "card chunk dialog", role: "dialog", "aria-modal": "true", "aria-labelledby": "aiConnectTitle" },
-        h("span", { class: "label" }, t("mcpCard")),
-        h("h2", { class: "display", id: "aiConnectTitle" }, t("aiPickTitle")),
-        h("div", { class: "bar" }),
+        h("div", { class: "dlg-head" },
+          h("div", { class: "grow" },
+            h("span", { class: "label" }, t("mcpCard")),
+            h("h2", { class: "display", id: "aiConnectTitle" }, t("aiPickTitle")))),
         h("p", {}, t("aiPickNote")),
         list,
-        h("div", { class: "actions" }, cancel, h("span", { class: "grow" }), go),
-        h("p", { class: "note" }, t("aiPickKeep"))));
+        h("div", { class: "dlg-foot" }, h("p", { class: "dlg-hint" }, t("aiPickKeep")), cancel, go)));
     dialog.addEventListener("keydown", (event) => {
       if (event.key === "Escape" && !busy) {
         event.preventDefault();
@@ -1166,6 +1332,7 @@ function aiConnectDialog() {
       }
     });
     document.body.append(dialog);
+    popIn(dialog.firstChild);
     cancel.focus();
     invoke("ai_clients", { connect: false })
       .then((result) => {
@@ -1188,32 +1355,40 @@ function aiConnectDialog() {
  * choose which of them to set up.
  */
 function mcpCard() {
-  const card = h("div", { class: "card chunk" }, h("span", { class: "label" }, t("mcpCard")), h("p", { class: "note" }, t("mcpNote")));
-  const list = h("div", {});
-  const button = h("button", { class: "btn yellow chunk-bright press" }, t("mcpFind"));
+  const list = h("div", { class: "set-rows" });
+  const button = h("button", { class: "btn light press" }, t("mcpFind"));
+  const card = h("div", { class: "card set-group" }, setHead(t("mcpCard"), button), setNote(t("mcpNoteShort"), t("mcpNote")), list);
   let found = null;
-  const show = (clients) => {
-    found = clients;
+  // Connected and current is live, connected but behind needs an update, a problem is an error
+  const look = (c) => c.problem ? "pill bad" : !c.connected ? "pill" : aiNeeds(c) ? "pill warn" : "pill live";
+  const paint = (clients) => {
     list.replaceChildren(...clients.map((c) => h("div", { class: "field" },
       h("span", { class: "grow" }, c.label),
-      h("span", { class: c.connected ? "pill brand" : "pill", title: c.problem ?? "" }, aiState(c)))));
+      h("span", { class: look(c), title: c.problem ?? "" }, aiState(c)))));
     if (!clients.some((c) => c.installed)) list.append(h("p", { class: "note" }, t("mcpNone")));
   };
+  const show = (clients) => {
+    found = clients;
+    ui.mcpClients = clients;
+    paint(clients);
+  };
+  // The last answer at once: a redraw of Settings (a toggle, the language) keeps the page's height
+  // instead of growing the list back under the reader's eyes
+  if (ui.mcpClients) paint(ui.mcpClients);
   button.addEventListener("click", async () => {
     button.disabled = true;
     try {
       const result = await aiConnectDialog();
       if (!result) return;
       show(result.clients);
-      if (result.clients.some((c) => result.only.includes(c.id) && c.connected)) toast(t("mcpRestart"));
+      if (result.clients.some((c) => result.only.includes(c.id) && c.connected)) toast(t("mcpRestart"), "info");
     } finally {
       button.disabled = false;
     }
   });
-  card.append(list, h("div", { class: "row", style: "margin-top:8px" }, h("span", { class: "grow" }), button));
   // What each AI has, as soon as the card opens: an update shows without a first click
   invoke("ai_clients", { connect: false }).then((result) => { if (!found && Array.isArray(result?.clients)) show(result.clients); }).catch(() => {});
-  card.append(h("p", { class: "note", style: "margin-top:12px" }, t("ruleNote")), h("div", { class: "row", style: "margin-top:8px" }, h("span", { class: "grow" }), ruleButton()));
+  card.append(h("div", { class: "field" }, h("span", { class: "grow" }, t("ruleOther"), h("span", { class: "hint", title: t("ruleNote") }, t("ruleHintShort"))), ruleButton()));
   return card;
 }
 
@@ -1222,7 +1397,7 @@ function mcpCard() {
  * so the click writes it at once, while the click still counts as the user's own gesture.
  */
 function ruleButton() {
-  const button = h("button", { class: "btn chunk-bright press" }, t("ruleCopy"));
+  const button = h("button", { class: "btn press" }, t("ruleCopy"));
   const fetchRule = () => {
     const pending = invoke("ai_rule").then((result) => {
       if (typeof result?.text !== "string") throw new Error(result?.error ?? "no rule");
@@ -1250,11 +1425,11 @@ function ruleButton() {
  * `cloud` command. The key field is always empty: a saved key shows only its last 4 characters.
  */
 function cloudCard() {
-  const card = h("div", { class: "card chunk" }, h("span", { class: "label" }, t("cloudCard")), h("p", { class: "note" }, t("cloudNote")));
-  const status = h("p", { class: "note mono" }, t("cloudLoading"));
-  const keyInput = h("input", { class: "field-input mono grow", type: "password", autocomplete: "off", spellcheck: "false", placeholder: t("cloudKeyNew") });
+  const card = h("div", { class: "card set-group" }, setHead(t("cloudCard")), setNote(t("cloudNoteShort"), t("cloudNote")));
+  const status = h("p", { class: "note set-path" }, t("cloudLoading"));
+  const keyInput = h("input", { class: "field-input mono set-key", type: "password", autocomplete: "off", spellcheck: "false", placeholder: t("cloudKeyNew"), "aria-label": t("cloudKey") });
   let kind = "user";
-  const idInput = h("input", { class: "field-input mono", style: "width:150px", inputmode: "numeric", placeholder: t("cloudIdPlaceholder") });
+  const idInput = h("input", { class: "field-input mono set-id", inputmode: "numeric", placeholder: t("cloudIdPlaceholder"), "aria-label": t("cloudCreator") });
   const kindButton = (value) => {
     const button = h("button", { onclick: () => { kind = value; paintKind(); } }, t(value === "user" ? "cloudUser" : "cloudGroup"));
     button.dataset.kind = value;
@@ -1262,8 +1437,8 @@ function cloudCard() {
   };
   const kinds = h("span", { class: "seg" }, kindButton("user"), kindButton("group"));
   const paintKind = () => kinds.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.kind === kind));
-  const save = h("button", { class: "btn yellow chunk-bright press" }, t("cloudSave"));
-  const remove = h("button", { class: "btn press hidden" }, t("cloudRemove"));
+  const save = h("button", { class: "btn light press" }, t("cloudSave"));
+  const remove = h("button", { class: "btn danger press hidden" }, t("cloudRemove"));
   const show = (s) => {
     keyInput.value = "";
     keyInput.placeholder = s.hasKey ? (s.keyEnd ? t("cloudKeySaved", { end: s.keyEnd }) : t("cloudKeySavedShort")) : t("cloudKeyNew");
@@ -1295,10 +1470,9 @@ function cloudCard() {
   paintKind();
   run({ key: null, userId: null, groupId: null, clear: null });
   card.append(
-    h("div", { class: "field" }, h("span", {}, t("cloudKey")), keyInput),
+    h("div", { class: "field" }, h("span", { class: "grow" }, t("cloudKey")), keyInput),
     h("div", { class: "field" }, h("span", { class: "grow" }, t("cloudCreator")), kinds, idInput),
-    status,
-    h("div", { class: "row", style: "margin-top:8px;gap:8px" }, h("span", { class: "grow" }), remove, save));
+    h("div", { class: "field set-foot" }, status, remove, save));
   return card;
 }
 
@@ -1355,6 +1529,60 @@ async function copyText(text) {
   }
 }
 
+/** A section's heading in Settings: its name, and what sits at its end (a pill, a button) */
+function setHead(label, ...end) {
+  return h("div", { class: "set-head" }, h("span", { class: "label" }, label), ...end);
+}
+
+/**
+ * The one line under a section's heading, and its long text behind a small info button beside it:
+ * the page stays short, and the whole story is one click away (and in the button's tooltip)
+ */
+function setNote(short, long) {
+  const more = h("p", { class: "note set-more hidden" }, long);
+  const info = h("button", { class: "btn ghost sm icon press set-info", title: long, "aria-label": t("setMore"), "aria-expanded": "false" }, h("span", { class: "ico i-info" }));
+  info.addEventListener("click", () => {
+    const open = more.classList.toggle("hidden") === false;
+    info.setAttribute("aria-expanded", String(open));
+    info.classList.toggle("on", open);
+  });
+  return h("div", { class: "set-lead" }, h("div", { class: "set-lead-row" }, h("p", { class: "note" }, short), info), more);
+}
+
+/** Settings' sections in page order: the id the index scrolls to and the key of its short name */
+const SETTINGS_SECTIONS = [
+  ["general", "setGeneral"],
+  ["games", "setGames"],
+  ["connect", "mcpCard"],
+  ["ai", "aiCard"],
+  ["auto", "autoCard"],
+  ["cloud", "setCloud"],
+  ["queue", "queueCard"],
+  ["daemon", "daemonSettings"],
+  ["about", "setAbout"],
+];
+
+/** Lower case and no accents: "configuracoes" finds "Configurações" */
+const fold = (text) => String(text).normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+
+/** What a search reads in a node: its text and the words it only shows on hover or to a screen reader */
+function searchText(node) {
+  const extra = [node, ...node.querySelectorAll("[title], [placeholder], [aria-label]")]
+    .flatMap((n) => ["title", "placeholder", "aria-label"].map((a) => n.getAttribute(a)))
+    .filter(Boolean);
+  return fold(`${node.textContent} ${extra.join(" ")}`);
+}
+
+/**
+ * The rows a search shows or hides in a section: each child under the heading, and inside a list
+ * of rows (the games, the AIs found) each row of it
+ */
+function searchUnits(section) {
+  return [...section.children]
+    .filter((c) => !c.classList.contains("set-head") && !c.classList.contains("label"))
+    .flatMap((c) => (!c.classList.contains("field") && c.querySelector(":scope > .field, :scope > .place") ? [...c.children] : [c]));
+}
+
 async function renderSettings(target) {
   const s = state();
   const mine = generation;
@@ -1370,20 +1598,27 @@ async function renderSettings(target) {
   ui.aiRefresh = false;
   if (mine !== generation) return;
 
+  // A row of a section: its name, a one-line hint under it (the long one in its tooltip), its controls
+  const row = (title, hint, ...controls) => h("div", { class: "field" },
+    h("span", { class: "grow" }, title, hint ? h("span", { class: "hint", title: hint.long ?? null }, hint.short ?? hint) : null),
+    ...controls);
+
   // Registered games and the form to add one (prefilled when it comes from a refusal)
-  const games = h("div", {});
+  const games = h("div", { class: "set-rows" });
   for (const place of s?.places ?? []) {
     let armed = false;
     // Named after its game: a row of identical "Remove" buttons cannot be told apart by a
     // screen reader (or by automation, which removed the wrong game in a test on 20/10/26)
-    const remove = h("button", { class: "btn dark chunk press danger", "aria-label": `${t("remove")} ${nameOf(place)}` }, t("remove"));
+    const remove = h("button", { class: "btn danger press", "aria-label": `${t("remove")} ${nameOf(place)}` }, t("remove"));
     remove.addEventListener("click", async () => {
       if (!armed) {
         armed = true;
+        remove.classList.add("armed");
         remove.textContent = `${t("remove")}?`;
         remove.setAttribute("aria-label", `${t("remove")} ${nameOf(place)}?`);
         setTimeout(() => {
           armed = false;
+          remove.classList.remove("armed");
           remove.textContent = t("remove");
           remove.setAttribute("aria-label", `${t("remove")} ${nameOf(place)}`);
         }, 3000);
@@ -1391,23 +1626,24 @@ async function renderSettings(target) {
       }
       await api.post("/api/unregister", { placeId: place.placeId }).then(() => toast(t("done"))).catch(fail);
     });
-    games.append(h("div", { class: "place chunk" }, h("div", { class: "grow" }, h("b", {}, nameOf(place)), h("span", { class: "mono" }, `${place.placeId} · ${place.folder}`)), remove));
+    games.append(h("div", { class: "place" }, h("div", { class: "grow" }, h("b", {}, nameOf(place)), h("span", { class: "mono" }, `${place.placeId} · ${place.folder}`)), remove));
   }
   if (!s?.places.length) games.append(h("p", { class: "note" }, t("noGames")));
 
-  const placeInput = h("input", { class: "field-input mono", placeholder: t("placeId"), value: ui.register?.placeId ?? "", inputmode: "numeric" });
-  const nameInput = h("input", { class: "field-input", placeholder: t("name"), value: ui.register?.placeName ?? "" });
+  const placeInput = h("input", { class: "field-input mono", placeholder: t("placeId"), value: ui.register?.placeId ?? "", inputmode: "numeric", "aria-label": t("placeId") });
+  const nameInput = h("input", { class: "field-input", placeholder: t("name"), value: ui.register?.placeName ?? "", "aria-label": t("name") });
   let folder = null;
-  const folderLabel = h("span", { class: "mono muted grow", style: "overflow-wrap:anywhere" }, t("noFolder"));
-  const choose = h("button", { class: "btn dark chunk press" }, t("chooseFolder"));
+  const folderLabel = h("span", { class: "mono muted grow set-folder" }, t("noFolder"));
+  const choose = h("button", { class: "btn press" }, t("chooseFolder"));
   choose.addEventListener("click", async () => {
     const picked = await invoke("pick_folder");
     if (picked) {
       folder = picked;
       folderLabel.textContent = picked;
+      folderLabel.title = picked;
     }
   });
-  const save = h("button", { class: "btn yellow chunk-bright press" }, t("save"));
+  const save = h("button", { class: "btn light press" }, t("save"));
   save.addEventListener("click", async () => {
     try {
       await api.post("/api/registry", { placeId: placeInput.value.trim(), folder: folder ?? "", name: nameInput.value.trim() || undefined });
@@ -1419,6 +1655,11 @@ async function renderSettings(target) {
       fail(error);
     }
   });
+
+  const form = h("div", { class: "set-form" },
+    h("span", { class: "set-sub" }, t("setAddGame")),
+    h("div", { class: "set-pair" }, placeInput, nameInput),
+    h("div", { class: "row" }, choose, folderLabel, save));
 
   const lang = (code, label) => h("button", {
     class: ui.settings.language === code ? "on" : "",
@@ -1443,7 +1684,7 @@ async function renderSettings(target) {
       [...ui.editors].sort((a, b) => (a.name < b.name ? -1 : 1)).map((e) => h("option", { value: e.id, selected: picked === e.id }, e.name)))
     : h("span", { class: "muted" }, t("noEditor"));
   // The background check runs every 6 hours: a release published right after the app opened waited that long
-  const checkUpdate = h("button", { class: "btn dark chunk press" }, t("checkUpdate"));
+  const checkUpdate = h("button", { class: "btn press" }, t("checkUpdate"));
   checkUpdate.addEventListener("click", async () => {
     checkUpdate.disabled = true;
     // The shorter label would pull the version beside it sideways
@@ -1455,7 +1696,7 @@ async function renderSettings(target) {
         ui.update = ready;
         renderAppUpdate();
       } else {
-        toast(t("upToDate", { version: ui.app.version }));
+        toast(t("upToDate", { version: ui.app.version }), "info");
       }
     } catch (error) {
       fail(error);
@@ -1465,43 +1706,169 @@ async function renderSettings(target) {
     }
   });
 
+  // The daemon's own settings are shown, never changed here: a value, not a switch that does nothing
   const cfg = daemon.config ?? {};
-  const ro = (label, on, extra) => h("div", { class: "field" }, h("span", { class: "grow" }, label), extra, toggle(on, null, true));
+  const ro = (label, on) => row(label, null, h("span", { class: `set-value${on ? " on" : ""}` }, t(on ? "setOn" : "setOff")));
 
-  target.replaceChildren(h("div", { class: "view" },
-    h("div", { class: "title" }, h("div", { class: "grow" }, h("h1", { class: "display" }, t("settings")), h("div", { class: "bar" }))),
-    h("div", { class: "cards" },
-      h("div", { class: "card chunk" },
-        h("span", { class: "label" }, t("registered")),
-        games,
-        h("div", { class: "form" },
-          placeInput, nameInput,
-          h("div", { class: "wide row" }, choose, folderLabel),
-          h("div", { class: "wide row" }, h("span", { class: "grow" }), save))),
-      h("div", { style: "display:flex;flex-direction:column;gap:16px" },
-        h("div", { class: "card chunk" },
-          h("span", { class: "label" }, t("hub")),
-          h("div", { class: "field" }, h("span", { class: "grow" }, t("language")), h("span", { class: "seg" }, lang("en", "English"), lang("pt", "Português"))),
-          h("div", { class: "field" }, h("span", { class: "grow" }, t("startWin")), autostartToggle),
-          h("div", { class: "field" }, h("span", { class: "grow" }, t("notify")), notifyToggle),
-          h("div", { class: "field" }, h("span", { class: "grow" }, t("editorSetting"), h("span", { class: "hint" }, t("editorHint"))), editorSelect),
-          h("div", { class: "field" }, h("span", { class: "grow" }, t("version")),
-            h("span", { class: "mono muted", title: `hub ${s?.build ?? "?"}` }, `${ui.app.version}${ui.app.build ? ` · ${ui.app.build}` : ""}`),
-            checkUpdate),
-          h("div", { class: "field" }, h("span", { class: "grow" }, t("pluginVersion"), h("span", { class: "hint" }, t("pluginVersionHint"))),
-            h("span", { class: "mono muted" }, pluginVersion ?? t("pluginVersionUnknown")))),
-        aiCard(ai),
-        automationCard(automation),
-        queueCard(queueSettings),
-        mcpCard(),
-        cloudCard(),
-        h("div", { class: "card chunk" },
-          h("span", { class: "label" }, t("daemonSettings")),
-          ro(t("mergeCrossed"), cfg.merge?.enabled !== false),
-          ro(t("deleteOrphans"), !!cfg.deleteOrphansOnConnect),
-          h("p", { class: "note" }, t("sharedConfig", { path: daemon.path })))))));
-  if (ui.register) placeInput.focus();
+  const automationSection = automationCard(automation);
+  automationSection.classList.add("set-group");
+  const sections = Object.entries({
+    general: h("div", { class: "card set-group" },
+      setHead(t("setGeneral")),
+      row(t("language"), null, h("span", { class: "seg" }, lang("en", "English"), lang("pt", "Português"))),
+      row(t("startWin"), null, autostartToggle),
+      row(t("notify"), null, notifyToggle),
+      row(t("editorSetting"), { short: t("editorHintShort"), long: t("editorHint") }, editorSelect)),
+    games: h("div", { class: "card set-group" },
+      setHead(t("registered")),
+      games,
+      form),
+    connect: mcpCard(),
+    ai: aiCard(ai),
+    auto: automationSection,
+    cloud: cloudCard(),
+    queue: queueCard(queueSettings),
+    daemon: h("div", { class: "card set-group" },
+      setHead(t("daemonSettings"), h("span", { class: "pill" }, t("setReadOnly"))),
+      ro(t("mergeCrossed"), cfg.merge?.enabled !== false),
+      ro(t("deleteOrphans"), !!cfg.deleteOrphansOnConnect),
+      h("p", { class: "note set-path" }, t("sharedConfig", { path: daemon.path }))),
+    about: h("div", { class: "card set-group" },
+      setHead(t("setAbout")),
+      row(t("version"), null, h("span", { class: "mono muted", title: `hub ${s?.build ?? "?"}` }, `${ui.app.version}${ui.app.build ? ` · ${ui.app.build}` : ""}`), checkUpdate),
+      row(t("hub"), t("setHubBuild"), h("span", { class: "mono muted" }, s?.build ?? "?")),
+      row(t("pluginVersion"), { short: t("pluginHintShort"), long: t("pluginVersionHint") }, h("span", { class: "mono muted" }, pluginVersion ?? t("pluginVersionUnknown")))),
+  });
+  for (const [id, node] of sections) {
+    node.id = `set-${id}`;
+    node.dataset.sec = id;
+  }
+
+  // The index: a click scrolls to its section; scrolling lights the section being read
+  const list = h("div", { class: "set-list scroll" });
+  const indexButtons = new Map();
+  let clicked = null;
+  const rem = () => parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+  const lit = () => {
+    const box = list.getBoundingClientRect();
+    const shown = sections.filter(([, node]) => !node.classList.contains("hidden"));
+    // The last section whose top came within a few lines of the list's top
+    let at = shown[0]?.[0] ?? null;
+    for (const [id, node] of shown) if (node.getBoundingClientRect().top <= box.top + 6 * rem()) at = id;
+    // The section clicked stays lit, on its way and once there, until the reader scrolls on their
+    // own: a short one near the end never reaches the top, the list stops scrolling first
+    if (clicked && !document.getElementById(`set-${clicked}`)?.classList.contains("hidden")) at = clicked;
+    for (const [id, button] of indexButtons) {
+      button.classList.toggle("on", id === at);
+      if (id === at) button.setAttribute("aria-current", "true");
+      else button.removeAttribute("aria-current");
+    }
+  };
+  const go = (id) => {
+    const node = document.getElementById(`set-${id}`);
+    if (!node) return;
+    clicked = id;
+    const top = node.getBoundingClientRect().top - list.getBoundingClientRect().top + list.scrollTop;
+    list.scrollTo({ top, behavior: "smooth" });
+    lit();
+  };
+  const index = h("nav", { class: "set-index", "aria-label": t("setSections") }, SETTINGS_SECTIONS.map(([id, key]) => {
+    const button = h("button", { class: "press", "data-sec": id, onclick: () => go(id) }, t(key));
+    indexButtons.set(id, button);
+    return button;
+  }));
+  list.addEventListener("scroll", lit, { passive: true });
+  // The reader's own scroll (wheel, the bar, keys) hands the index back to the position
+  const own = () => {
+    clicked = null;
+  };
+  for (const type of ["wheel", "pointerdown", "keydown", "touchstart"]) list.addEventListener(type, own, { passive: true });
+
+  // Settings opened fresh (no page of it on screen) starts with no search, and so does a call to
+  // add a game (the sidebar's + Add folder, a refused Studio): the form must not be filtered away.
+  // That call is used once: the redraws after it keep the reader's place
+  const before = target.querySelector(".set-list");
+  const adding = ui.registerOpen === true;
+  ui.registerOpen = false;
+  if (!before || adding) ui.setSearch = "";
+
+  // The search: rows whose words do not match hide, and so does a section left with none. A match
+  // in a section's heading (or its long note) keeps the whole section
+  const search = h("input", { class: "field-input set-q", placeholder: t("setSearch"), "aria-label": t("setSearch"), spellcheck: "false", autocomplete: "off", value: ui.setSearch ?? "" });
+  const emptyTitle = h("strong", {});
+  const empty = h("div", { class: "empty set-empty hidden" }, emptyTitle, t("setNoMatchHint"));
+  const filter = () => {
+    ui.setSearch = search.value;
+    const query = fold(search.value.trim());
+    let any = false;
+    for (const [id, node] of sections) {
+      const head = node.querySelector(":scope > .set-head, :scope > .label");
+      const whole = !query || (head && searchText(head).includes(query));
+      let shown = whole;
+      let first = true;
+      for (const unit of searchUnits(node)) {
+        const hit = whole || searchText(unit).includes(query);
+        unit.classList.toggle("set-miss", !hit);
+        // The first row left under the heading drops its hairline, as the first row always does
+        unit.classList.toggle("set-first", hit && first);
+        if (hit) first = false;
+        shown ||= hit;
+      }
+      node.classList.toggle("hidden", !shown);
+      indexButtons.get(id).classList.toggle("set-out", !shown);
+      any ||= shown;
+    }
+    emptyTitle.textContent = t("setNoMatch", { q: search.value.trim() });
+    empty.classList.toggle("hidden", any);
+    lit();
+  };
+  search.addEventListener("input", filter);
+  search.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && search.value) {
+      event.preventDefault();
+      search.value = "";
+      filter();
+    }
+  });
+  list.append(...sections.map(([, node]) => node), empty);
+  // Rows that arrive later (the AIs found, the Open Cloud file) go through the search too
+  const late = new MutationObserver(filter);
+  for (const [, node] of sections) late.observe(node, { childList: true, subtree: true, characterData: true });
+
+  // A redraw (a switch, the language, a game added) keeps the place in the page and the search
+  const scrolled = adding ? 0 : before?.scrollTop ?? 0;
+  const typing = !adding && document.activeElement?.classList.contains("set-q");
+  const caret = typing ? [document.activeElement.selectionStart, document.activeElement.selectionEnd] : null;
+  target.replaceChildren(h("div", { class: "set-view" },
+    h("div", { class: "title set-title" },
+      h("h1", { class: "display grow" }, t("settings")),
+      h("label", { class: "search-field" }, h("span", { class: "ico i-search" }), search)),
+    h("div", { class: "set-body" }, index, list)));
+  filter();
+  list.scrollTop = scrolled;
+  if (adding) {
+    // The form whole in view, its first field ready to type in
+    const below = form.getBoundingClientRect().bottom + 0.75 * rem() - list.getBoundingClientRect().bottom;
+    if (below > 0) list.scrollTop += below;
+    clicked = "games";
+    placeInput.focus({ preventScroll: true });
+  }
+  lit();
+  if (typing) {
+    search.focus();
+    search.setSelectionRange(...caret);
+  }
 }
+
+// Ctrl+F in Settings goes to its search
+addEventListener("keydown", (event) => {
+  if (ui.view !== "settings" || !event.ctrlKey || event.key.toLowerCase() !== "f") return;
+  const search = document.querySelector(".set-q");
+  if (!search) return;
+  event.preventDefault();
+  search.focus();
+  search.select();
+});
 
 // ---------- Navigation ----------
 
@@ -1526,11 +1893,12 @@ const QUEUE_FIELDS = [
 ];
 
 function queueCard(settings) {
-  const card = h("div", { class: "card chunk" }, h("span", { class: "label" }, t("queueCard")));
+  const card = h("div", { class: "card set-group" }, setHead(t("queueCard")));
   if (!settings) {
-    card.append(h("p", { class: "note" }, t("error", { e: "the hub has no Studio queue" })));
+    card.append(h("p", { class: "note bad" }, t("error", { e: "the hub has no Studio queue" })));
     return card;
   }
+  card.append(h("p", { class: "note set-lead" }, t("queueNote")));
   const save = (patch) =>
     api.post("/api/queue/settings", { settings: patch }).then(() => {
       toast(t("qsSaved"));
@@ -1538,8 +1906,9 @@ function queueCard(settings) {
       renderContent();
     }).catch(fail);
   for (const [key, label] of knownFields(QUEUE_FIELDS, settings)) {
-    const list = key === "infraWaitSec";
-    const input = h("input", { class: "field-input mono", style: "width:96px;text-align:right", value: list ? settings[key].join(", ") : String(settings[key]), inputmode: "decimal", "aria-label": t(label) });
+    // An older hub may send one number here, not a list: shown as it is, never a broken card
+    const list = key === "infraWaitSec" && Array.isArray(settings[key]);
+    const input = h("input", { class: "field-input mono set-num", value: list ? settings[key].join(", ") : String(settings[key] ?? ""), inputmode: "decimal", "aria-label": t(label) });
     input.addEventListener("change", () => {
       const raw = input.value.trim();
       const value = list ? raw.split(/[,\s]+/).filter(Boolean).map(Number) : Number(raw);
@@ -1549,10 +1918,8 @@ function queueCard(settings) {
   }
   const pick = (value, label) => h("button", { class: settings.sharedRetry === value ? "on" : "", onclick: () => save({ sharedRetry: value }) }, t(label));
   card.append(h("div", { class: "field" }, h("span", { class: "grow" }, t("qsSharedRetry")), h("span", { class: "seg" }, pick("all", "qsSharedAll"), pick("foreign", "qsSharedForeign"))));
-  card.append(h("p", { class: "note" }, t("queueNote")));
   return card;
 }
-
 
 function show(view, conflictId = null) {
   ui.view = view;
@@ -1567,6 +1934,8 @@ function select(placeId, view = "output") {
 
 function openRegister(refusal) {
   ui.register = refusal ? { placeId: refusal.placeId, placeName: refusal.placeName } : null;
+  // Settings scrolls to the form and focuses it once, for this call (renderSettings)
+  ui.registerOpen = true;
   contentKey = "";
   show("settings");
 }
@@ -1625,7 +1994,7 @@ async function renderSetup(choice) {
     optionNodes.forEach((n, i) => n.classList.toggle("on", i === index));
     newRow.classList.toggle("hidden", options[index].kind !== "new");
   }
-  const choose = h("button", { class: "btn dark chunk press" }, t("chooseFolder"));
+  const choose = h("button", { class: "btn press" }, t("chooseFolder"));
   choose.addEventListener("click", async () => {
     const picked = await invoke("pick_folder");
     if (picked) {
@@ -1633,7 +2002,7 @@ async function renderSetup(choice) {
       options[options.length - 1].folder = picked;
     }
   });
-  const newRow = h("div", { class: "row" }, h("div", { class: "grow" }, newInput), choose);
+  const newRow = h("div", { class: "setup-new" }, h("div", { class: "grow" }, newInput), choose);
 
   let dialog;
   const go = h("button", { class: "btn yellow chunk-bright press" }, t("setupGo"));
@@ -1649,7 +2018,7 @@ async function renderSetup(choice) {
       fail(error);
     }
   });
-  const cancel = h("button", { class: "btn dark chunk press" }, t("cancel"));
+  const cancel = h("button", { class: "btn ghost press" }, t("cancel"));
   cancel.addEventListener("click", async () => {
     try {
       await api.post("/api/choice", { id: choice.id, decision: "cancel" });
@@ -1662,17 +2031,18 @@ async function renderSetup(choice) {
 
   dialog = h("div", { id: "choice", class: "overlay" },
     h("div", { class: "card chunk dialog", role: "dialog", "aria-modal": "true" },
-      h("span", { class: "label" }, t("setupLabel")),
-      h("h2", { class: "display" }, place),
-      h("div", { class: "bar" }),
-      h("p", { class: "mono muted" }, `place ${choice.placeId}`),
+      h("div", { class: "dlg-head" },
+        h("div", { class: "grow" },
+          h("span", { class: "label" }, t("setupLabel")),
+          h("h2", { class: "display" }, place),
+          h("span", { class: "mono" }, `place ${choice.placeId}`))),
       h("p", {}, found.existing.length ? t("setupFound", { n: found.existing.length }) : t("setupNoneFound")),
       h("div", { class: "setup-options" }, optionNodes),
       newRow,
-      h("div", { class: "actions" }, cancel, h("span", { class: "grow" }), go),
-      h("p", { class: "note" }, t("setupNote"))));
+      h("div", { class: "dlg-foot" }, h("p", { class: "dlg-hint" }, t("setupNote")), cancel, go)));
   document.getElementById("choice")?.remove();
   document.body.append(dialog);
+  popIn(dialog.firstChild);
   select(0);
   go.focus();
 }
@@ -1722,10 +2092,11 @@ function renderChoice() {
   const take = option("take", t("takeOver"), folderCase ? t("takeEffectFolder", { place }) : t("takeEffectStudio"), decide("continue"));
 
   dialog = h("div", { id: "choice", class: "overlay" },
-    h("div", { class: "card chunk dialog", role: "alertdialog", "aria-modal": "true" },
-      h("span", { class: "label" }, t("oneConnection")),
-      h("h2", { class: "display" }, folderCase ? t("choiceFolderTitle") : t("choiceStudioTitle")),
-      h("div", { class: "bar" }),
+    h("div", { class: "card chunk dialog wide", role: "alertdialog", "aria-modal": "true" },
+      h("div", { class: "dlg-head" },
+        h("div", { class: "grow" },
+          h("span", { class: "label" }, t("oneConnection")),
+          h("h2", { class: "display" }, folderCase ? t("choiceFolderTitle") : t("choiceStudioTitle")))),
       h("div", { class: "parties" },
         party(t("wantsIn"), "new", place, `place ${choice.placeId}`, "warn"),
         h("span", { class: "arrow" }, "→"),
@@ -1736,8 +2107,9 @@ function renderChoice() {
         h("span", { class: "arrow" }, "←"),
         party(t("syncingNow"), "current", current.title, current.detail, "live")),
       h("div", { class: "options" }, keep, take),
-      h("p", { class: "note" }, t("choiceWaiting"))));
+      h("p", { class: "note center" }, t("choiceWaiting"))));
   document.body.append(dialog);
+  popIn(dialog.firstChild);
   keep.focus();
 }
 
@@ -1798,13 +2170,13 @@ function renderApproval() {
     toast(t("approvalSent"));
   };
   const refuse = h("button", { class: "btn yellow chunk-bright press", onclick: answer(false) }, t("approvalRefuse"));
-  const accept = h("button", { class: "btn dark chunk press danger", onclick: answer(true) }, t("approvalAccept"));
+  const accept = h("button", { class: "btn danger press", onclick: answer(true) }, t("approvalAccept"));
   refuse.disabled = accept.disabled = !answerable;
   approvalEscape = answer(false);
 
   const text = h("textarea", { class: "approval-text mono", readonly: true, spellcheck: "false", "aria-label": approval.title });
   text.value = approval.text;
-  const expires = h("p", { class: "note" });
+  const expires = h("p", { class: "dlg-hint" });
   const tick = () => {
     expires.textContent = t("approvalExpires", { time: countdown(approval.expiresAt - Date.now()) });
   };
@@ -1812,15 +2184,19 @@ function renderApproval() {
   approvalTimer = setInterval(tick, 1000);
 
   dialog = h("div", { id: "approval", class: "overlay" },
-    h("div", { class: "card chunk dialog", role: "alertdialog", "aria-modal": "true", "aria-labelledby": "approvalTitle" },
-      h("span", { class: "label" }, t("approvalLabel")),
-      h("h2", { class: "display approval-title", id: "approvalTitle" }, approval.title),
+    h("div", { class: "card chunk dialog approval", role: "alertdialog", "aria-modal": "true", "aria-labelledby": "approvalTitle" },
+      h("div", { class: "dlg-head" },
+        h("span", { class: "slot lg warn", "aria-hidden": "true" }, h("span", { class: "ico i-alert" })),
+        h("div", { class: "grow" },
+          h("span", { class: "label" }, t("approvalLabel")),
+          h("h2", { class: "display approval-title", id: "approvalTitle" }, approval.title))),
       h("p", { class: "note approval-ask" }, t("approvalAsk")),
       text,
       answerable ? null : h("p", { class: "note bad" }, t("approvalCannotAnswer")),
-      h("div", { class: "actions" }, h("span", { class: "grow" }), accept, refuse),
-      expires));
+      // The countdown on the left; Accept, then Refuse (the default) at the end
+      h("div", { class: "dlg-foot" }, expires, accept, refuse)));
   document.body.append(dialog);
+  popIn(dialog.firstChild);
   refuse.focus();
 }
 

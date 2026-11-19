@@ -1,0 +1,229 @@
+/*
+  The shared controls, used by every view, dialog and the tray. Owner: the shared layer: no view
+  group edits this file. A view that needs a control to look different restyles it under its own
+  scope in its own file (".queue .card { ... }"); a control two groups need is asked for here.
+  Sizes are rem (base.css: 1rem grows with the window). Brand colour only on .btn.yellow (one per
+  screen: its main action) and on the main state of a screen; everything else is neutral.
+  A sample of every control: app/harness/controls.html (harness shots "controls", "controls-1920").
+
+  Buttons (pills, 2.25rem tall, never stretched: put them in .actions or a .row, not a grid cell)
+    .btn              neutral (the default)          .btn.dark   the same neutral, older name
+    .btn.yellow       the screen's one main action    .btn.light  a strong neutral (a notice's action)
+    .btn.ghost        quiet: no fill until hover      .btn.danger destroys or removes something
+    .btn.sm           1.875rem tall                   .btn.icon   square, for one glyph or .ico (.btn.more: the same)
+    .btn.danger.armed a danger button after its first click: filled red, the second click does it
+    .chev             the › or ‹ inside a button that goes somewhere
+    .split            a button and its ▾ (.btn.more) side by side
+    .press            the click squeeze, for any clickable element
+  Fields
+    .field-input      text input, textarea or select (select gets its own chevron)
+    .tog / .tog.off / .tog.ro   switch, on is white (neutral), off is grey, ro is read-only
+    .seg > button(.on)          segmented choice, one lit
+    .chip(.on)                  a filter or a pick among many; on is white
+    input.checkbox              a tick box, white when ticked     .radio(.on) or .on > .radio   a round pick
+    .search-field > .ico.i-search + .field-input                  a search, its glass inside the pill
+  Labels and states
+    .pill             a small neutral label         .pill.strong  neutral, in full text colour (a level, a tag)
+    .pill.live / .warn / .bad / .sky                a state, in its colour
+    .pill.brand       the screen's main state only  .pill.mono    a number or an id
+    .dot(.live/.warn/.bad)                          a state dot (.live pulses)
+    .slot(.lg)(.live/.warn/.bad/.sky)              a square sign: an .ico or a short number, in a state's colour
+    .label            small caps heading            .note(.bad)   a muted line under a control
+  Blocks
+    .title > h1.display (+ .grow, a .pill or .actions beside it)      a view's title
+    .view             a view's scrolling column     .scroll       any scrolling area with a gutter
+    .cards > .card    two columns of cards          .card > .label  a card's heading
+    .card > .field    a row of a card: text (.grow, .hint under it) and its control at the end
+    .list > .lrow     a list's row: hover lit, hairline between rows (.lrow.sel: picked)
+    .place            a game: name in b, id or folder in .mono
+    .panel > .panel-top + content       a darker well (a log, a list of findings)
+    .actions          a row of buttons that wraps   .ico          a square mask icon in currentColor
+    .ico.i-lock / i-unlock / i-run / i-play / i-check / i-cross / i-alert / i-up / i-folder / i-search / i-info, .ico.sliders
+    .empty > (.slot) strong + text      main.js emptyState(): nothing to show yet
+    .game             a game's line (tray; the sidebar restyles it in shell.css)
+    .brand > .mark + .word              the logo lockup
+*/
+
+/* .chunk and .chunk-bright were the portfolio's thick outline and hard shadow; the views still
+   carry them and they draw nothing now. .press is the click feedback: a small squeeze */
+.press { cursor: pointer; transition: transform var(--t-fast) var(--ease), background-color var(--t-fast), color var(--t-fast), filter var(--t-fast); }
+.press:active { transform: scale(0.97); }
+
+/* ---------- Buttons ---------- */
+button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+button:disabled { cursor: default; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 0.5rem; height: 2.25rem; padding: 0 1.125rem; border-radius: var(--r-pill);
+  font-size: 0.8125rem; font-weight: 650; white-space: nowrap; background: var(--surface-2); color: var(--text);
+  transition: transform var(--t-fast) var(--ease), background-color var(--t-fast), color var(--t-fast), filter var(--t-fast); }
+.btn:hover { background: var(--surface-3); }
+.btn:active { transform: scale(0.97); }
+/* The main action: the one brand-coloured button of a screen */
+.btn.yellow { background: linear-gradient(180deg, var(--brand-400), var(--brand-500)); color: var(--brand-ink); }
+.btn.yellow:hover { background: linear-gradient(180deg, var(--brand-400), var(--brand-500)); filter: brightness(1.07); }
+.btn.dark { background: var(--surface-2); color: var(--text); }
+.btn.dark:hover { background: var(--surface-3); }
+/* Quackify's primary: white on the dark, for an action that matters but is not the screen's main one */
+.btn.light { background: var(--text); color: #111114; }
+.btn.light:hover { background: var(--text); filter: brightness(0.92); }
+.btn.ghost { background: transparent; color: var(--text-soft); }
+.btn.ghost:hover { background: var(--surface-2); color: var(--text); }
+/* Red text at rest, a red wash on hover: it reads as destructive before the pointer gets there */
+.btn.danger { color: var(--bad-soft); }
+.btn.danger:hover { color: var(--bad-soft); background: color-mix(in srgb, var(--bad) 16%, transparent); }
+/* A danger button armed by its first click (the second one does it): filled red, so the second
+   click reads as the real one */
+.btn.danger.armed, .btn.danger.armed:hover { background: var(--bad); color: #1a0606; }
+.btn.sm { height: 1.875rem; padding: 0 0.875rem; font-size: 0.78125rem; }
+.btn.icon { width: 2.25rem; padding: 0; }
+.btn.sm.icon { width: 1.875rem; }
+.btn:disabled { opacity: .45; pointer-events: none; }
+/* "Open in …" and its ▾, the list of the other editors found */
+.split { display: inline-flex; gap: 0.375rem; }
+.btn.more { width: 2.25rem; padding: 0; }
+
+/* ---------- Labels and states ---------- */
+.pill { display: inline-flex; align-items: center; gap: 0.4375rem; height: 1.625rem; padding: 0 0.6875rem; border-radius: var(--r-pill); background: var(--surface-1);
+  border: 1px solid var(--line); font-size: 0.75rem; font-weight: 600; white-space: nowrap; color: var(--muted); }
+.pill.strong { color: var(--text); background: var(--surface-2); }
+.pill.live { color: var(--live); background: color-mix(in srgb, var(--live) 12%, transparent); border-color: color-mix(in srgb, var(--live) 22%, transparent); }
+.pill.warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); border-color: color-mix(in srgb, var(--warn) 22%, transparent); }
+.pill.bad { color: var(--bad-soft); background: color-mix(in srgb, var(--bad) 12%, transparent); border-color: color-mix(in srgb, var(--bad) 22%, transparent); }
+.pill.brand { color: var(--brand-400); background: color-mix(in srgb, var(--brand-400) 10%, transparent); border-color: color-mix(in srgb, var(--brand-400) 20%, transparent); }
+.pill.sky { color: var(--sky); background: color-mix(in srgb, var(--sky) 12%, transparent); border-color: color-mix(in srgb, var(--sky) 22%, transparent); }
+.pill.mono { font-family: var(--mono); font-size: 0.71875rem; font-weight: 500; letter-spacing: 0; }
+button.pill { cursor: pointer; transition: filter var(--t-fast); }
+button.pill:hover { filter: brightness(1.2); }
+.dot { position: relative; width: 0.5rem; height: 0.5rem; border-radius: 50%; flex: none; background: var(--faint); }
+.dot.live { background: var(--live); }
+/* The pulse is a ring that grows and fades: transform and opacity only, so the compositor runs
+   it without repainting the page each frame (box-shadow did, 0.7 of a core with the window
+   hidden, 12/11/26) */
+.dot.live::after { content: ""; position: absolute; inset: 0; border-radius: 50%; background: rgba(41,211,154,.55); animation: pulse 2.4s ease-out infinite; pointer-events: none; }
+.dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+@keyframes pulse { 0% { transform: scale(1); opacity: 1; } 70%,100% { transform: scale(2.5); opacity: 0; } }
+/* No focus (idle.js): every animation stops where it is */
+body.idle *, body.idle *::before, body.idle *::after { animation-play-state: paused !important; }
+
+/* A square slot for a glyph (.ico.i-*) or a short number, tinted by its state: a row's lead, a
+   game's folder, a dialog's sign. .lg for a block's one big sign */
+.slot { flex: none; display: inline-grid; place-items: center; width: 2rem; height: 2rem; border-radius: var(--r-sm);
+  background: var(--surface-2); color: var(--text-soft); font-family: var(--mono); font-size: 0.75rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.slot.lg { width: 2.75rem; height: 2.75rem; border-radius: var(--r-md); }
+.slot.lg .ico { width: 1.25rem; height: 1.25rem; }
+.slot.live { color: var(--live); background: color-mix(in srgb, var(--live) 14%, transparent); }
+.slot.warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
+.slot.bad { color: var(--bad-soft); background: color-mix(in srgb, var(--bad) 16%, transparent); }
+.slot.sky { color: var(--sky); background: color-mix(in srgb, var(--sky) 14%, transparent); }
+/* The "›" or "‹" beside a label that says a button goes somewhere */
+.chev { font-size: 1rem; line-height: 1; margin-top: -0.0625rem; }
+
+/* A game, in the tray's list (the sidebar's look is in shell.css) */
+.game { display: flex; align-items: center; gap: 0.625rem; width: 100%; min-height: 2.625rem; padding: 0 0.875rem; border-radius: var(--r-md); background: var(--surface-1);
+  text-align: left; color: var(--text); transition: background-color var(--t-fast), color var(--t-fast); }
+.game:hover { background: var(--surface-2); }
+.game b { font-size: 0.84375rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.game small { font-size: 0.75rem; color: var(--muted); white-space: nowrap; }
+.game.sel { background: var(--surface-3); }
+
+/* ---------- Fields ---------- */
+/* On is white with a dark knob, as Quackify's: the brand stays for the screen's main action */
+.tog { width: 2.5rem; height: 1.5rem; border-radius: var(--r-pill); background: var(--text); position: relative; flex: none; cursor: pointer; transition: background-color var(--t-fast); }
+.tog::after { content: ""; position: absolute; top: 0.25rem; right: 0.25rem; width: 1rem; height: 1rem; border-radius: 50%; background: var(--bg); transition: transform .22s var(--ease), background-color var(--t-fast); }
+.tog.off { background: var(--surface-3); } .tog.off::after { transform: translateX(-1rem); background: var(--muted); }
+.tog.ro { cursor: default; opacity: .6; }
+
+.seg { display: inline-flex; padding: 0.1875rem; gap: 0.125rem; border-radius: var(--r-pill); background: var(--surface-1); border: 1px solid var(--line); }
+.seg button { height: 1.75rem; padding: 0 0.875rem; border-radius: var(--r-pill); font-size: 0.78125rem; font-weight: 600; color: var(--muted); transition: background-color var(--t-fast), color var(--t-fast); }
+.seg button:hover { color: var(--text); }
+.seg button.on { background: var(--surface-3); color: var(--text); }
+
+.chip { display: inline-flex; align-items: center; gap: 0.375rem; height: 1.875rem; padding: 0 0.875rem; border-radius: var(--r-pill); background: var(--surface-2);
+  font-size: 0.78125rem; font-weight: 600; color: var(--text-soft); white-space: nowrap; transition: background-color var(--t-fast), color var(--t-fast); }
+.chip:hover { background: var(--surface-3); color: var(--text); }
+.chip.on { background: var(--text); color: #111114; }
+
+.field-input { font: inherit; font-size: 0.8125rem; color: var(--text); background: var(--surface-1); border: 1px solid var(--line-strong); border-radius: 0.625rem; height: 2.25rem; padding: 0 0.75rem; outline: none; min-width: 0; transition: border-color var(--t-fast), background-color var(--t-fast); }
+.field-input:focus { border-color: color-mix(in srgb, var(--text) 45%, transparent); background: var(--surface-2); }
+.field-input::placeholder { color: var(--faint); }
+/* A search: a pill field with its glass inside, the glass lit while typing */
+.search-field { position: relative; display: flex; align-items: center; width: 17.5rem; max-width: 100%; }
+.search-field .ico { position: absolute; left: 0.875rem; width: 0.875rem; height: 0.875rem; color: var(--muted); pointer-events: none; }
+.search-field .field-input { width: 100%; padding-left: 2.25rem; border-radius: var(--r-pill); }
+.search-field:focus-within .ico { color: var(--text); }
+/* A tick box and a round pick, neutral: white when on, never the brand */
+input.checkbox { appearance: none; -webkit-appearance: none; margin: 0; width: 1.125rem; height: 1.125rem; flex: none; border-radius: 0.3125rem; border: 1.5px solid var(--muted);
+  background: transparent center / 0.75rem no-repeat; cursor: pointer; transition: background-color var(--t-fast), border-color var(--t-fast); }
+input.checkbox:checked { background-color: var(--text); border-color: var(--text);
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23111114' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'><path d='M3.5 8.5l3 3 6-7'/></svg>"); }
+input.checkbox:focus-visible { outline: 2px solid color-mix(in srgb, var(--text) 60%, transparent); outline-offset: 2px; }
+.radio { width: 1.125rem; height: 1.125rem; border-radius: 50%; border: 1.5px solid var(--muted); flex: none; transition: border-color var(--t-fast); }
+.radio.on, .on > .radio { border-color: var(--text); background: radial-gradient(circle, var(--text) 0 38%, transparent 42%); }
+/* font: inherit above would undo .mono (base.css) on an id or a number */
+.field-input.mono { font-family: var(--mono); font-size: 0.75rem; }
+textarea.field-input { height: auto; min-height: 5rem; padding: 0.5rem 0.75rem; line-height: 1.5; resize: vertical; }
+select.field-input { cursor: pointer; max-width: 16.25rem; appearance: none; padding-right: 2.25rem;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%239a978f' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'><path d='M3 4.5l3 3 3-3'/></svg>");
+  background-repeat: no-repeat; background-position: right 0.75rem center; background-size: 0.75rem; }
+select.field-input option { background: #16161c; }
+
+/* ---------- The logo and icons ---------- */
+/* The name as the logo's lockup: the mark (logo.svg, written by app/scripts/icons.mjs) and the word
+   in Fredoka with the gold gradient and its drop shadow. Figma's white top light on the letters has
+   no CSS form on clipped text, so it is left out */
+.word { font-family: var(--logo); font-weight: 700; line-height: 1; background: linear-gradient(var(--word-1), var(--word-2) 45%, var(--word-3));
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; filter: drop-shadow(0 0.125rem 0.1875rem rgba(0, 0, 0, .7)); }
+.brand { display: inline-flex; align-items: center; gap: 0.625rem; flex: none; }
+.brand .mark { width: 2rem; height: 2rem; flex: none; background: url(logo.svg) center / contain no-repeat; }
+html.dev .brand .mark { background-image: url(logo-dev.svg); }
+.brand .word { font-size: 1.5rem; padding-bottom: 0.125rem; }
+.ico { width: 1rem; height: 1rem; flex: none; background: currentColor; -webkit-mask: var(--ico) center / contain no-repeat; mask: var(--ico) center / contain no-repeat; }
+.ico.i-lock { --ico: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'><rect x='3.25' y='7' width='9.5' height='6.75' rx='1.75'/><path d='M5.5 7V5.25a2.5 2.5 0 0 1 5 0V7'/></svg>"); }
+.ico.i-unlock { --ico: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'><rect x='3.25' y='7' width='9.5' height='6.75' rx='1.75'/><path d='M5.5 7V5.25a2.5 2.5 0 0 1 4.85-.85'/></svg>"); }
+.ico.i-run { --ico: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='3.75' fill='black'/></svg>"); }
+.ico.i-play { --ico: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M5.25 3.6v8.8a.6.6 0 0 0 .9.5l6.9-4.4a.6.6 0 0 0 0-1L6.15 3.1a.6.6 0 0 0-.9.5z' fill='black'/></svg>"); }
+.ico.i-check { --ico: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M3.5 8.5l3 3 6-6.5'/></svg>"); }
+.ico.i-cross { --ico: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'><path d='M4.75 4.75l6.5 6.5M11.25 4.75l-6.5 6.5'/></svg>"); }
+.ico.i-alert { --ico: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M8 3.25v5.75' stroke='black' stroke-width='2.1' stroke-linecap='round'/><circle cx='8' cy='12.5' r='1.25' fill='black'/></svg>"); }
+.ico.i-up { --ico: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M8 12.75V3.75M4.5 7.25L8 3.75l3.5 3.5'/></svg>"); }
+.ico.i-folder { --ico: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.6' stroke-linejoin='round'><path d='M2.25 4.75c0-.83.67-1.5 1.5-1.5h2.6l1.5 1.5h4.4c.83 0 1.5.67 1.5 1.5v5.5c0 .83-.67 1.5-1.5 1.5h-8.5c-.83 0-1.5-.67-1.5-1.5z'/></svg>"); }
+.ico.i-search { --ico: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.7' stroke-linecap='round'><circle cx='7' cy='7' r='4.6'/><path d='M10.4 10.4L14 14'/></svg>"); }
+.ico.i-info { --ico: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round'><circle cx='8' cy='8' r='6.3'/><path d='M8 7.3v4'/><circle cx='8' cy='4.8' r='0.5' fill='black' stroke='none'/></svg>"); }
+.ico.sliders { --ico: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round'><path d='M2 4h6.5M13.5 4H14M2 8h1.5M8.5 8H14M2 12h8M14 12h0'/><circle cx='11' cy='4' r='1.8'/><circle cx='6' cy='8' r='1.8'/><circle cx='12' cy='12' r='1.8'/></svg>"); }
+
+/* ---------- Blocks ---------- */
+/* A darker well inside the glass: the log, a list of findings */
+.panel { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; border-radius: var(--r-md); background: var(--well); border: 1px solid var(--line); }
+.panel-top { display: flex; align-items: center; gap: 0.625rem; padding: 0.75rem 0.875rem 0.5rem 1rem; }
+.empty { padding: 1.75rem 1rem; color: var(--muted); text-align: center; line-height: 1.6; }
+.empty strong { display: block; margin-bottom: 0.25rem; font-family: var(--display); font-size: 1rem; font-weight: 700; color: var(--text); }
+.title { display: flex; align-items: flex-start; gap: 0.75rem; flex-wrap: wrap; }
+.title h1 { margin: 0; font-size: 1.625rem; line-height: 1.15; overflow-wrap: anywhere; }
+/* The portfolio's underline under a title: gone from the look, still in some views' markup */
+.bar { display: none; }
+
+.list { flex: 1; overflow: auto; padding: 0 0.75rem 0.625rem; }
+.lrow { display: flex; align-items: center; gap: 0.75rem; min-height: 2.75rem; padding: 0.5rem 0.625rem; border-top: 1px solid var(--line); border-radius: var(--r-sm);
+  color: var(--text-soft); transition: background-color var(--t-fast); }
+.lrow:first-child { border-top-color: transparent; }
+/* The row's text gives way with an ellipsis; its pills, times and buttons keep their size */
+.lrow > .grow { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lrow > :not(.grow) { flex: none; }
+.lrow:hover { background: var(--surface-1); }
+.lrow.sel { background: var(--surface-2); color: var(--text); }
+.view { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 1rem; padding-right: 0.25rem; }
+/* Room between the content and the scrollbar, kept when the bar is not there */
+.scroll { overflow: auto; scrollbar-gutter: stable; padding-right: 0.25rem; }
+.actions { display: flex; gap: 0.625rem; flex-wrap: wrap; align-items: center; }
+
+.cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.875rem; align-items: start; }
+.card { background: var(--surface-1); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 1rem 1.125rem; }
+.card > .label { display: block; margin-bottom: 0.5rem; }
+.field { display: flex; align-items: center; gap: 0.75rem; padding: 0.6875rem 0; border-top: 1px solid var(--line); color: var(--text); font-weight: 600; font-size: 0.8125rem; }
+.card > .field:first-of-type { border-top: 0; }
+.field .hint { display: block; font-weight: 400; color: var(--muted); font-size: 0.75rem; margin-top: 0.125rem; }
+.field .grow.bad { color: var(--bad-soft); }
+.place { display: flex; align-items: center; gap: 0.75rem; background: var(--surface-1); border: 1px solid var(--line); border-radius: var(--r-md); padding: 0.625rem 0.875rem; margin-bottom: 0.5rem; }
+.place b { color: var(--text); font-size: 0.84375rem; display: block; }
+.place .mono { color: var(--muted); font-size: 0.71875rem; overflow-wrap: anywhere; }
+.note { color: var(--muted); font-size: 0.78125rem; line-height: 1.5; margin: 0.5rem 0 0; }
+.note.bad { color: var(--bad-soft); }

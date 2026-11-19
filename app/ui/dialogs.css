@@ -1,0 +1,127 @@
+/* Dialogs (a connection's choice, the first setup, an approval of a live write, Connect to AI), the
+   pop-up menu and the toast. Owner: the dialogs, menu, toast and tray group.
+   Sizes in rem (px / 16), never px past a 2 px hairline: 1rem grows with the window (base.css).
+   Reuse controls.css (its list is at its top) before making a control here.
+
+   Entrances are not CSS animations: body.idle pauses every CSS animation on its first frame, so a
+   dialog opened while the window has no focus (the approval's usual case) would stay faded or
+   small. popIn (common.js) runs a Web Animation only when the window has the focus; it runs on
+   time, never paused, and leaves nothing behind once done. */
+
+/* ---------- Menu ---------- */
+/* A glass card with 14 px corners under (or over) the button that opened it, rows of 2 rem */
+/* Under the dialogs (20 and up): a menu left open never covers an approval that arrives */
+.menu { position: fixed; z-index: 15; min-width: 12.5rem; max-width: 20rem; max-height: calc(100vh - 1rem); overflow-y: auto;
+  display: flex; flex-direction: column; gap: 0.125rem; padding: 0.375rem;
+  background: var(--glass-strong); border: 1px solid var(--line-strong); border-radius: var(--r-md); box-shadow: var(--shadow-popup); transform-origin: top right; }
+.menu.up { transform-origin: bottom right; }
+.menu .label { padding: 0.375rem 0.625rem 0.25rem; font-size: 0.6875rem; }
+.menu button { flex: none; display: flex; align-items: center; gap: 0.625rem; height: 2rem; padding: 0 0.625rem; border-radius: 0.625rem; text-align: left;
+  color: var(--text-soft); font-size: 0.8125rem; font-weight: 500; white-space: nowrap; transition: background-color var(--t-fast), color var(--t-fast); }
+.menu button:hover, .menu button:focus-visible { background: var(--surface-2); color: var(--text); outline: none; }
+/* The saved pick: full text and a neutral tick (the brand stays for the screen's main action) */
+.menu button.on { color: var(--text); font-weight: 600; }
+.menu button.on::after { content: ""; margin-left: auto; width: 0.875rem; height: 0.875rem; flex: none; background: currentColor;
+  -webkit-mask: var(--menu-tick) center / contain no-repeat; mask: var(--menu-tick) center / contain no-repeat; }
+.menu { --menu-tick: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M3.5 8.5l3 3 6-7'/></svg>"); }
+
+/* ---------- Toast ---------- */
+/* A dark glass pill at the bottom, its kind in a small circle: success, info, error. Over every
+   dialog: an error raised from inside one must be read */
+.toast { position: fixed; left: 0; right: 0; bottom: 1.5rem; margin-inline: auto; width: max-content; max-width: min(35rem, calc(100vw - 2rem)); z-index: 40;
+  display: flex; align-items: center; gap: 0.625rem; min-height: 2.5rem; padding: 0.375rem 1rem 0.375rem 0.5rem; border-radius: var(--r-md);
+  background: var(--glass-strong); border: 1px solid var(--line-strong); box-shadow: var(--shadow-popup);
+  color: var(--text); font-size: 0.8125rem; font-weight: 600; line-height: 1.4; }
+.toast-icon { flex: none; display: grid; place-items: center; width: 1.5rem; height: 1.5rem; border-radius: 50%; font-size: 0.75rem; font-weight: 800; line-height: 1;
+  background: var(--surface-3); color: var(--text); }
+.toast.success .toast-icon { background: color-mix(in srgb, var(--live) 20%, transparent); color: var(--live); }
+.toast.bad .toast-icon { background: color-mix(in srgb, var(--bad) 22%, transparent); color: var(--bad-soft); }
+.toast-text { min-width: 0; overflow-wrap: anywhere; }
+
+/* ---------- Dialogs ---------- */
+/* The dim behind a dialog is a plain translucent colour (no blur: the WebView has no GPU) */
+.overlay { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 1rem; background: rgba(4, 4, 6, 0.66); }
+.dialog { width: min(36rem, calc(100vw - 2rem)); max-height: calc(100vh - 2rem); overflow-y: auto; display: flex; flex-direction: column; gap: 1rem;
+  padding: 1.375rem 1.5rem 1.25rem; border-radius: 1.375rem; background: var(--glass-strong); border-color: var(--line-strong); box-shadow: var(--shadow-popup); }
+.dialog > * { flex-shrink: 0; }
+.dialog.wide { width: min(44rem, calc(100vw - 2rem)); }
+.dialog h2 { margin: 0; font-size: 1.25rem; line-height: 1.2; overflow-wrap: anywhere; }
+.dialog p { margin: 0; color: var(--text-soft); line-height: 1.5; font-size: 0.84375rem; }
+/* The eyebrow, the title and what it is about, close together */
+.dlg-head { display: flex; align-items: flex-start; gap: 0.875rem; }
+.dlg-head > .grow { display: flex; flex-direction: column; gap: 0.375rem; }
+.dlg-head .mono { color: var(--muted); }
+/* The last row: a short line on the left, the buttons on the right (the main one last) */
+.dlg-foot { display: flex; align-items: center; gap: 0.625rem; flex-wrap: wrap; padding-top: 0.25rem; }
+.dlg-foot .dlg-hint { flex: 1 1 12rem; min-width: 0; margin: 0; color: var(--muted); font-size: 0.75rem; line-height: 1.45; }
+.dialog .note { margin: 0; }
+.dialog .note.center { text-align: center; color: var(--muted); font-size: 0.78125rem; }
+
+/* A connection's choice: who wants in, the folder, who syncs it now */
+.parties { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1.15fr) auto minmax(0, 1fr); align-items: stretch; gap: 0.5rem; }
+.party { display: flex; flex-direction: column; gap: 0.375rem; min-width: 0; padding: 0.75rem 0.875rem; border-radius: var(--r-md); background: var(--surface-1); border: 1px solid var(--line); }
+.party .label { font-size: 0.65625rem; }
+.party .row { gap: 0.5rem; }
+.party b { color: var(--text); font-size: 0.875rem; font-weight: 650; line-height: 1.3; overflow-wrap: anywhere; }
+.party .mono { font-size: 0.6875rem; overflow-wrap: anywhere; }
+.party.folder { align-items: center; justify-content: center; text-align: center; background: var(--surface-2); border-color: var(--line-strong); }
+.party.folder b.display { font-size: 1rem; }
+.arrow { align-self: center; display: grid; place-items: center; width: 1.5rem; height: 1.5rem; border-radius: 50%; background: var(--surface-1); color: var(--muted); font-size: 0.8125rem; font-weight: 700; }
+/* Two answers as big buttons: keeping is the main one, taking over is the risky one */
+.options { display: grid; grid-template-columns: 1fr 1fr; gap: 0.625rem; }
+.option { display: flex; flex-direction: column; align-items: flex-start; gap: 0.25rem; min-width: 0; text-align: left; border-radius: var(--r-md); padding: 0.875rem 1rem; }
+.option b { font-size: 0.875rem; font-weight: 700; }
+.option span { font-size: 0.75rem; line-height: 1.45; }
+.option.keep { background: linear-gradient(180deg, var(--brand-400), var(--brand-500)); color: var(--brand-ink); }
+.option.keep:hover { filter: brightness(1.06); }
+.option.keep span { color: color-mix(in srgb, var(--brand-ink) 78%, transparent); }
+.option.take { background: var(--surface-1); border: 1px solid var(--line-strong); color: var(--text); }
+.option.take b { color: var(--bad-soft); }
+.option.take span { color: var(--muted); }
+.option.take:hover { background: color-mix(in srgb, var(--bad) 10%, transparent); border-color: color-mix(in srgb, var(--bad) 30%, transparent); }
+
+/* A write to the live game waiting for an answer: over every other dialog */
+#approval { z-index: 30; }
+.dialog.approval { width: min(40rem, calc(100vw - 2rem)); overflow: hidden; }
+.dialog h2.approval-title { font-size: 1.125rem; line-height: 1.3; }
+.dialog .note.approval-ask { color: var(--text-soft); font-size: 0.8125rem; }
+/* The whole text of the change, read only; it is the one part that shrinks and scrolls, so the
+   answer buttons always stay on screen */
+.approval-text { flex: 0 1 15rem; width: 100%; min-height: 5rem; resize: none; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+  font-size: 0.75rem; line-height: 1.6; color: var(--text); background: var(--well); border: 1px solid var(--line); border-radius: 0.75rem; padding: 0.75rem 0.875rem; outline: none; }
+.approval-text:focus { border-color: var(--line-strong); }
+.dialog.approval .note.bad { font-size: 0.78125rem; }
+/* Accept changes the live game: red text and a red edge, never the brand */
+.dialog.approval .btn.danger { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--bad) 45%, transparent); }
+.dialog.approval .dlg-hint { font-variant-numeric: tabular-nums; }
+
+/* A pick among a few (a folder, an AI): neutral cards, the picked one lit in white */
+.setup-options { display: flex; flex-direction: column; gap: 0.5rem; }
+.setup-option { display: flex; align-items: center; gap: 0.875rem; min-height: 3.5rem; text-align: left; padding: 0.625rem 0.875rem; border-radius: var(--r-md);
+  background: var(--surface-1); border: 1px solid var(--line); color: var(--text-soft); transition: background-color var(--t-fast), border-color var(--t-fast); }
+.setup-option:hover { background: var(--surface-2); }
+.setup-option .grow { display: flex; flex-direction: column; gap: 0.125rem; }
+.setup-option b { display: block; color: var(--text); font-size: 0.84375rem; font-weight: 650; }
+.setup-option .muted { font-size: 0.75rem; }
+.setup-option .mono { font-size: 0.6875rem; overflow-wrap: anywhere; }
+.setup-option.on { background: var(--surface-2); border-color: color-mix(in srgb, var(--text) 38%, transparent); }
+.setup-new { display: flex; align-items: center; gap: 0.5rem; }
+.setup-new .field-input { width: 100%; }
+
+/* Connect to AI: one card per AI config folder, the ticked ones get Quack */
+.ai-option { cursor: pointer; }
+.ai-option:has(input:checked) { background: var(--surface-2); border-color: color-mix(in srgb, var(--text) 38%, transparent); }
+.ai-option .mono { display: block; }
+.ai-option .pill { flex: none; }
+/* Not installed: greyed by colour, not opacity, and nothing to tick */
+.ai-option.off { cursor: default; background: transparent; }
+.ai-option.off:hover { background: transparent; }
+.ai-option.off b { color: var(--muted); }
+.ai-option.off .mono { color: var(--faint); }
+.ai-option.off input { border-color: var(--faint); cursor: default; }
+
+/* The window's smallest size (820 x 560): tighter, so the answers stay on screen */
+@media (max-height: 660px) {
+  .dialog { gap: 0.75rem; padding: 1.125rem 1.25rem 1rem; }
+  .setup-option { min-height: 3rem; padding-block: 0.5rem; }
+}

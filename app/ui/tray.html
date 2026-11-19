@@ -3,20 +3,27 @@
 <head>
 <meta charset="utf-8">
 <title>Quack</title>
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="base.css">
+<link rel="stylesheet" href="controls.css">
+<link rel="stylesheet" href="shell.css">
+<link rel="stylesheet" href="views-merges.css">
+<link rel="stylesheet" href="views-queue.css">
+<link rel="stylesheet" href="views-settings.css">
+<link rel="stylesheet" href="dialogs.css">
+<link rel="stylesheet" href="tray.css">
 <script type="module" src="tray.js"></script>
 </head>
 <body class="traybody">
-  <div class="tray chunk" id="tray">
+  <div class="tray" id="tray">
     <div class="trayhead brand">
       <span class="mark"></span>
       <div class="who"><span class="word">Quack</span><span id="port"></span></div>
     </div>
     <div class="traylist" id="list"></div>
     <div class="trayfoot">
-      <button class="btn yellow chunk-bright press" id="open" data-t="openWindow"></button>
-      <button class="btn dark chunk press" id="pause"></button>
-      <button class="btn dark chunk press" id="quit" data-t="quit"></button>
+      <button class="btn yellow press" id="open" data-t="openWindow"></button>
+      <button class="btn press" id="pause"></button>
+      <button class="btn ghost press" id="quit" data-t="quit"></button>
     </div>
   </div>
 </body>

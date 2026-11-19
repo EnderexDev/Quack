@@ -22,7 +22,7 @@
         "minHeight": 560,
         "visible": false,
         "center": true,
-        "backgroundColor": "#0d0b08"
+        "backgroundColor": "#0a0a0c"
       },
       {
         "label": "tray",

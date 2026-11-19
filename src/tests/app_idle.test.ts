@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { appCss } from "./app_css.js";
 
 // 12/11/26: the app's two windows live on hidden in the tray, and their WebView2 used 0.7 of a
 // core doing nothing: the pulsing dot animated box-shadow (a repaint every frame, forever) and
@@ -63,7 +64,7 @@ test("app idle: losing the focus marks the window idle, gaining it clears it", a
 });
 
 test("app idle: the pulse animates only transform and opacity, and every animation pauses on body.idle", () => {
-  const css = read("ui/style.css");
+  const css = appCss();
   // The whole block, up to the brace that closes @keyframes, however it is laid out
   const from = css.indexOf("@keyframes pulse");
   let keyframes = "";

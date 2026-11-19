@@ -110,7 +110,8 @@ test("app ai: the card wires the pill to a menu that posts the model, with every
   assert.match(main, /import \{[^}]*modelChoice[^}]*\} from "\.\/aiview\.js"/);
   assert.match(main, /modelChoice\(ai\)/);
   assert.match(main, /set\(\{ \[choice\.field\]: /, "the pick goes to the hub as model or codexModel");
-  assert.match(main, /h\("button", \{ class: "pill brand[^"]*"/, "the pill is a button");
+  // A button, in any colour: the Quackify restyle made it neutral (only a screen's main state is brand)
+  assert.match(main, /h\("button", \{ class: "pill(?: [^"]*)?", title: t\("aiModelPick"\)/, "the pill is a button");
   const used = new Set([...main.matchAll(/t\("(ai\w*)"/g)].map((m) => m[1]));
   for (const key of ["aiModel", "aiModelDefault", "aiModelPick"]) assert.ok(used.has(key), `${key} is used`);
   for (const language of ["en", "pt"] as const) {
