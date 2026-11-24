@@ -27,8 +27,8 @@ test("app: each game has an Analysis tab with the findings panel, the new produc
   }
   // the badge counts the panel's findings and the errors not dismissed, from /api/state
   assert.match(main, /\(place\?\.findings \?\? 0\) \+ \(place\?\.newErrors \?\? 0\)/);
-  // the four features in Settings (for every game) and in the tab (for that game)
-  assert.match(main, /const AUTO_FEATURES = \["review", "panel", "errors", "precommit"\]/);
+  // the six features in Settings (for every game) and in the tab (for that game): Quack Test's two last
+  assert.match(main, /const AUTO_FEATURES = \["review", "panel", "errors", "precommit", "tests", "playTests"\]/);
   assert.match(main, /automationCard\(automation\)/);
   assert.match(main, /autoRows\(view, placeId\)/);
   // its poll stops with the view
@@ -42,7 +42,7 @@ test("app: every string of the Analysis tab and the automation settings is in En
   const en = keysOf("en");
   const pt = keysOf("pt");
   const used = new Set([...main.matchAll(/\bt\("((?:analysis|errors|auto)\w*)"/g)].map((m) => m[1]));
-  for (const f of ["review", "panel", "errors", "precommit"]) used.add(`auto_${f}`).add(`auto_${f}_hint`);
+  for (const f of ["review", "panel", "errors", "precommit", "tests", "playTests"]) used.add(`auto_${f}`).add(`auto_${f}_hint`);
   assert.ok(used.size >= 25, `${used.size} keys`);
   for (const key of used) {
     assert.ok(en.has(key), `${key} in English`);

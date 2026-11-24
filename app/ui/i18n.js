@@ -330,6 +330,10 @@ const STRINGS = {
     auto_errors_hint: "Once an hour, read-only: a notification when the live game shows an error it never had.",
     auto_precommit: "Pre-commit check",
     auto_precommit_hint: "A git hook that stops a commit whose Luau files have findings (git commit --no-verify skips it).",
+    auto_tests: "Quack Test after each AI edit",
+    auto_tests_hint: "The specs in tests/ that the edited file reaches run outside Studio, and the AI gets what failed with the review. Never blocks the edit.",
+    auto_playTests: "Quack Test before each play",
+    auto_playTests_hint: "Every spec runs while a play starts (quack play, solo_playtest); what failed comes as a warning. Never stops the play.",
   },
   pt: {
     hubPort: "Hub · porta {port}",
@@ -660,6 +664,10 @@ const STRINGS = {
     auto_errors_hint: "Uma vez por hora, só leitura: uma notificação quando o jogo publicado mostra um erro que nunca teve.",
     auto_precommit: "Checagem no commit",
     auto_precommit_hint: "Um hook do git que barra o commit cujos arquivos Luau têm achados (git commit --no-verify pula).",
+    auto_tests: "Quack Test depois de cada edição da IA",
+    auto_tests_hint: "Os specs de tests/ que alcançam o arquivo editado rodam fora do Studio, e a IA recebe o que falhou junto com a revisão. Nunca bloqueia a edição.",
+    auto_playTests: "Quack Test antes de cada play",
+    auto_playTests_hint: "Todos os specs rodam enquanto o play começa (quack play, solo_playtest); o que falhou vem como aviso. Nunca impede o play.",
   },
 };
 

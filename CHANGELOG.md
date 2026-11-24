@@ -6,6 +6,13 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.43] - 2026-11-24
+
+### Added
+- Quack Test: `quack test` runs Luau specs outside Studio, in Lune, against the place's tree from the sourcemap (a worktree borrows its checkout's; with none, the sync folder). Specs live in `tests/` next to `sync/` and never reach the game: a module named `*Spec.luau` returns its tests, written with `local T = require("@quack/test")` and `T.expect(x).toBe(y)` (with `.never`), and `tests/setup.luau` runs first to make what only a play has. The output lists only what failed or did not run, each with its `file:line` and the reason, then one summary line; `--verbose` lists every test and what it printed, `--json` gives it all for a script. A test that needs a piece of Roblox Lune lacks (physics, a web call, a child made during the play) is reported as "did not run outside Studio" with the missing piece named, and counts as a failure. The play's pieces it imitates: `DateTime`, `TweenInfo`, `RaycastParams`, `Random`, change signals (`Changed`, `AttributeChanged`, `ChildAdded`...), `WaitForChild`, one player with a client and a server joined by remotes, and DataStores and MemoryStores in memory, empty at the start of each test.
+- The MCP tool `test` runs Quack Test as `quack test` does. The hub keeps one Lune process per project with the place's tree already loaded, so a run of the Anime Astral copy's 29 specs takes about a second; with no hub, `quack test` starts Lune for the run.
+- Quack Test runs on its own, each on or off for every game or per game in the app's Analysis settings: after each AI edit, the specs the edited file reaches run and what failed goes back to the AI with the review ("Quack Test after each AI edit"); when a play starts (`quack play`, `solo_playtest`), every spec runs and what failed comes as a warning after the play's answer, never stopping the play ("Quack Test before each play").
+
 ## [1.0.42] - 2026-11-19
 
 ### Changed
@@ -434,7 +441,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.42...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.43...HEAD
+[1.0.43]: https://github.com/EnderexDev/Quack/compare/v1.0.42...v1.0.43
 [1.0.42]: https://github.com/EnderexDev/Quack/compare/v1.0.41...v1.0.42
 [1.0.41]: https://github.com/EnderexDev/Quack/compare/v1.0.40...v1.0.41
 [1.0.40]: https://github.com/EnderexDev/Quack/compare/v1.0.39...v1.0.40

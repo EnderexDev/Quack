@@ -23,6 +23,8 @@ import type { SourcemapNode } from "../analyze/tree.js";
 import { buttonsCode, errorPlace, installCode, nodeForPath, probeErrorLine, probeErrors, readCode, removeCode, requireCode, signature, type CollectedError } from "../analyze/probe.js";
 import { loadTree } from "../analyze/tree.js";
 import { FINDINGS_EXIT, runPrecommit } from "../auto/precommit.js";
+import { runTestCommand } from "../quacktest/command.js";
+import { playText, type TestReport } from "../quacktest/text.js";
 
 /**
  * `quack` / `quackdev`: the hub from a terminal. Every command is one or a few calls to the
@@ -75,6 +77,8 @@ class Done extends Error {
 
 interface Options {
   json: boolean;
+  /** test: every test and what it printed, not only what failed */
+  verbose: boolean;
   yes: boolean;
   follow: boolean;
   connected: boolean;
@@ -270,6 +274,7 @@ function parse(full: string[]): { command?: string; args: string[]; options: Opt
     allowPositionals: true,
     options: {
       json: { type: "boolean" },
+      verbose: { type: "boolean", short: "v" },
       yes: { type: "boolean", short: "y" },
       follow: { type: "boolean", short: "f" },
       connected: { type: "boolean" },
@@ -439,6 +444,7 @@ function parse(full: string[]): { command?: string; args: string[]; options: Opt
     args: positionals.slice(1),
     options: {
       json: values.json === true,
+      verbose: values.verbose === true,
       yes: values.yes === true,
       follow: values.follow === true,
       connected: values.connected === true,
@@ -629,6 +635,16 @@ See
                             place is still read). Exit 1 when it finds something. In a Rojo
                             project (a project file, no sync folder) the tree comes from the
                             project file
+  test [file...] [--path <folder>] [--filter <a,b>] [--timeout <s>] [--verbose] [--json]   Quack Test: the specs
+                            of the project's tests/ (next to sync/, never in the game) run in
+                            Lune against the place's tree, no Studio needed. A spec is a module
+                            named *Spec.luau returning { ["name"] = function() ... end }, with
+                            require("@quack/test").expect(x).toBe(y); tests/setup.luau runs first.
+                            Files: spec files to run, or scripts (only the specs whose requires
+                            reach them run). Lists what failed and what did not run outside
+                            Studio (a piece of Roblox Lune lacks, named), each with file:line;
+                            --verbose lists every test and its prints; --timeout is each test's
+                            limit (default 10 s). Exit 1 unless all passed
   sourcemap [folder] [--out <file>]   A Rojo project's sourcemap.json from its project file, by
                             Quack's own reader (no rojo binary): the scripts' files, and the
                             nodes whose children the disk does not say all marked _quack.open
@@ -1207,6 +1223,27 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
           evalServer: (placeId, code, timeoutMs) => studio(ctx, { placeId, folder: "" }, "eval", { code, peer: "server", timeoutMs }, timeoutMs),
         },
       });
+    case "test":
+      return runTestCommand({
+        cwd: ctx.cwd,
+        root: options.path,
+        files: [...args, ...(options.files ? options.files.split(",").map((f) => f.trim()).filter(Boolean) : [])],
+        filter: options.filter,
+        testTimeout: options.timeout,
+        json: options.json,
+        verbose: options.verbose,
+        out: ctx.out,
+        // the hub's process has the tree loaded already; no hub (or an older one): this process runs it
+        hub: async (body) => {
+          try {
+            return (await client.post("/api/test", body, 15 * 60_000)) as TestReport;
+          } catch (error) {
+            if (error instanceof HubOffline || (error instanceof HubError && error.status === 404)) return null;
+            throw error;
+          }
+        },
+        placeFolders: async () => ((await client.get("/api/state")).places as Place[]).map((p) => p.folder),
+      });
     case "changes":
       return changes(ctx, options, args[0]);
     case "perf":
@@ -1723,6 +1760,20 @@ async function play(ctx: ControlContext, options: Options, query: string | undef
   const worktree = list[0];
   const several = list.length > 1;
   const place = query ? await resolvePlace(ctx, query) : await placeOfWorktree(ctx, worktree);
+  // the branch's specs, with the branch's scripts, while the play swaps it in (one worktree)
+  const tests = several ? Promise.resolve("") : testsBeforePlay(ctx, place.placeId, worktree);
+  const said = async () => {
+    const warning = await afterPlay(tests);
+    if (warning) ctx.err(warning);
+  };
+  try {
+    return await playWorktrees(ctx, options, place, list, worktree, several);
+  } finally {
+    await said();
+  }
+}
+
+async function playWorktrees(ctx: ControlContext, options: Options, place: Place, list: string[], worktree: string, several: boolean): Promise<number> {
   let started: any;
   try {
     ({ play: started } = await ctx.client.post("/api/play", several ? { placeId: place.placeId, worktrees: list } : { placeId: place.placeId, worktree }, 70_000));
@@ -1877,16 +1928,45 @@ async function runLuau(ctx: ControlContext, options: Options, command: string, q
   return EXIT.error;
 }
 
+/**
+ * Quack Test before a play (the playTests setting, his call 23/11/26): every spec of the folder
+ * that plays, run in the hub while Studio starts the play. Resolves the warning to print after the
+ * play's own answer, "" when they all pass, the setting is off, there are no specs, or the hub
+ * cannot run them. Never a reason not to play
+ */
+function testsBeforePlay(ctx: ControlContext, placeId: string, folder?: string): Promise<string> {
+  return ctx.client
+    .post("/api/test", { feature: "play", placeId, ...(folder ? { folder } : {}) }, 5 * 60_000)
+    .then((answer: { disabled?: boolean; report?: TestReport }) => (answer?.report ? playText(answer.report) : ""))
+    .catch(() => "");
+}
+
+/** After the play is up, the specs get this much longer: a stuck spec never holds the play's answer */
+const PLAY_TESTS_WAIT_MS = 10_000;
+
+/** The warning, or a line saying the specs were still running once the play's answer waited enough */
+export function afterPlay(tests: Promise<string>, waitMs = PLAY_TESTS_WAIT_MS): Promise<string> {
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<string>((resolve) => {
+    timer = setTimeout(() => resolve(`Quack Test was still running the specs ${Math.round(waitMs / 1000)} s after the play started: \`quack test\` runs them and waits.`), waitMs);
+  });
+  return Promise.race([tests, late]).finally(() => clearTimeout(timer));
+}
+
 async function playtest(ctx: ControlContext, options: Options, action: string | undefined, query: string | undefined): Promise<number> {
   if (action !== "start" && action !== "stop" && action !== "status") throw new UsageError("usage: playtest start|stop|status [place] [--run]");
   const place = await resolvePlace(ctx, query);
   const timeoutMs = options.timeout === undefined ? undefined : options.timeout * 1000;
   const players = action === "start" ? positiveInt(options.players, "players") : undefined;
+  const tests = action === "start" ? testsBeforePlay(ctx, place.placeId) : Promise.resolve("");
   const result = await studio(ctx, place, "playtest", { action, ...(action === "start" ? { mode: options.run ? "run" : "play" } : {}), ...(players ? { players } : {}), ...(timeoutMs ? { timeoutMs } : {}) }, timeoutMs ?? (players ? 120_000 : 60_000));
+  const warning = await afterPlay(tests);
   if (options.json) {
     ctx.out(JSON.stringify(result, null, 2));
+    if (warning) ctx.err(warning);
     return EXIT.ok;
   }
+  if (warning) NOTES.get(ctx)?.push(warning);
   if (action === "status") {
     if (!result.editConnected) ctx.out(`${placeLabel(place)}: Studio is not connected.`);
     else if (!result.playing) ctx.out(`${placeLabel(place)}: no play is running.`);

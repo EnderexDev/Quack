@@ -13,11 +13,16 @@
  *  - Cursor: postToolUse (its edit tools' names are not documented: every tool comes, and only a
  *    call naming a Luau file goes further); the answer is `additional_context`
  *
- * Only node:fs, node:http and node:path: it runs after every edit, as one small file (review.mjs).
+ * Quack Test's specs the edit reaches run too (the `tests` setting), and what they say goes in the
+ * same answer.
+ *
+ * Only node:fs, node:http, node:path and Quack Test's text: it runs after every edit, as one small
+ * file (review.mjs).
  */
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
+import { editText } from "../quacktest/text.js";
 
 export type ReviewClient = "claude" | "codex" | "cursor";
 
@@ -28,6 +33,8 @@ export const CODEX_REVIEW_MATCHER = "apply_patch|Edit|Write";
 
 const LUAU = /\.luau?$/i;
 const MAX_LINES = 40;
+/** How long the hook waits for Quack Test's answer (a cold run of the Astral copy: ~4 s, tree included) */
+const TESTS_WAIT_MS = 8_000;
 
 const text = (value: unknown) => (typeof value === "string" ? value : "");
 
@@ -82,10 +89,19 @@ export function reviewOutput(client: ReviewClient, message: string): string {
 }
 
 function askHub(port: number, files: string[], timeoutMs: number): Promise<any> {
+  return post(port, "/api/analyze", { files, feature: "review" }, timeoutMs);
+}
+
+/** Quack Test: the specs the edited files reach, run in the hub */
+function askTests(port: number, files: string[], timeoutMs: number): Promise<any> {
+  return post(port, "/api/test", { files, feature: "edit" }, timeoutMs);
+}
+
+function post(port: number, pathname: string, payload: object, timeoutMs: number): Promise<any> {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ files, feature: "review" });
+    const body = JSON.stringify(payload);
     const req = http.request(
-      { host: "127.0.0.1", port, method: "POST", path: "/api/analyze", timeout: timeoutMs, headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) } },
+      { host: "127.0.0.1", port, method: "POST", path: pathname, timeout: timeoutMs, headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) } },
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (c: Buffer) => chunks.push(c));
@@ -106,15 +122,34 @@ function askHub(port: number, files: string[], timeoutMs: number): Promise<any> 
   });
 }
 
-/** The hook's whole run: stdin in, the client's answer out; never throws */
-export async function reviewAnswer(stdin: string, options: { client: ReviewClient; port: number; timeoutMs?: number; ask?: typeof askHub }): Promise<string> {
+/**
+ * The hook's whole run: stdin in, the client's answer out; never throws. The analysis and Quack
+ * Test's specs run at once in the hub; each part says nothing when it is off, found nothing, or
+ * could not answer
+ */
+export async function reviewAnswer(
+  stdin: string,
+  options: { client: ReviewClient; port: number; timeoutMs?: number; ask?: typeof askHub; askTests?: typeof askTests; testsWaitMs?: number },
+): Promise<string> {
   const empty = reviewOutput(options.client, "");
   try {
     const files = editedFiles(JSON.parse(stdin)).filter((f) => fs.existsSync(f));
     if (!files.length) return empty;
-    const answer = await (options.ask ?? askHub)(options.port, files, options.timeoutMs ?? 20_000);
-    if (!answer || answer.disabled) return empty;
-    return reviewOutput(options.client, reviewText(answer));
+    const timeout = options.timeoutMs ?? 20_000;
+    // the specs get a shorter wait than the analysis: a stuck spec never holds the AI's edit
+    // longer than this, and the run goes on in the hub
+    const testsWait = options.testsWaitMs ?? TESTS_WAIT_MS;
+    let late = false;
+    const [analysis, tests] = await Promise.all([
+      (options.ask ?? askHub)(options.port, files, timeout).catch(() => null),
+      Promise.race([
+        (options.askTests ?? askTests)(options.port, files, timeout).catch(() => null),
+        new Promise<null>((resolve) => setTimeout(() => ((late = true), resolve(null)), testsWait).unref()),
+      ]),
+    ]);
+    const testsPart = tests && !tests.disabled && Array.isArray(tests.reports) ? editText(tests.reports) : late ? `Quack Test was still running the specs this edit reaches after ${Math.round(testsWait / 1000)} s: \`quack test\` runs them and waits.` : "";
+    const parts = [analysis && !analysis.disabled ? reviewText(analysis) : "", testsPart].filter(Boolean);
+    return reviewOutput(options.client, parts.join("\n\n"));
   } catch {
     return empty;
   }

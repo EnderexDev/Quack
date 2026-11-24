@@ -4,6 +4,8 @@ import { loadProject, type AnalyzeReport, type Finding, type ParseCache } from "
 import { borrowedSourcemap } from "../analyze/command.js";
 import { treeFromProject } from "../analyze/project.js";
 import { fileKey, loadTree, type GameTree } from "../analyze/tree.js";
+import { findSpecs } from "../quacktest/project.js";
+import { reached, requiresOf } from "../quacktest/reach.js";
 
 /**
  * The analysis that stays loaded between runs (the hub's worker thread): per project, the parse of
@@ -90,8 +92,8 @@ export class ResidentAnalysis {
     else this.projects.clear();
   }
 
-  async run(req: ResidentRequest): Promise<ResidentAnswer> {
-    const root = path.resolve(req.root);
+  /** A project's kept state, made on its first run (the one used longest ago leaves past MAX_PROJECTS) */
+  private entryFor(root: string): Entry {
     const key = fileKey(root);
     let entry = this.projects.get(key);
     if (!entry) {
@@ -102,6 +104,58 @@ export class ResidentAnalysis {
         if (oldest) this.projects.delete(oldest[0]);
       }
     }
+    entry.used = Date.now();
+    return entry;
+  }
+
+  /** A synced project's sourcemap (its own, or a worktree's borrowed one) and its tree, kept while the sourcemap is the same */
+  private async syncTree(entry: Entry, root: string, placeFolders: string[]): Promise<{ sourcemap?: string; tree: GameTree }> {
+    const syncDir = path.join(root, "sync");
+    let sourcemap: string | undefined = path.join(root, "sourcemap.json");
+    if (!fs.existsSync(sourcemap)) {
+      // looked up again when the registered folders change (the checkout registered later) or the borrowed file is gone
+      const among = JSON.stringify(placeFolders);
+      if (entry.borrowed === undefined || entry.borrowedAmong !== among || (entry.borrowed && !fs.existsSync(entry.borrowed))) {
+        entry.borrowed = (await borrowedSourcemap(root, async () => placeFolders).catch(() => undefined)) ?? null;
+        entry.borrowedAmong = among;
+      }
+      sourcemap = entry.borrowed ?? undefined;
+    }
+    const stamp = stampOf(sourcemap);
+    // a tree read from the sync folder (no sourcemap, or one cut mid-write) follows its files:
+    // read again every run, so a module added since is found by the requires that name it
+    if (!entry.tree || entry.treeStamp !== stamp || !entry.tree.complete) {
+      entry.tree = loadTree(root, syncDir, sourcemap ?? path.join(root, "sourcemap.json"));
+      entry.treeStamp = stamp;
+    }
+    return { sourcemap, tree: entry.tree };
+  }
+
+  /**
+   * Quack Test's reach: the spec files whose requires reach one of `files`, read with this
+   * project's kept tree and parses (the tests' files are parsed too, and leave the cache at the
+   * next analysis, which does not read them). Never a review's baseline.
+   */
+  async reach(req: { root: string; files: string[]; placeFolders: string[] }): Promise<string[]> {
+    const root = path.resolve(req.root);
+    const specs = findSpecs(root);
+    if (!specs.length) return [];
+    const entry = this.entryFor(root);
+    let requires: Map<string, string[]>;
+    if (fs.existsSync(path.join(root, "sync"))) {
+      const { sourcemap, tree } = await this.syncTree(entry, root, req.placeFolders);
+      requires = requiresOf(root, { sourcemap, loadedTree: tree, cache: entry.cache });
+    } else {
+      const tree = await treeFromProject(root);
+      if (!tree) return [];
+      requires = requiresOf(root, { tree, cache: entry.cache });
+    }
+    return reached(root, specs, req.files, requires).map((s) => s.file);
+  }
+
+  async run(req: ResidentRequest): Promise<ResidentAnswer> {
+    const root = path.resolve(req.root);
+    const entry = this.entryFor(root);
     const started = Date.now();
     entry.used = started;
     const syncDir = path.join(root, "sync");
@@ -110,24 +164,8 @@ export class ResidentAnalysis {
     const asCommitted = !!texts || given.absent.size > 0;
     let report: AnalyzeReport;
     if (fs.existsSync(syncDir)) {
-      let sourcemap: string | undefined = path.join(root, "sourcemap.json");
-      if (!fs.existsSync(sourcemap)) {
-        // looked up again when the registered folders change (the checkout registered later) or the borrowed file is gone
-        const among = JSON.stringify(req.placeFolders);
-        if (entry.borrowed === undefined || entry.borrowedAmong !== among || (entry.borrowed && !fs.existsSync(entry.borrowed))) {
-          entry.borrowed = (await borrowedSourcemap(root, async () => req.placeFolders).catch(() => undefined)) ?? null;
-          entry.borrowedAmong = among;
-        }
-        sourcemap = entry.borrowed ?? undefined;
-      }
-      const stamp = stampOf(sourcemap);
-      // a tree read from the sync folder (no sourcemap, or one cut mid-write) follows its files:
-      // read again every run, so a module added since is found by the requires that name it
-      if (!entry.tree || entry.treeStamp !== stamp || !entry.tree.complete) {
-        entry.tree = loadTree(root, syncDir, sourcemap ?? path.join(root, "sourcemap.json"));
-        entry.treeStamp = stamp;
-      }
-      report = loadProject(root, { sourcemap, loadedTree: entry.tree, cache: entry.cache, ...given }).report();
+      const { sourcemap, tree } = await this.syncTree(entry, root, req.placeFolders);
+      report = loadProject(root, { sourcemap, loadedTree: tree, cache: entry.cache, ...given }).report();
     } else {
       // a Rojo project: its tree is its project file and the disk, read again each run
       const tree = await treeFromProject(root);

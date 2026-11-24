@@ -59,6 +59,8 @@ export interface AnalyzeOptions {
   textFiles?: string[];
   /** Files on disk left out, by fileKey (the pre-commit check: untracked, not in the commit) */
   absent?: Set<string>;
+  /** Scripts outside the tree read too (Quack Test's specs): their requires are bound, they are never reported */
+  extraFiles?: string[];
 }
 
 /** A file's parse, by fileKey, with the size and time it was read at */
@@ -113,6 +115,8 @@ export interface Project {
   liveCandidates(): LiveCandidate[];
   /** The checks; `live` fills the keys of modules the text could not read (never of one it could) */
   report(live?: LiveKeys): AnalyzeReport;
+  /** The module files each script requires (by its fileKey): `require(X)` anywhere in it, and a loader's `get("Name")` */
+  requires(): Map<string, string[]>;
 }
 
 /** Containers whose children are copied somewhere else at run time (PlayerGui, PlayerScripts, the character, the backpack) */
@@ -255,6 +259,8 @@ export function loadProject(root: string, options: AnalyzeOptions = {}): Project
   // the place as a commit holds it: untracked files out, files deleted after `git add` back in
   const absent = options.absent;
   if (absent?.size) files = files.filter((f) => !absent.has(fileKey(f)));
+  const extra = new Set((options.extraFiles ?? []).map((f) => fileKey(f)));
+  for (const f of options.extraFiles ?? []) if (!files.some((x) => fileKey(x) === fileKey(f))) files.push(path.resolve(f));
   for (const f of options.textFiles ?? []) {
     if (files.some((x) => fileKey(x) === fileKey(f))) continue;
     files.push(path.resolve(f));
@@ -302,7 +308,7 @@ export function loadProject(root: string, options: AnalyzeOptions = {}): Project
     return k;
   };
   const wanted = options.files?.length ? new Set(options.files.map((f) => fileKey(path.resolve(root, f)))) : null;
-  const isWanted = (s: ScriptFile) => !wanted || wanted.has(fileKey(s.file));
+  const isWanted = (s: ScriptFile) => !extra.has(fileKey(s.file)) && (!wanted || wanted.has(fileKey(s.file)));
 
   // The modules a play's server has started: a module counts only when its require is reached
   // in a file already running, at the top level (not in a function or a branch), before any
@@ -882,7 +888,12 @@ export function loadProject(root: string, options: AnalyzeOptions = {}): Project
     };
   };
   const loadMs = Date.now() - t0;
-  return { liveCandidates, report };
+  const requires = (): Map<string, string[]> => {
+    const out = new Map<string, string[]>();
+    for (const s of scripts) out.set(fileKey(s.file), [...new Set(requiresOf(s).map((n) => n.file!))]);
+    return out;
+  };
+  return { liveCandidates, report, requires };
 }
 
 /**

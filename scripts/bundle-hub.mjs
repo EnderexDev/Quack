@@ -48,6 +48,15 @@ export async function bundleHub(outDir = path.join(root, "app", "src-tauri", "re
   const shipsWatcher = process.platform === "win32" && process.arch === "x64";
   const watcherBinary = shipsWatcher ? fs.readFileSync(createRequire(import.meta.url).resolve("@parcel/watcher-win32-x64")) : null;
   if (watcherBinary) fs.writeFileSync(path.join(outDir, "watcher.node"), watcherBinary);
+  // Quack Test's engine: the pinned Lune (downloaded and checked once per checkout) and the
+  // runtime's Luau files, flat (quacktest-main.luau...) next to the hub, which copies them to its
+  // cache before running them (src/quacktest/lune.ts)
+  const { ensureLune } = await import(pathToFileURL(path.join(root, "scripts", "fetch-lune.mjs")).href);
+  const lune = await ensureLune();
+  fs.copyFileSync(lune.file, path.join(outDir, path.basename(lune.file)));
+  for (const name of fs.readdirSync(outDir)) if (name.startsWith("quacktest-")) fs.rmSync(path.join(outDir, name));
+  const runtime = path.join(root, "src", "quacktest", "runtime");
+  for (const name of fs.readdirSync(runtime)) fs.copyFileSync(path.join(runtime, name), path.join(outDir, `quacktest-${name}`));
   // Content ids: a rebuild of the same code keeps its id, so an update that leaves the hub's
   // bytes alone does not restart it, and a daemon is replaced only when daemon.mjs or the
   // binary it loads changed

@@ -9,7 +9,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { PassThrough } from "node:stream";
-import { runControl, type ControlContext } from "../control/commands.js";
+import { afterPlay, runControl, type ControlContext } from "../control/commands.js";
 import { serveMcp } from "../control/mcp.js";
 import { instructions, rule } from "../control/rule.js";
 import { checkTool, guardAnswer } from "../control/guard.js";
@@ -425,6 +425,69 @@ test("restart-hub sees a hub replaced between two of its polls", { timeout: 3000
   }
 });
 
+test("Quack Test before a play: playtest start and the MCP solo_playtest carry its warning after the play's answer, and a stuck run never holds it", { timeout: 60000 }, async () => {
+  // a hub that starts plays at once and answers /api/test for the play as told
+  let testAnswer: () => Promise<object> = async () => ({});
+  const played: string[] = [];
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", async () => {
+      const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
+      const send = (value: object) => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(value));
+      if (req.url === "/api/state") return send({ places: [{ placeId: "555", folder: os.tmpdir(), name: "Game" }], sessions: [], pending: [], refused: [] });
+      if (req.url === "/api/studio") return send({ result: { ok: true, mode: "play", ms: 900 } });
+      if (req.url === "/api/test") {
+        played.push(`${body.feature}:${body.placeId}`);
+        return send(await testAnswer());
+      }
+      return res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: "not found" }));
+    });
+  });
+  const port = await freePort();
+  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+  const failing = {
+    report: {
+      root: os.tmpdir(),
+      rows: [{ spec: "tests/ShopSpec.luau", test: "price", status: "failed", line: 4, message: "expected 20 (number) to be 21 (number)" }],
+      stats: { passed: 3, failed: 1, notRun: 0, specs: 2, ms: 900, tree: "tree from the sourcemap", warm: true },
+    },
+  };
+  try {
+    testAnswer = async () => failing;
+    const started = await control(port)("playtest", "start", "555");
+    assert.equal(started.code, 0, started.err);
+    assert.deepEqual(played, ["play:555"]);
+    assert.match(started.out, /the play is running[\s\S]*Quack Test before this play: 3 passed, 1 failed[\s\S]*tests\/ShopSpec\.luau:4  failed  price: expected 20/);
+    assert.ok(started.out.indexOf("the play is running") < started.out.indexOf("Quack Test before this play"), "after the play's own answer");
+
+    // the same through the MCP tool an AI calls
+    const mcp = mcpSession(port);
+    await mcp.call("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "0" } });
+    const tool = await mcp.tool("solo_playtest", { action: "start", place: "555" });
+    assert.match(tool.content[0].text, /Quack Test before this play: 3 passed, 1 failed/);
+    await mcp.close();
+
+    // all passing (or no specs, or the setting off): nothing is said
+    testAnswer = async () => ({ report: { ...failing.report, rows: [], stats: { ...failing.report.stats, failed: 0 } } });
+    assert.doesNotMatch((await control(port)("playtest", "start", "555")).out, /Quack Test/);
+    testAnswer = async () => ({ disabled: true });
+    assert.doesNotMatch((await control(port)("playtest", "start", "555")).out, /Quack Test/);
+    // stop runs no specs
+    played.length = 0;
+    await control(port)("playtest", "stop", "555");
+    assert.deepEqual(played, []);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+  // a run still going once the play is up: a line says so, the answer does not wait for it
+  const t0 = Date.now();
+  assert.match(await afterPlay(new Promise<string>(() => {}), 100), /still running the specs/);
+  assert.ok(Date.now() - t0 < 1000);
+  assert.equal(await afterPlay(Promise.resolve("done"), 100), "done");
+});
+
 test("open --wait on a place not registered yet waits for Set up instead of failing", { timeout: 60000 }, async () => {
   await withHub(async ({ port, tmp }) => {
     const opened: string[] = [];
@@ -476,7 +539,7 @@ function mcpSession(port: number, cwd = os.tmpdir()) {
 }
 
 /** The eight Studio calls an AI makes most (a month of chrrxs use, 08/11/26), by the same names, then a click by path, a wait and a recording */
-const STUDIO_TOOLS = ["eval_server_runtime", "eval_client_runtime", "production_errors", "probe", "execute_luau", "solo_playtest", "capture_screenshot", "get_runtime_logs", "simulate_keyboard_input", "set_device_simulator", "click_gui", "wait_for", "record", "inspect_gui", "verify_sync", "analyze", "studio_changes", "perf_sample", "set_logpoint", "export_rbxm", "import_rbxm", "find_instances", "inspect_instance", "set_properties", "simulate_conditions", "script_tabs", "capture_devices", "test_profile", "simulate_mouse_input", "get_roblox_docs", "search_assets", "get_asset_details", "get_asset_thumbnail", "preview_asset", "insert_asset", "upload_asset", "get_memory_breakdown", "capture_script_profiler", "get_scene_analysis", "capture_micro_profiler", "get_request_status", "get_place_info", "list_place_versions", "download_place", "open_place", "selection", "generate_model", "badges", "developer_products", "game_passes", "localization", "analytics_query", "move_player", "get_universe", "update_universe", "restart_servers", "publish_message", "memory_store_sorted_map", "memory_store_queue", "flush_memory_store", "ordered_data_store", "user_restriction", "datastore", "experience_config", "cloud_permissions", "luau_run"];
+const STUDIO_TOOLS = ["eval_server_runtime", "eval_client_runtime", "production_errors", "probe", "execute_luau", "solo_playtest", "capture_screenshot", "get_runtime_logs", "simulate_keyboard_input", "set_device_simulator", "click_gui", "wait_for", "record", "inspect_gui", "verify_sync", "analyze", "test", "studio_changes", "perf_sample", "set_logpoint", "export_rbxm", "import_rbxm", "find_instances", "inspect_instance", "set_properties", "simulate_conditions", "script_tabs", "capture_devices", "test_profile", "simulate_mouse_input", "get_roblox_docs", "search_assets", "get_asset_details", "get_asset_thumbnail", "preview_asset", "insert_asset", "upload_asset", "get_memory_breakdown", "capture_script_profiler", "get_scene_analysis", "capture_micro_profiler", "get_request_status", "get_place_info", "list_place_versions", "download_place", "open_place", "selection", "generate_model", "badges", "developer_products", "game_passes", "localization", "analytics_query", "move_player", "get_universe", "update_universe", "restart_servers", "publish_message", "memory_store_sorted_map", "memory_store_queue", "flush_memory_store", "ordered_data_store", "user_restriction", "datastore", "experience_config", "cloud_permissions", "luau_run"];
 
 test("mcp: initialize carries the instructions, and the tools are the reading ones, wait, play and the Studio tools", { timeout: 15000 }, async () => {
   const mcp = mcpSession(await freePort());

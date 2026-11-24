@@ -8,11 +8,16 @@ import path from "node:path";
  * (automation.json / automation-dev.json), never config.json: that one is shared by both hubs and
  * an older Official rewrites it without the fields it does not know.
  */
-export type AutoFeature = "review" | "panel" | "errors" | "precommit";
-export const AUTO_FEATURES: readonly AutoFeature[] = ["review", "panel", "errors", "precommit"];
+export type AutoFeature = "review" | "panel" | "errors" | "precommit" | "tests" | "playTests";
+/**
+ * tests: Quack Test's specs an AI's edit reaches, run after the edit (the answer goes back with the
+ * review's); playTests: every spec, run when a play starts (quack play, solo_playtest), a warning
+ * only (his call, 23/11/26)
+ */
+export const AUTO_FEATURES: readonly AutoFeature[] = ["review", "panel", "errors", "precommit", "tests", "playTests"];
 
-/** The pre-commit check stops commits: off until the user turns it on */
-export const AUTO_DEFAULTS: Readonly<Record<AutoFeature, boolean>> = { review: true, panel: true, errors: true, precommit: false };
+/** The pre-commit check stops commits: off until the user turns it on. The tests never stop anything */
+export const AUTO_DEFAULTS: Readonly<Record<AutoFeature, boolean>> = { review: true, panel: true, errors: true, precommit: false, tests: true, playTests: true };
 
 export interface AutoSettings {
   global: Record<AutoFeature, boolean>;

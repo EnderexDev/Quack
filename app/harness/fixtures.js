@@ -116,8 +116,8 @@
     fresh: [{ at: "ServerScriptService/Services/TradeService.luau:88", hash: "9c1e", source: "Server", message: "attempt to index nil with 'Inventory'", count: 37 }],
   };
   const automation = {
-    settings: { global: { review: true, panel: true, errors: true, precommit: false }, places: { "122779716334700": { precommit: true } } },
-    effective: Object.fromEntries(places.map((p) => [p.placeId, { review: true, panel: true, errors: true, precommit: p.placeId === "122779716334700" }])),
+    settings: { global: { review: true, panel: true, errors: true, precommit: false, tests: true, playTests: true }, places: { "122779716334700": { precommit: true, playTests: false } } },
+    effective: Object.fromEntries(places.map((p) => [p.placeId, { review: true, panel: true, errors: true, precommit: p.placeId === "122779716334700", tests: true, playTests: p.placeId !== "122779716334700" }])),
     precommitHooks: { "122779716334700": "installed" },
   };
 

@@ -12,3 +12,5 @@ test/
 # Ignore Plugin dependencies
 /plugin/Packages/
 /plugin/Vendor/
+# Quack Test engine downloaded by scripts/fetch-lune.mjs
+/vendor/lune/

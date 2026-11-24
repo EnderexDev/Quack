@@ -438,6 +438,34 @@ export const TOOLS: Tool[] = [
     },
   },
   {
+    name: "test",
+    description: "Quack Test: runs the project's Luau specs outside Studio, in Lune, against the place's instance tree (the sourcemap), in about a second, with no Studio and no play. Specs live in tests/ next to sync/ and never reach the game: a module named *Spec.luau that returns { [\"test name\"] = function() ... end }, using `local T = require(\"@quack/test\")` for `T.expect(x).toBe(y)` (also toEqual, toBeNil, toBeTruthy, toBeCloseTo, toBeGreaterThan, toContain, toThrow, and .never before any) and `T.network` (client(fn) and server(fn) run code as each side, flush() lets remotes arrive, player() is the one simulated player). tests/setup.luau runs first and makes what only a play has (attributes, values, instances made at run time). DataStores and MemoryStores are in memory and empty at each test; signals (Changed, AttributeChanged, ChildAdded) fire a frame after the change. Answers only what failed and what did not run outside Studio (a piece of Roblox this run lacks, named: physics, the web, a child made during the play), each with file:line, then a summary. Write a spec for a module's logic (prices, rewards, guards, data changes) and run it after changing that module, before a playtest. Errors unless every test passed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        files: { type: "array", items: { type: "string" }, description: "Spec files to run, or scripts: only the specs whose requires reach them run (absolute, or from the project folder). Default: every spec" },
+        filter: { type: "string", description: "Only tests whose full name (\"Group/CoinsSpec › adds coins\") holds this text; several separated by commas" },
+        path: { type: "string", description: "The project folder (the one holding sync/ and tests/). Default: found from the first file or the folder the AI runs in" },
+        verbose: { type: "boolean", description: "List every test, passes too, with what the game printed during each" },
+        timeoutSeconds: { type: "number", description: "How long one test may take before it fails as stuck (default 10)" },
+        json: { type: "boolean", description: "The whole report as JSON: each test's status, spec line, innermost script line, message, reason and output" },
+      },
+    },
+    argv: (args) => {
+      const files = args.files;
+      if (files !== undefined && (!Array.isArray(files) || files.some((f) => typeof f !== "string" || !f || f.startsWith("-")))) throw new ToolInputError("files must be a list of paths, none starting with \"-\"");
+      return [
+        "test",
+        ...(Array.isArray(files) ? (files as string[]) : []),
+        ...(text(args, "path").length ? [`--path=${args.path}`] : []),
+        ...(text(args, "filter").length ? [`--filter=${args.filter}`] : []),
+        ...number(args, "timeoutSeconds", "--timeout"),
+        ...(args.verbose === true ? ["--verbose"] : []),
+        ...(args.json === true ? ["--json"] : []),
+      ];
+    },
+  },
+  {
     name: "studio_changes",
     description: "Which uncommitted changes in the place's synced folder came from Studio (a game designer tuning values there; the sync writes them to disk), so they are not taken for someone's work in progress. Lists every file git sees as changed in the sync folder, new files too, each marked: studio (Studio wrote it and nothing touched it since; from the commit only Studio changed it), mixed (Studio wrote it, but the disk changed it after, or it already held another uncommitted edit, or a merge) or other (not from Studio). Quack knows because its daemon writes those files itself; no Studio call, so it answers with Studio closed. balance also lists the balance: Studio's files whose only change from the commit is numbers (a designer tuning values; comments ignored, a string counts only when its whole text is a number). Paths are from the repository's root. It commits nothing, except with commitBalance: the balance alone in its own commit (\"" + BALANCE_SUBJECT + "\"), every other change and whatever is staged left as it was, then a push; mixed and other files are never in it, and whether to commit them is the user's call.",
     inputSchema: {

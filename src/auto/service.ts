@@ -45,6 +45,11 @@ export class AnalysisService {
     return this.send({ request }, timeoutMs);
   }
 
+  /** Quack Test: the spec files of a project whose requires reach one of `files` */
+  reach(request: { root: string; files: string[]; placeFolders: string[] }, timeoutMs = 60_000): Promise<string[]> {
+    return this.send({ reach: request }, timeoutMs);
+  }
+
   /** Forgets one project's parses (its place was unregistered), or every one */
   drop(root?: string): Promise<void> {
     if (!this.worker) return Promise.resolve();

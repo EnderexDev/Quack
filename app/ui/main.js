@@ -588,7 +588,7 @@ async function renderMerges(target) {
 // ---------- Analysis: the findings panel, the production errors, what runs on its own ----------
 
 const ANALYSIS_POLL_MS = 2000;
-const AUTO_FEATURES = ["review", "panel", "errors", "precommit"];
+const AUTO_FEATURES = ["review", "panel", "errors", "precommit", "tests", "playTests"];
 
 /**
  * One row per feature that runs on its own (Settings: for every game; a game's Analysis tab: for

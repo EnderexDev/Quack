@@ -68,7 +68,7 @@ test("automation settings: per flavor next to the registry, a place may differ, 
   const file = path.join(dir, "automation-dev.json");
   fs.writeFileSync(file, JSON.stringify({ newer: { kept: true } }));
   let s = readAutoSettings(file);
-  assert.deepEqual(s.global, { review: true, panel: true, errors: true, precommit: false }, "the pre-commit check starts off");
+  assert.deepEqual(s.global, { review: true, panel: true, errors: true, precommit: false, tests: true, playTests: true }, "the pre-commit check starts off; Quack Test runs on its own");
   s = writeAutoSettings(file, { global: { panel: false }, place: { placeId: "42", values: { precommit: true } } });
   assert.equal(autoEnabled(s, "panel", "42"), false);
   assert.equal(autoEnabled(s, "precommit", "42"), true);

@@ -44,7 +44,12 @@ test("the bundled hub the app ships syncs a Studio with one daemon, away from di
   // The bundle stands alone: nothing from dist/ or node_modules next to it
   // (watcher.node, the backstop watcher, only where the app ships: Windows x64)
   const shipsWatcher = process.platform === "win32" && process.arch === "x64";
-  assert.deepEqual(fs.readdirSync(bundleDir).sort(), ["BUILD", "DAEMON_BUILD", "VERSION", "analysis-worker.mjs", "cli.mjs", "daemon.mjs", "guard.mjs", "hub.mjs", "review.mjs", ...(shipsWatcher ? ["watcher.node"] : [])]);
+  // and Quack Test's engine: the pinned Lune and the runtime's Luau files, flat (the app's
+  // resources glob takes only the folder's own files)
+  const runtime = fs.readdirSync(path.join(repo, "src", "quacktest", "runtime")).map((n) => `quacktest-${n}`);
+  const lune = process.platform === "win32" ? "lune.exe" : "lune";
+  assert.deepEqual(fs.readdirSync(bundleDir).sort(), ["BUILD", "DAEMON_BUILD", "VERSION", "analysis-worker.mjs", "cli.mjs", "daemon.mjs", "guard.mjs", "hub.mjs", "review.mjs", lune, ...runtime, ...(shipsWatcher ? ["watcher.node"] : [])].sort());
+  assert.ok(fs.readFileSync(path.join(bundleDir, lune)).equals(fs.readFileSync(path.join(repo, "vendor", "lune", "0.11.1", lune))), "the checked download ships as is");
   const buildId = fs.readFileSync(path.join(bundleDir, "BUILD"), "utf8").trim();
   assert.match(buildId, /^[0-9a-f]{12}$/);
   assert.match(fs.readFileSync(path.join(bundleDir, "DAEMON_BUILD"), "utf8").trim(), /^[0-9a-f]{12}$/);

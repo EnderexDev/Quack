@@ -165,7 +165,7 @@ test("app inventory: every string is still shown, in English and Portuguese", ()
   assert.deepEqual(lostIndirect, [], `strings no longer picked: ${lostIndirect.join(", ")}`);
   // The built ones, where they are built: the automation rows, tn's "Many" twin, duration()
   assert.ok(read("main.js").includes("t(`auto_${f}`), h(\"span\", { class: \"hint\" }, t(`auto_${f}_hint`))"), "the automation rows build their strings");
-  assert.ok(read("main.js").includes(`const AUTO_FEATURES = ["review", "panel", "errors", "precommit"]`), "the four automation features");
+  assert.ok(read("main.js").includes(`const AUTO_FEATURES = ["review", "panel", "errors", "precommit", "tests", "playTests"]`), "the six automation features (Quack Test's two last)");
   const i18n = read("i18n.js");
   assert.ok(i18n.includes("return t(n === 1 ? key : `${key}Many`, { n });"), "tn picks the Many twin");
   for (const key of ["conflicts", "hunks", "linesAround"]) assert.ok(code.includes(`tn("${key}"`), `tn("${key}") is still shown`);

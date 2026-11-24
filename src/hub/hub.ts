@@ -21,6 +21,7 @@ import { RobloxError, robloxEnv, type RobloxEnv } from "../control/roblox.js";
 import type { StudioPort, Timings } from "../queue/queue.js";
 import { AnalysisService } from "../auto/service.js";
 import { HubAutomation } from "../auto/hubAuto.js";
+import { HubTests } from "../quacktest/hubTests.js";
 import { AUTO_FEATURES, autoSettingsPath, flavorFile, type AutoFeature, type AutoPatch } from "../auto/settings.js";
 import { ErrorsWatch } from "../auto/errorsWatch.js";
 import type { PrecommitEntry } from "../auto/precommit.js";
@@ -308,6 +309,8 @@ export class QuackHub {
   /** The resident analysis (a worker thread) and what runs on its own: the AI's review, the panel */
   readonly analysis: AnalysisService;
   readonly auto: HubAutomation;
+  /** Quack Test: the runs asked for, the ones after an AI's edit and before a play, and the ready processes */
+  readonly tests: HubTests;
   private autoTimer?: NodeJS.Timeout;
 
   constructor(private readonly options: HubOptions) {
@@ -320,6 +323,13 @@ export class QuackHub {
       log: (line) => this.log(line),
       ...(options.auto?.debounceMs !== undefined ? { debounceMs: options.auto.debounceMs } : {}),
       ...(options.precommit ? { precommit: options.precommit, hooksFile: options.auto?.hooksFile ?? flavorFile(options.registryFile, "precommit-hooks") } : {}),
+    });
+    this.tests = new HubTests({
+      places: () => this.registry().places,
+      analysis: this.analysis,
+      enabled: (feature, placeId) => this.auto.enabled(feature, placeId),
+      placeOf: (root) => this.auto.placeOf(root),
+      log: (line) => this.log(line),
     });
     this.queues = new HubQueues({
       registryFile: options.registryFile,
@@ -521,6 +531,7 @@ export class QuackHub {
     this.approvals.close();
     if (this.autoTimer) clearInterval(this.autoTimer);
     this.auto.stop();
+    this.tests.stop();
     this.analysis.stop();
     this.errorsWatch.stop();
     // A start or replacement already under way finishes first, so its daemon is in the list below
@@ -1038,6 +1049,31 @@ export class QuackHub {
             const absent: unknown[] | undefined = body.absent === undefined ? undefined : Array.isArray(body.absent) ? body.absent : [null];
             if (absent && !absent.every(script)) throw new ApiError(400, "absent must list scripts' absolute paths");
             this.auto.review(files as string[], feature, texts, absent as string[] | undefined).then((answer) => send(200, answer), fail);
+            return;
+          }
+          if (url.pathname === "/api/test") {
+            // Quack Test. feature "edit": an AI client's hook after an edit (the specs the files
+            // reach); "play": a play starting (every spec, a warning only); none: quack test
+            const absolute = (f: unknown): f is string => typeof f === "string" && path.isAbsolute(f);
+            const files: unknown[] = body.files === undefined ? [] : Array.isArray(body.files) ? body.files : [null];
+            if (files.length > 200 || !files.every(absolute)) throw new ApiError(400, "files must be absolute paths");
+            if (body.feature === "edit") {
+              this.tests.afterEdit(files as string[]).then((answer) => send(200, answer), fail);
+              return;
+            }
+            if (body.feature === "play") {
+              const placeId = typeof body.placeId === "string" ? body.placeId : null;
+              this.folderOf(placeId);
+              if (body.folder !== undefined && !absolute(body.folder)) throw new ApiError(400, "folder must be an absolute path");
+              this.tests.beforePlay(placeId!, body.folder as string | undefined).then((answer) => send(200, answer), fail);
+              return;
+            }
+            if (!absolute(body.root)) throw new ApiError(400, "root must be the project folder's absolute path");
+            const filter: unknown[] = body.filter === undefined ? [] : Array.isArray(body.filter) ? body.filter : [null];
+            if (!filter.every((f) => typeof f === "string")) throw new ApiError(400, "filter must be a list of texts");
+            const limit = body.testTimeout;
+            if (limit !== undefined && (typeof limit !== "number" || !(limit > 0 && limit <= 600))) throw new ApiError(400, "testTimeout must be seconds, 600 at most");
+            this.tests.run(body.root as string, files as string[], filter as string[], limit as number | undefined).then((report) => send(200, report), fail);
             return;
           }
           if (url.pathname === "/api/automation") {

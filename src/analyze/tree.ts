@@ -70,6 +70,14 @@ export function treeFromSourcemap(json: SourcemapNode, root: string): GameTree {
 
 const SCRIPT_FILE = /^(.*?)(\.server|\.client)?\.luau?$/i;
 
+/** A script file's instance, as the sync names it (X.server.luau: the Script X), or null for another file */
+export function scriptOfFile(fileName: string): { name: string; className: "ModuleScript" | "Script" | "LocalScript" } | null {
+  const m = SCRIPT_FILE.exec(fileName);
+  if (!m) return null;
+  const kind = m[2]?.toLowerCase();
+  return { name: m[1], className: kind === ".server" ? "Script" : kind === ".client" ? "LocalScript" : "ModuleScript" };
+}
+
 export function treeFromSyncFolder(syncDir: string): GameTree {
   const byFile = new Map<string, TreeNode>();
   const root: TreeNode = { name: "Game", className: "DataModel", children: [] };
@@ -83,10 +91,9 @@ export function treeFromSyncFolder(syncDir: string): GameTree {
     // scripts first: a folder named like a script beside it holds that script's children
     for (const e of entries) {
       if (!e.isFile()) continue;
-      const m = SCRIPT_FILE.exec(e.name);
-      if (!m) continue;
-      const className = m[2]?.toLowerCase() === ".server" ? "Script" : m[2]?.toLowerCase() === ".client" ? "LocalScript" : "ModuleScript";
-      const node: TreeNode = { name: m[1], className, parent, children: [], file: path.join(dir, e.name) };
+      const script = scriptOfFile(e.name);
+      if (!script) continue;
+      const node: TreeNode = { ...script, parent, children: [], file: path.join(dir, e.name) };
       parent.children.push(node);
       byFile.set(fileKey(node.file!), node);
     }
@@ -114,8 +121,8 @@ export function addSyncFile(tree: GameTree, syncDir: string, file: string): void
   const rel = path.relative(syncDir, file);
   if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return;
   const parts = rel.split(/[\\/]/);
-  const m = SCRIPT_FILE.exec(parts.pop()!);
-  if (!m) return;
+  const script = scriptOfFile(parts.pop()!);
+  if (!script) return;
   let parent = tree.root;
   for (const name of parts) {
     let next = parent.children.find((c) => c.name === name && (c.className === "Folder" || isScript(c) || parent === tree.root));
@@ -125,8 +132,7 @@ export function addSyncFile(tree: GameTree, syncDir: string, file: string): void
     }
     parent = next;
   }
-  const className = m[2]?.toLowerCase() === ".server" ? "Script" : m[2]?.toLowerCase() === ".client" ? "LocalScript" : "ModuleScript";
-  const node: TreeNode = { name: m[1], className, parent, children: [], file: path.resolve(file) };
+  const node: TreeNode = { ...script, parent, children: [], file: path.resolve(file) };
   parent.children.push(node);
   tree.byFile.set(fileKey(file), node);
 }
