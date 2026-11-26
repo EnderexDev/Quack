@@ -6,6 +6,8 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.44] - 2026-11-26
+
 ### Fixed
 - Quack's guard no longer blocks AI sessions that never touch Quack. A grep pattern with an escaped `\|` or `\(` read as the drive's root, a search on another drive (`E:/`, `D:/worktrees`), and a code comment's `//` in a heredoc counted as a search over Quack's data folders: of 1073 blocks found in the past two weeks of sessions, 1006 no longer happen. A recursive search of the home folder, AppData or Quack's own folders is still refused, and so is `/` read by PowerShell or cmd.
 
@@ -444,7 +446,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.43...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.44...HEAD
+[1.0.44]: https://github.com/EnderexDev/Quack/compare/v1.0.43...v1.0.44
 [1.0.43]: https://github.com/EnderexDev/Quack/compare/v1.0.42...v1.0.43
 [1.0.42]: https://github.com/EnderexDev/Quack/compare/v1.0.41...v1.0.42
 [1.0.41]: https://github.com/EnderexDev/Quack/compare/v1.0.40...v1.0.41
