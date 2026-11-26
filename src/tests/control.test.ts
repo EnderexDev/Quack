@@ -769,7 +769,25 @@ test("Quack's guard refuses the vault, the approval token, DPAPI, the vault's co
     ["Bash", { command: "cp -r src/* dist" }],
     ["Bash", { command: "zip -r out.zip src" }],
     ["PowerShell", { command: "powershell -EncodedCommand RwBlAHQALQBQAHIAbwBjAGUAcwBzACAAcQB1AGEAYwBrAC0AYQBwAHAA" }],
+    // Sessions that never touch Quack (26/11/26: 1062 blocks, 871 of them a lone "/"). An escaped
+    // separator in a grep pattern, a search on another drive, a code comment's "//" in a heredoc
+    ["Bash", { command: "grep -rn \"getBridge\\|Bridge\\(\\|OnServerEvent\" sync/ServerScriptService | head" }],
+    ["Bash", { command: "cd /e/t3-scratch/core && grep -rn --include=*.go -E '\"/(credentials|config)[^\"]*\"' ." }],
+    ["Bash", { command: "grep -rn x E:/" }],
+    ["Grep", { pattern: "x", path: "E:\\" }],
+    ["Bash", { command: "grep -rn \"Map %s:\" sync" }],
+    ["Bash", { command: "cat >> a.test.mjs <<'EOF'\n// ---- three accounts ----\nEOF\ngrep -rn computeWeights ." }],
+    ["Bash", { command: "find . -name '*.luau' -exec grep -l x {} \\; | sort -r" }],
+    // "/" in Git Bash is Git's own folder
+    ["Bash", { command: "grep -rn \"a / b\" src" }],
   ];
+  // Still the root of the drive holding Quack's files, where a Windows shell reads "/"
+  blocked.push(["Bash", { command: "grep -rn KEY C:/" }], ["Grep", { pattern: "KEY", path: "c:" }]);
+  const onC = "C:/Users/A/work";
+  assert.ok(checkTool("PowerShell", { command: "Get-ChildItem / -Recurse | Select-String KEY" }, onC));
+  assert.ok(checkTool("Bash", { command: "powershell -c \"gci / -r | sls KEY\"" }, onC));
+  assert.equal(checkTool("Bash", { command: "grep -rn \"a\\(b\" / src" }, onC), undefined);
+  assert.equal(checkTool("PowerShell", { command: "Get-ChildItem / -Recurse | Select-String KEY" }, "E:/work"), undefined);
   for (const [tool, input] of blocked) assert.ok(checkTool(tool, input), `${tool} ${JSON.stringify(input)} should be blocked`);
   for (const [tool, input] of allowed) assert.equal(checkTool(tool, input), undefined, `${tool} ${JSON.stringify(input)} should pass`);
 

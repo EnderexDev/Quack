@@ -32,6 +32,8 @@ const HOME = os.homedir();
 const ROAMING = process.env.APPDATA || path.join(HOME, "AppData", "Roaming");
 const LOCAL = process.env.LOCALAPPDATA || path.join(HOME, "AppData", "Local");
 const slashes = (s: string) => s.replace(/\\/g, "/");
+/** The drives that hold Quack's files: this user's Roaming and home (C: on a usual install) */
+const PROTECTED_DRIVES = new Set([ROAMING, HOME].map((p) => /^([A-Za-z]):/.exec(p)?.[1]?.toLowerCase()).filter((d): d is string => !!d));
 
 /**
  * A protected file named in one word (a path, an argument): by its name, or by a wildcard
@@ -76,6 +78,10 @@ const resolveWord = (word: string, cwd: string) => slashes(path.resolve(cwd, exp
 function searchRoot(resolved: string): boolean {
   let w = resolved;
   while (w.endsWith("/")) w = w.slice(0, -1);
+  // Quack's files live under Users on the drive of this user's AppData: a search on another
+  // drive (E:/, D:/worktrees, a pattern word like "s:") cannot reach them
+  const drive = /^([A-Za-z]):/.exec(w)?.[1]?.toLowerCase();
+  if (drive && !PROTECTED_DRIVES.has(drive)) return false;
   if (!w || /^[A-Za-z]:$/.test(w)) return true;
   const same = (dir: string) => w.toLowerCase() === slashes(dir).replace(/\/+$/, "").toLowerCase();
   if (same(HOME) || same(ROAMING) || same(path.dirname(ROAMING))) return true;
@@ -206,8 +212,23 @@ function normalizeWord(word: string): string {
   return slashes(word.replace(/\\[*?[]/g, "\u0001"));
 }
 
-function checkCommand(command: string, cwd: string): GuardBlock | undefined {
-  const words = command.split(/[\s"'`;|&()<>,]+/).filter(Boolean).map(normalizeWord);
+/**
+ * A word made only of slashes and dots ("/", "//", "/."), the shape a code comment or a pattern
+ * leaves. "//" and more is a network root in every shell, never a drive. "/" in Git Bash is Git's
+ * own folder (no c/ inside, measured 26/11/26): it is a drive's root only for PowerShell or cmd.
+ */
+function harmlessRoot(word: string, gitBash: boolean): boolean {
+  if (!/^\/[/.]*$/.test(word)) return false;
+  return word.startsWith("//") || gitBash;
+}
+
+/** A Bash call that runs no Windows shell inside it: there "/" is Git's folder */
+const isGitBash = (kind: string, command: string) => kind === "Bash" && !/\b(?:powershell|pwsh|cmd)(?:\.exe)?\b/i.test(command);
+
+function checkCommand(command: string, cwd: string, gitBash = false): GuardBlock | undefined {
+  // An escaped separator (grep "a\|b", "\(x\)", find's \;) stays inside its word: split there,
+  // its lone "\" became "/", read as the drive's root (871 of 1062 blocks in other sessions, 26/11/26)
+  const words = command.replace(/\\[|()<>;&,]/g, "\u0001").split(/[\s"'`;|&()<>,]+/).filter(Boolean).map(normalizeWord);
   // An option's value glued to it (-Path:$env:APPDATA/quack, --dir=~/AppData) is checked as a
   // path where its option stands, never read as a command or a cd of its own
   const glued = words.map((w) => /^-{1,2}[A-Za-z][\w-]*[:=](.+)$/.exec(w)?.[1]);
@@ -250,7 +271,7 @@ function checkCommand(command: string, cwd: string): GuardBlock | undefined {
     }
     for (const word of [isOption(words[i]) ? undefined : words[i], glued[i]]) {
       if (word === undefined) continue;
-      if (searchRoot(resolveWord(word, folderAt[i]))) rootWord = true;
+      if (!harmlessRoot(word, gitBash) && searchRoot(resolveWord(word, folderAt[i]))) rootWord = true;
       // A wildcard, resolved where it runs, must not match one of Quack's own files (quack*/*,
       // ~/AppDat?/Roaming/quack/*, cat * inside quack). Any other one passes: /* in a code
       // comment, a search pattern like AppData.*, ~/AppData/Local/Roblox/logs/*.log
@@ -289,8 +310,10 @@ export function checkTool(toolName: string, input: Record<string, unknown> | und
   const kind = toolKind(toolName);
   if (!kind || !input) return undefined;
   if (kind === "Bash" || kind === "PowerShell") {
+    // Judged on the whole call: a command decoded from -EncodedCommand is PowerShell's
+    const gitBash = isGitBash(kind, text(input.command));
     for (const command of withDecoded(text(input.command))) {
-      const hit = checkCommand(command, cwd || process.cwd());
+      const hit = checkCommand(command, cwd || process.cwd(), gitBash);
       if (hit) return hit;
     }
     return undefined;
