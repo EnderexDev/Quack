@@ -1030,6 +1030,7 @@ function renderFolder(target) {
   target.replaceChildren(h("div", { class: "view folder" }, h("div", { class: "card fcard" },
     h("span", { class: "label" }, t("folder")),
     h("div", { class: "place" }, qslot("lg", "folder"), h("div", { class: "grow" }, h("b", {}, nameOf(place)), h("span", { class: "mono" }, place.folder))),
+    nameField(place),
     h("div", { class: "field" }, h("span", { class: "grow" }, t("placeId")), h("span", { class: "mono muted" }, place.placeId)),
     h("p", { class: "note" }, t("folderTab")),
     h("div", { class: "actions" },
@@ -1037,6 +1038,54 @@ function renderFolder(target) {
       h("span", { class: "grow" }), remove),
     // Under the buttons, so the armed one stays where the second click lands
     sure)));
+}
+
+/**
+ * The game's name as Quack shows it (the sidebar, the header, the tools), with Rename beside it:
+ * a click turns it into a text field, Enter or Save keeps it, Esc or Cancel puts it back. The
+ * name Studio sent at setup is often the place's default ("Place1"), so this is where it changes.
+ */
+function nameField(place) {
+  const row = h("div", { class: "field" });
+  const showing = () => {
+    const rename = h("button", { class: "btn press", "aria-label": `${t("rename")}: ${nameOf(place)}` }, t("rename"));
+    rename.addEventListener("click", editing);
+    row.replaceChildren(h("span", { class: "grow" }, t("name")), h("span", { class: "muted" }, nameOf(place)), rename);
+  };
+  const editing = () => {
+    const input = h("input", { class: "field-input grow", value: place.name ?? "", placeholder: nameOf(place), maxlength: "100", "aria-label": t("name") });
+    const save = h("button", { class: "btn light press" }, t("saveName"));
+    const cancel = h("button", { class: "btn press" }, t("cancel"));
+    const keep = async () => {
+      const name = input.value.trim();
+      if (!name || name === place.name) return showing();
+      save.disabled = true;
+      try {
+        await api.post("/api/rename", { placeId: place.placeId, name });
+        // The state's own copy, so the sidebar, the header and this card show it now, before
+        // the hub's next state says the same
+        const shown = placeOf(place.placeId);
+        if (shown) shown.name = name;
+        toast(t("done"));
+        contentKey = "";
+        renderMain();
+      } catch (error) {
+        save.disabled = false;
+        fail(error);
+      }
+    };
+    save.addEventListener("click", keep);
+    cancel.addEventListener("click", showing);
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") keep();
+      else if (event.key === "Escape") showing();
+    });
+    row.replaceChildren(input, save, cancel);
+    input.focus();
+    input.select();
+  };
+  showing();
+  return row;
 }
 
 /** Line diff by longest common subsequence: [op, aIndex, bIndex] with op "=", "a" or "b" */

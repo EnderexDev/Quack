@@ -3,6 +3,7 @@
   "identifier": "dev.enderex.quack",
   "plugins": {
     "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERGNjA3REQ2MTc3OThDNTAKUldSUWpIa1gxbjFnMzY3TkRwTGZHblFMVTBBYmVvUVA3ZmJGL0FZWmZncVFWbUNSVVl6aXhIMGMK",
       "endpoints": ["https://github.com/EnderexDev/Quack/releases/latest/download/latest.json"]
     }
   },

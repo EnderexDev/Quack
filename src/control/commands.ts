@@ -934,6 +934,7 @@ Change${info.flavor === "official" ? " (each asks first; --yes to skip, required
   pause | resume            Stop every daemon and turn Studios away / allow them again
   register <placeId> [folder] [--name <name>]   Link a folder (default: here) to a place
   unregister <place>
+  rename <place> <name>     The name the app and the tools show for the place
   resolve <id> --disk|--keep [place]   Put the saved disk version back, or keep what is there
   choose <id> continue|cancel          Answer a waiting connection
   ai [on|off|claude|codex]  The AI merge (no argument: show it; --refresh checks the CLIs again)
@@ -965,7 +966,7 @@ Every command takes --json. Exit codes: 0 ok, 1 error, ${EXIT.offline} hub not r
 push, build and pack stay in the old command: node dist/cli.js.`;
 }
 
-const MUTATING = new Set(["pause", "resume", "register", "unregister", "resolve", "choose", "restart-hub"]);
+const MUTATING = new Set(["pause", "resume", "register", "unregister", "rename", "resolve", "choose", "restart-hub"]);
 
 export async function runControl(argv: string[], ctx: ControlContext): Promise<number> {
   let parsed: ReturnType<typeof parse>;
@@ -1122,6 +1123,14 @@ async function dispatch(command: string, args: string[], options: Options, ctx: 
       const folder = path.resolve(ctx.cwd, args[1] ?? ".");
       await client.post("/api/registry", { placeId, folder, ...(options.name ? { name: options.name } : {}) });
       print({ ok: true, placeId, folder }, () => `Registered ${options.name ?? placeId} -> ${folder}`);
+      return EXIT.ok;
+    }
+    case "rename": {
+      const place = await resolvePlace(ctx, need(args[0], "rename <place> <name>"));
+      const name = args.slice(1).join(" ").trim();
+      if (!name) throw new UsageError("rename <place> <name>");
+      await client.post("/api/rename", { placeId: place.placeId, name });
+      print({ ok: true, placeId: place.placeId, name }, () => `Renamed ${placeLabel(place)} to ${name}`);
       return EXIT.ok;
     }
     case "unregister": {

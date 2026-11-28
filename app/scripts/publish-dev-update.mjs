@@ -6,9 +6,13 @@
 // The version is chosen here (dev-version.mjs): one above every Dev version published, installed
 // or built in any worktree. An explicit x.y.z is still accepted, only when above all of them.
 // The Official app is released by .github/workflows/release.yml, never from here.
-// Signing key: %APPDATA%\quack\signing\quack-updater.key (+ .password). Needs gh logged in.
+// Signing key: ~/.tauri/quack-dev.key, no password, like Quackify's and Quackblox's (a copy sits
+// in Proton Drive); TAURI_SIGNING_PRIVATE_KEY overrides it. The Dev channel's own since 26/11/26
+// (the shared key was lost with the old PC). Official is signed by CI with its secret and keeps
+// its pubkey in tauri.official.conf.json. Needs gh logged in.
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { compareVersions, existingVersions, highestVersion, nextVersion } from "./dev-version.mjs";
@@ -49,7 +53,11 @@ if (dirty && !local) {
   process.exit(1);
 }
 
-const signing = path.join(process.env.APPDATA ?? "", "quack", "signing");
+const keyPath = path.join(os.homedir(), ".tauri", "quack-dev.key");
+if (!process.env.TAURI_SIGNING_PRIVATE_KEY && !fs.existsSync(keyPath)) {
+  console.error(`no signing key at ${keyPath} (a copy is in Proton Drive)`);
+  process.exit(1);
+}
 // Dev builds skip LTO and use 16 codegen units (Ender's call, 08/11/26): with Cargo.toml's
 // lto = true and codegen-units = 1, one changed line re-optimised the whole program, 116 s per
 // update; without them it took 21 s, for an exe 25% bigger (installer +10%). Only the Dev
@@ -58,8 +66,8 @@ const DEV_PROFILE_ENV = { CARGO_PROFILE_RELEASE_LTO: "false", CARGO_PROFILE_RELE
 const env = {
   ...process.env,
   ...DEV_PROFILE_ENV,
-  TAURI_SIGNING_PRIVATE_KEY: fs.readFileSync(path.join(signing, "quack-updater.key"), "utf8"),
-  TAURI_SIGNING_PRIVATE_KEY_PASSWORD: fs.readFileSync(path.join(signing, "quack-updater.key.password"), "utf8"),
+  TAURI_SIGNING_PRIVATE_KEY: process.env.TAURI_SIGNING_PRIVATE_KEY ?? fs.readFileSync(keyPath, "utf8"),
+  TAURI_SIGNING_PRIVATE_KEY_PASSWORD: process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD ?? "",
 };
 // Only npx needs a shell on Windows (it is a .cmd); gh and git get their arguments as they are,
 // so a title with spaces stays one argument

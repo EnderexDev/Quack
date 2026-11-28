@@ -319,7 +319,12 @@ test("register, a conflict found and resolved without naming its place, and open
     const registered = await control(port, { cwd: extra })("register", "333", "--name", "Gamma");
     assert.equal(registered.code, 0, registered.err);
     assert.ok((await run("places", "--json")).json().some((p: any) => p.placeId === "333" && path.resolve(p.folder) === extra));
-    assert.equal((await run("unregister", "gamma")).code, 0);
+    // rename: by the place's current name, the new one in two words without quotes
+    const renamed = await run("rename", "gamma", "Strike", "Reborn");
+    assert.equal(renamed.code, 0, renamed.err);
+    assert.deepEqual((await run("places", "--json")).json().map((p: any) => [p.placeId, p.name]).sort(), [["111", "Alpha Game"], ["222", "Beta Game"], ["333", "Strike Reborn"]]);
+    assert.equal((await run("rename", "strike")).code !== 0, true, "no name is a usage error");
+    assert.equal((await run("unregister", "strike")).code, 0);
     assert.equal((await run("places", "--json")).json().some((p: any) => p.placeId === "333"), false);
 
     const studio = fakeStudio(port, 222, "BetaScript");
@@ -554,7 +559,7 @@ test("mcp: initialize carries the instructions, and the tools are the reading on
   assert.equal((await mcp.call("initialize", { protocolVersion: "1999-01-01" })).result.protocolVersion, "2025-06-18", "an unknown version gets the newest");
   const names = (await mcp.call("tools/list")).result.tools.map((t: any) => t.name);
   assert.deepEqual(names, ["status", "wait", "log", "conflicts", "conflict", "doctor", "play", ...STUDIO_TOOLS]);
-  for (const mutating of ["resolve", "pause", "resume", "register", "unregister", "choose", "restart-hub", "open", "ai"]) {
+  for (const mutating of ["resolve", "pause", "resume", "register", "unregister", "rename", "choose", "restart-hub", "open", "ai"]) {
     assert.ok(!names.includes(mutating), `${mutating} is a person's, not a tool`);
   }
   assert.equal((await mcp.call("tools/call", { name: "pause" })).error.code, -32602);

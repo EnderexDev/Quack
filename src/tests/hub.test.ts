@@ -372,6 +372,34 @@ test("pause stops every daemon and turns Studios away until resumed", { timeout:
   });
 });
 
+test("rename changes only the name: the folder, the running daemon and the other places stay", { timeout: 60000 }, async () => {
+  await withHub({ "111": "GameA", "222": "Place1", "333": "GameC" }, async ({ port, registryFile, folders }) => {
+    // The middle one of three, with its Studio connected and its daemon running
+    const studio = fakeStudio(port, 222, "BetaScript");
+    await waitFor(() => fs.existsSync(path.join(folders["222"], "sync", "ServerStorage", "BetaScript.luau")));
+    const pid = (await sessionsOf(port)).find((x: any) => x.placeId === "222").daemonPid;
+
+    assert.equal((await call(port, "POST", "/api/rename", { placeId: "222", name: "  Strike Reborn  " })).status, 200);
+    const onDisk = JSON.parse(fs.readFileSync(registryFile, "utf8")).places;
+    assert.deepEqual(Object.fromEntries(Object.entries(onDisk).map(([id, e]: [string, any]) => [id, e.name])), { "111": "GameA", "222": "Strike Reborn", "333": "GameC" });
+    assert.equal(onDisk["222"].folder, folders["222"]);
+    const state = (await call(port, "GET", "/api/state")).json;
+    assert.equal(state.places.find((p: any) => p.placeId === "222").name, "Strike Reborn");
+    const session = (await sessionsOf(port)).find((x: any) => x.placeId === "222");
+    assert.equal(session.daemonPid, pid, "the daemon kept running");
+    assert.equal(session.name, "Strike Reborn");
+
+    // Refused: no name, a blank one, a long one, an unregistered place; none changes the file
+    const before = fs.readFileSync(registryFile, "utf8");
+    assert.equal((await call(port, "POST", "/api/rename", { placeId: "222" })).status, 400);
+    assert.equal((await call(port, "POST", "/api/rename", { placeId: "222", name: "   " })).status, 400);
+    assert.equal((await call(port, "POST", "/api/rename", { placeId: "222", name: "x".repeat(101) })).status, 400);
+    assert.equal((await call(port, "POST", "/api/rename", { placeId: "999", name: "Nope" })).status, 404);
+    assert.equal(fs.readFileSync(registryFile, "utf8"), before);
+    studio.ws.terminate();
+  });
+});
+
 test("a refused place is listed until the app registers it, then it connects", { timeout: 60000 }, async () => {
   await withHub({ "111": "GameA" }, async ({ port, tmp }) => {
     const stranger = fakeStudio(port, 555, "Stranger");

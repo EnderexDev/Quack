@@ -48,10 +48,16 @@ const EMPTY_SHOTS = [{ name: "home", ready: "document.querySelector('.offline .b
  * reaches open_path or pick_folder, which would open real windows.
  */
 const EXAMPLE = { placeId: "98112345678901", name: "Quack Lab" };
+const RENAMED = "Strike Reborn";
 const TABS = ["output", "playtest", "merges", "analysis", "queue", "folder"];
 const EXAMPLE_SHOTS = [
   { name: "place", ready: "document.querySelectorAll('#side .game').length >= 2", then: "document.querySelector('#side .game').click()", settle: "!document.querySelector('.navlink:disabled')" },
   ...TABS.map((view) => ({ name: `tab-${view}`, then: `document.querySelector('.navlink[data-view="${view}"]').click(); new Promise((r) => setTimeout(r, 1500))`, settle: `document.querySelector('.navlink.on')?.dataset.view === '${view}'` })),
+  // Rename, in the Folder tab the last one left open, through the app's real hub: the run then
+  // reads the profile's registry for RENAMED (renamedOnDisk in the report)
+  { name: "folder-rename", then: "[...document.querySelectorAll('.folder .field .btn')].find((b) => b.textContent === 'Rename').click()", settle: "document.activeElement === document.querySelector('.folder .field .field-input')" },
+  { name: "folder-renamed", then: `const i = document.querySelector('.folder .field .field-input'); i.value = '${RENAMED}'; i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }))`,
+    settle: `document.querySelector('.head h1')?.textContent === '${RENAMED}' && [...document.querySelectorAll('#side .game b')].some((b) => b.textContent === '${RENAMED}')`, wait: 10_000 },
   ...SETTINGS_SHOTS,
 ];
 
@@ -305,6 +311,11 @@ export async function realWindow({ out, exe, build, examplePlace = false }) {
     for (const shot of examplePlace ? EXAMPLE_SHOTS : EMPTY_SHOTS) {
       report.shots.push(await shoot(main.page, main.events, out, shot.name, shot));
       if (report.shots.length === 1) report.timings.firstShotMs = Date.now() - started;
+    }
+    if (examplePlace) {
+      const registry = JSON.parse(fs.readFileSync(path.join(profile, "appdata", "quack", "hub-dev.json"), "utf8"));
+      report.renamedOnDisk = registry.places[EXAMPLE.placeId]?.name === RENAMED;
+      if (!report.renamedOnDisk) report.problems.push(`the registry still names the place ${registry.places[EXAMPLE.placeId]?.name}`);
     }
     const trayTarget = await pageTarget(debugPort, (url) => url.includes("tray.html"), 10_000);
     if (trayTarget) {

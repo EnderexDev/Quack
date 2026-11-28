@@ -1551,6 +1551,48 @@ test("profile: save runs the prelude's __quackSaveProfile and keeps its JSON, re
   }
 });
 
+test("profile: a restore too big for one Source goes in pieces under 200 000 characters, joined in _G and cleared after", { timeout: 30000 }, async () => {
+  const preludeDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-profile-big-"));
+  const prelude = "local function __quackSaveProfile(p) return {} end\nlocal function __quackRestoreProfile(p, d) end\n";
+  fs.writeFileSync(path.join(preludeDir, "server.luau"), prelude);
+  // 2.3 MB like Anime Astral's profile, with quotes, backslashes and an emoji (a surrogate pair)
+  const profile = { Pets: Array.from({ length: 9000 }, (_, i) => ({ Id: `pet-${i}`, Note: 'a "quoted" \\ back 🦆 olá', Level: i * 1.5 })), Coins: 5 };
+  const json = JSON.stringify(profile).padEnd(2_300_000, " ");
+  const d = await daemon({ preludeDir });
+  try {
+    const edit = await editStudio(d.url, () => ({}));
+    const codes: string[] = [];
+    const stage = new Map<string, string[]>();
+    let restored: string | undefined;
+    const server = await playPeer(d.url, "server", (_tool, args) => {
+      const code: string = args.code;
+      codes.push(code);
+      assert.ok(code.length + (args.prelude ?? "").length < 200_000, `one eval is ${code.length + (args.prelude ?? "").length} characters`);
+      const slot = code.match(/_G\["(__quackProfile_[0-9a-f]+)"\]/)?.[1];
+      if (slot && /= nil/.test(code)) { stage.delete(slot); return { ok: true, values: ["true"], output: [] }; }
+      if (slot && /= \{\}/.test(code)) stage.set(slot, []);
+      const piece = code.match(/table\.insert\(__s, ("(?:[^"\\]|\\.)*")\)/)?.[1];
+      if (slot && piece) { stage.get(slot)!.push(JSON.parse(piece)); return { ok: true, values: [String(stage.get(slot)!.length)], output: [] }; }
+      if (slot && /JSONDecode\(table\.concat/.test(code)) { restored = stage.get(slot)!.join(""); return { ok: true, values: ["true"], output: [] }; }
+      return { ok: true, values: ["true"], output: [] };
+    });
+    await waitFor(() => d.ipc.playPeers().server === "ready");
+    const dir = path.join(path.dirname((d.tools as any).screenshotDir), "profiles");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "big.json"), json);
+    const result: any = await d.tools.call("profile", { action: "restore", name: "big" }).finally(() => fs.rmSync(path.join(dir, "big.json"), { force: true }));
+    assert.ok(result.pieces > 11, `${result.pieces} pieces`);
+    assert.equal(restored, json, "the pieces join back to the kept JSON exactly");
+    assert.equal(stage.size, 0, "the staging slot is cleared");
+    assert.ok(StudioTools.luauPieces("x".repeat(10), 1000).length === 1, "a small one stays one literal");
+    server.close();
+    edit.close();
+  } finally {
+    await d.close();
+    fs.rmSync(preludeDir, { recursive: true, force: true });
+  }
+});
+
 test("png: resize averages the area each pixel covers, and a mosaic wraps rows at the width it is given", async () => {
   const { resize, mosaic } = await import("../util/png.js");
   const two = Buffer.from([0, 0, 0, 255, 200, 100, 50, 255]);

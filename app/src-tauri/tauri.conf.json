@@ -48,7 +48,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERGNjA3REQ2MTc3OThDNTAKUldSUWpIa1gxbjFnMzY3TkRwTGZHblFMVTBBYmVvUVA3ZmJGL0FZWmZncVFWbUNSVVl6aXhIMGMK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI2NkYwMDg5OTQxMDlBMzIKUldReW1oQ1VpUUJ2Sm9vaFhxem9VbUo5ZnBUck5WdmhaSGFacEhoQ3Ntbmo4dHhuT2N0dmxwRlcK",
       "endpoints": ["https://github.com/EnderexDev/quack-releases/releases/download/dev-channel/latest-dev.json"],
       "windows": { "installMode": "quiet" }
     }

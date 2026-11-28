@@ -110,6 +110,18 @@ export const SHOTS = [
   { name: "folder-removed", query: "view=folder", size: WINDOW, ready: "document.querySelector('.folder .btn.danger')",
     then: "document.querySelector('.folder .btn.danger').click(); document.querySelector('.folder .btn.danger').click()",
     settle: "document.querySelector('.toast') && ![...document.querySelectorAll('.side .game b')].some((b) => b.textContent === 'Anime Astral Copy')" },
+  // Rename on a game that is not the first: the field open, then saved with Enter, and the
+  // sidebar, the header and the card show the new name while the other games keep theirs
+  { name: "folder-rename", query: "view=folder&place=98112345678901", size: WINDOW, ready: "document.querySelector('.folder .place')",
+    then: "[...document.querySelectorAll('.folder .field .btn')].find((b) => b.textContent === 'Rename').click()",
+    settle: "document.activeElement === document.querySelector('.folder .field .field-input')" },
+  { name: "folder-renamed", query: "view=folder&place=98112345678901", size: WINDOW, ready: "document.querySelector('.folder .place')",
+    then: "[...document.querySelectorAll('.folder .field .btn')].find((b) => b.textContent === 'Rename').click(); const i = document.querySelector('.folder .field .field-input'); i.value = 'Strike Reborn'; i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }))",
+    settle: "document.querySelector('.head h1')?.textContent === 'Strike Reborn' && document.querySelector('.folder .place b')?.textContent === 'Strike Reborn'",
+    check: "(() => { const names = [...document.querySelectorAll('.side .game b')].map((b) => b.textContent); return names.includes('Strike Reborn') && !names.includes('Quack Lab') && names.includes('Anime Astral Copy'); })()" },
+  { name: "folder-rename-pt-820", query: "lang=pt&view=folder", size: SMALL, ready: "document.querySelector('.folder .place')",
+    then: "[...document.querySelectorAll('.folder .field .btn')].find((b) => b.textContent === 'Renomear').click()",
+    settle: "document.querySelector('.folder .field .field-input')" },
   { name: "folder-none", query: "view=folder&noFolder=1", size: WINDOW, ready: "document.querySelector('.folder > .empty')" },
   // The busy Queue scrolled to its end: Waiting, Recent and Today
   // Scrolled, then past two polls (each 1.5 s redraws the cards): the scroll stays where it was

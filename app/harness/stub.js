@@ -95,6 +95,15 @@
       case "/api/analysis/run":
         F.analysis.at = Date.now();
         break;
+      case "/api/rename": {
+        const name = String(body.name ?? "").trim();
+        if (!name) throw new Error("name must not be empty");
+        const place = state.places.find((p) => p.placeId === body.placeId);
+        if (!place) throw new Error(`place ${body.placeId} is not registered`);
+        place.name = name;
+        for (const s of state.sessions) if (s.placeId === body.placeId) s.name = name;
+        break;
+      }
       case "/api/unregister":
         state.places = state.places.filter((p) => p.placeId !== body.placeId);
         state.sessions = state.sessions.filter((s) => s.placeId !== body.placeId);

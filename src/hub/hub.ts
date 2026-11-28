@@ -252,6 +252,8 @@ interface Handshake {
 /** The app lists a refused place for this long after its last attempt */
 const REFUSAL_SHOWN_MS = 10 * 60_000;
 const MAX_BODY_BYTES = 64 * 1024;
+/** A place's name as the app and the tools show it (Roblox caps a game's name at 50) */
+const PLACE_NAME_MAX = 100;
 /** /api/studio carries Luau code (an eval, execute_luau) */
 const STUDIO_BODY_BYTES = 4 * 1024 * 1024;
 
@@ -1257,6 +1259,24 @@ export class QuackHub {
         this.pending.delete(body.id);
         this.decisions.set(body.id, { decision: body.decision, at: Date.now() });
         this.log(`${choice.placeName ?? choice.placeId}: ${body.decision === "continue" ? "take over" : "keep the other connection"} (${choice.kind})`);
+        return;
+      }
+      case "/api/rename": {
+        // Only the name: the folder and the running daemon stay as they are
+        if (typeof body.placeId !== "string") throw new ApiError(400, "placeId is required");
+        if (typeof body.name !== "string") throw new ApiError(400, "name must be text");
+        const name = body.name.trim();
+        if (!name) throw new ApiError(400, "name must not be empty");
+        if (name.length > PLACE_NAME_MAX) throw new ApiError(400, `name must be at most ${PLACE_NAME_MAX} characters`);
+        const registry = this.registry();
+        const entry = registry.places[body.placeId];
+        if (!entry) throw new ApiError(404, `place ${body.placeId} is not registered`);
+        const before = entry.name ?? body.placeId;
+        entry.name = name;
+        saveRegistry(this.options.registryFile, registry);
+        const session = this.sessions.get(body.placeId);
+        if (session) session.name = name;
+        this.log(`Renamed ${before} -> ${name}`);
         return;
       }
       case "/api/unregister": {

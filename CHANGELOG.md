@@ -6,6 +6,14 @@ has release notes with the details and the source commits.
 
 ## [Unreleased]
 
+## [1.0.45] - 2026-11-28
+
+### Added
+- A game's name can be changed after it is registered. The Folder tab has a Name row with Rename (Enter saves, Esc cancels), and the terminal has `quack rename <place> <name>`. Setup takes the name Studio sends, often the place's default ("Place1"), and until now only removing the game and adding it again changed it. Renaming leaves the folder and the running sync as they are.
+
+### Fixed
+- `test_profile restore` works with a large profile. The whole saved profile went into one eval, and Roblox refuses a script over 200 000 characters, so a profile of about 2 MB (Anime Astral's) could be saved but never put back. A profile that does not fit is now sent in pieces under that limit and joined in the play before the game's `__quackRestoreProfile` runs.
+
 ## [1.0.44] - 2026-11-26
 
 ### Fixed
@@ -446,7 +454,8 @@ until its place is reopened with the new plugin.
   place config lives in `ServerStorage.Quack` (`ServerStorage.Azul` is still read)
 - No update check against npm
 
-[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.44...HEAD
+[Unreleased]: https://github.com/EnderexDev/Quack/compare/v1.0.45...HEAD
+[1.0.45]: https://github.com/EnderexDev/Quack/compare/v1.0.44...v1.0.45
 [1.0.44]: https://github.com/EnderexDev/Quack/compare/v1.0.43...v1.0.44
 [1.0.43]: https://github.com/EnderexDev/Quack/compare/v1.0.42...v1.0.43
 [1.0.42]: https://github.com/EnderexDev/Quack/compare/v1.0.41...v1.0.42

@@ -1707,10 +1707,63 @@ export class StudioTools {
     } catch {
       throw new ToolError(`no profile kept as ${name} (save one first)`);
     }
-    const code = `local __p = ${who}\nif not __p then error("no player in the play") end\n__quackRestoreProfile(__p, game:GetService("HttpService"):JSONDecode(${JSON.stringify(json)}))\nreturn true`;
-    const result: any = await this.evalRuntime({ code, peer: "server", timeoutMs: 30_000 });
-    if (!result?.ok) throw new ToolError(`__quackRestoreProfile failed: ${result?.error ?? "no answer"}`);
-    return { action, name, file, bytes: Buffer.byteLength(json) };
+    // The eval's source (prelude + code) is a ModuleScript's Source, which Roblox caps at
+    // 200 000 characters: a whole profile is often more (Anime Astral's is 2.3 MB as a Luau
+    // literal, refused 27/11/26). A JSON that does not fit goes in pieces into _G of the
+    // play server (shared by every eval of that play), and the last eval joins and restores.
+    const room = StudioTools.SOURCE_LIMIT - prelude.length - 2_000;
+    const pieces = StudioTools.luauPieces(json, room);
+    const restore = (literal: string) => `local __p = ${who}\nif not __p then error("no player in the play") end\n__quackRestoreProfile(__p, game:GetService("HttpService"):JSONDecode(${literal}))\nreturn true`;
+    if (pieces.length === 1) {
+      const result: any = await this.evalRuntime({ code: restore(pieces[0]), peer: "server", timeoutMs: 30_000 });
+      if (!result?.ok) throw new ToolError(`__quackRestoreProfile failed: ${result?.error ?? "no answer"}`);
+      return { action, name, file, bytes: Buffer.byteLength(json) };
+    }
+    const slot = `__quackProfile_${randomBytes(6).toString("hex")}`;
+    const stage = `_G[${JSON.stringify(slot)}]`;
+    try {
+      for (const [i, piece] of pieces.entries()) {
+        const code = `${i === 0 ? `${stage} = {}\n` : ""}local __s = ${stage}\nif not __s then error("the profile's pieces were lost (the play restarted?)") end\ntable.insert(__s, ${piece})\nreturn #__s`;
+        const result: any = await this.evalRuntime({ code, peer: "server", timeoutMs: 30_000 });
+        if (!result?.ok) throw new ToolError(`sending the profile (piece ${i + 1} of ${pieces.length}) failed: ${result?.error ?? "no answer"}`);
+      }
+      const result: any = await this.evalRuntime({ code: restore(`table.concat(${stage})`), peer: "server", timeoutMs: 30_000 });
+      if (!result?.ok) throw new ToolError(`__quackRestoreProfile failed: ${result?.error ?? "no answer"}`);
+    } finally {
+      await this.evalRuntime({ code: `${stage} = nil\nreturn true`, peer: "server", timeoutMs: 10_000 }).catch(() => undefined);
+    }
+    return { action, name, file, bytes: Buffer.byteLength(json), pieces: pieces.length };
+  }
+
+  /** Roblox's cap on a script's Source, in characters */
+  static readonly SOURCE_LIMIT = 200_000;
+
+  /**
+   * A text cut into Luau string literals of at most `room` characters each (escapes counted),
+   * never splitting a UTF-16 surrogate pair, so each piece is valid on its own and the pieces
+   * joined in the play give back the text exactly.
+   */
+  static luauPieces(text: string, room: number): string[] {
+    const whole = JSON.stringify(text);
+    if (whole.length <= room) return [whole];
+    const pieces: string[] = [];
+    let start = 0;
+    while (start < text.length) {
+      // the longest piece from start whose literal fits: binary search on its end
+      let low = start + 1;
+      let high = Math.min(text.length, start + room);
+      while (low < high) {
+        const mid = Math.ceil((low + high) / 2);
+        if (JSON.stringify(text.slice(start, mid)).length <= room) low = mid;
+        else high = mid - 1;
+      }
+      let end = low;
+      const code = text.charCodeAt(end - 1);
+      if (end < text.length && code >= 0xd800 && code <= 0xdbff) end--;
+      pieces.push(JSON.stringify(text.slice(start, end)));
+      start = end;
+    }
+    return pieces;
   }
 
   /** A Creator Store asset id from the caller */

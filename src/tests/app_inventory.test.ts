@@ -34,7 +34,7 @@ const API: Record<string, number> = {
   "/api/conflict": 1, "/api/conflict/resolve": 1, "/api/log": 1, "/api/merges": 2, "/api/pause": 2,
   "/api/production-errors": 1, "/api/production-errors/check": 1, "/api/production-errors/dismiss": 1,
   "/api/queue": 1, "/api/queue/force-release": 1, "/api/queue/settings": 2, "/api/queue/unstick": 1,
-  "/api/registry": 2, "/api/setup-candidates": 1, "/api/unregister": 2,
+  "/api/registry": 2, "/api/rename": 1, "/api/setup-candidates": 1, "/api/unregister": 2,
 };
 
 /** The tabs of the main window's navigation, and every view it can show */
